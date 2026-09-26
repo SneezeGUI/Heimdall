@@ -4729,6 +4729,7 @@ class Display:
 
                 # Stats — positions scaled to fill the physical width/height,
                 # but icon images stay at their original pixel size.
+                self._exploit_stat_line()  # refresh sd.exploitnbr
                 stats = [
                     (self.shared_data.target,    (int(8 * sx),   int(22 * sy)), (int(28 * sx),  int(22 * sy)), str(self.shared_data.targetnbr)),
                     (self.shared_data.port,      (int(47 * sx),  int(22 * sy)), (int(67 * sx),  int(22 * sy)), str(self.shared_data.portnbr)),
@@ -4738,7 +4739,7 @@ class Display:
                     (self.shared_data.level,     (int(2 * sx),   int(217 * sy)), (int(4 * sx),  int(237 * sy)), str(self.shared_data.levelnbr)),
                     (self.shared_data.zombie,    (int(47 * sx),  int(41 * sy)), (int(67 * sx),  int(41 * sy)), str(self.shared_data.zombiesnbr)),
                     (self.shared_data.networkkb, (int(102 * sx), int(190 * sy)), (int(102 * sx), int(208 * sy)), str(self.shared_data.networkkbnbr)),
-                    (self.shared_data.data,      (int(86 * sx),  int(41 * sy)), (int(106 * sx), int(41 * sy)), str(self.shared_data.datanbr)),
+                    (getattr(self.shared_data, 'exploit', None) or self.shared_data.attacks, (int(86 * sx),  int(41 * sy)), (int(106 * sx), int(41 * sy)), str(getattr(self.shared_data, 'exploitnbr', 0))),
                     (self.shared_data.attacks,   (int(100 * sx), int(218 * sy)), (int(102 * sx), int(237 * sy)), str(self.shared_data.attacksnbr)),
                 ]
 
