@@ -618,6 +618,25 @@ class Orchestrator:
 
         return sanitized_ports
 
+    def _run_standalone_actions(self, current_data):
+        """Run every standalone action (ExploitRunner first).
+
+        Independent of whether regular attack actions fired — exploits must
+        not be starved by a successful bruteforce earlier in the cycle.
+        """
+        ordered = sorted(
+            self.standalone_actions,
+            key=lambda a: 0 if 'Exploit' in a.action_name else 1,
+        )
+        for action in ordered:
+            if self.shared_data.orchestrator_should_exit:
+                break
+            with self.semaphore:
+                try:
+                    self.execute_standalone_action(action, current_data)
+                except Exception as exc:
+                    logger.error(f"standalone {action.action_name} raised: {exc}")
+
     def execute_standalone_action(self, action, current_data):
         """Execute a standalone action with timeout protection"""
         row = next((r for r in current_data if r["MAC Address"] == "STANDALONE"), None)
@@ -1062,11 +1081,8 @@ class Orchestrator:
                 
                 self.failed_scans_count += 1
                 if self.failed_scans_count >= 1:
-                    for action in self.standalone_actions:
-                        with self.semaphore:
-                            if self.execute_standalone_action(action, current_data):
-                                self.failed_scans_count = 0
-                                break
+                    self._run_standalone_actions(current_data)
+                    self.failed_scans_count = 0
                     
                     # Idle period before next cycle
                     idle_start_time = datetime.now()
@@ -1087,6 +1103,12 @@ class Orchestrator:
                     logger.info("✓ Attack actions executed successfully")
                 self.failed_scans_count = 0
                 action_retry_pending = True
+                # Attacks fired — still run standalone actions so exploits
+                # are not skipped for the whole cycle.
+                try:
+                    self._run_standalone_actions(current_data)
+                except Exception as exc:
+                    logger.error(f"standalone pass after attacks failed: {exc}")
 
             if action_retry_pending:
                 self.failed_scans_count = 0
