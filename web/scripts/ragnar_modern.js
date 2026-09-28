@@ -12006,14 +12006,25 @@ function updateDashboardStats(stats) {
     scaleStatNumber('dashboard-scanned-network-count', scannedNetworks);
     updateElement('points-count', points);
 
-    // Exploit engine stats (from /api/dashboard/quick -> exploit_count)
-    const exploitCount = toNumber(stats.exploit_count ?? stats.exploit_vulnerable ?? 0, 0);
-    const exploitAttempts = toNumber(stats.exploit_attempted ?? 0, 0);
-    const exploitHosts = toNumber(stats.exploit_host_count ?? 0, 0);
-    updateElement('exploit-count', exploitCount);
-    scaleStatNumber('exploit-count', exploitCount);
-    updateElement('dashboard-exploit-attempts-count', exploitAttempts);
-    updateElement('dashboard-exploit-hosts-count', exploitHosts);
+    // Exploit engine stats. Only update when the payload actually carries
+    // them — /api/dashboard/stats (legacy) does not, and would otherwise
+    // clobber live values with zeros on every refresh.
+    const hasExploitStats = (
+        Object.prototype.hasOwnProperty.call(stats, 'exploit_count') ||
+        Object.prototype.hasOwnProperty.call(stats, 'exploit_attempted') ||
+        Object.prototype.hasOwnProperty.call(stats, 'exploit_host_count') ||
+        Object.prototype.hasOwnProperty.call(stats, 'exploit_vulnerable')
+    );
+    if (hasExploitStats) {
+        // Big number = confirmed (vulnerable) hits; subtext carries activity.
+        const exploitVulnerable = toNumber(stats.exploit_vulnerable ?? stats.exploit_count ?? 0, 0);
+        const exploitAttempts = toNumber(stats.exploit_attempted ?? 0, 0);
+        const exploitHosts = toNumber(stats.exploit_host_count ?? 0, 0);
+        updateElement('exploit-count', exploitVulnerable);
+        scaleStatNumber('exploit-count', exploitVulnerable);
+        updateElement('dashboard-exploit-attempts-count', exploitAttempts);
+        updateElement('dashboard-exploit-hosts-count', exploitHosts);
+    }
 
     const activeSummary = totalTargets > 0 ? `${activeTargets}/${totalTargets} active` : `${activeTargets} active`;
     const newSummary = newTargets > 0 ? `${newTargets} new` : 'No new targets';
@@ -17961,6 +17972,18 @@ async function refreshDashboardStatsForCurrentSelection(options = {}) {
     const { forceRefresh = false, fallbackData = null } = options;
     try {
         const stats = await fetchDashboardStatsForSelection({ forceRefresh });
+        // Exploit counters are global, not per-network. The network-scoped
+        // endpoint used to omit them, which left the tile frozen — merge them
+        // in from the quick payload whenever the selection payload lacks them.
+        if (stats && fallbackData) {
+            for (const key of ['exploit_count', 'exploit_vulnerable',
+                               'exploit_attempted', 'exploit_host_count']) {
+                if (!Object.prototype.hasOwnProperty.call(stats, key)
+                    && Object.prototype.hasOwnProperty.call(fallbackData, key)) {
+                    stats[key] = fallbackData[key];
+                }
+            }
+        }
         if (stats) {
             updateDashboardStats(stats);
         } else if (fallbackData) {

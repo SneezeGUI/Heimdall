@@ -27326,6 +27326,7 @@ def get_dashboard_quick():
             'lost_target_ips': lost_target_ips,
             'port_count': port_count,
             'exploit_count': _exploit_count(),
+            'exploit_vulnerable': _exploit_count(),
             'exploit_attempted': _exploit_stat('attempted'),
             'exploit_host_count': _exploit_stat('host_count'),
             'vulnerability_count': vulnerability_count,
@@ -27375,6 +27376,14 @@ def get_dashboard_stats():
         requested_network = request.args.get('network') or request.args.get('ssid') or request.args.get('slug')
         identifier = requested_network if requested_network else None
         stats = _collect_dashboard_stats_for_network(identifier)
+        # Exploit-engine counters are global (not per-network) but the dashboard
+        # polls THIS endpoint when a network is selected. Without these fields
+        # the Exploits tile silently freezes at its first-paint value, because
+        # updateDashboardStats() skips the block when a payload lacks them.
+        stats['exploit_count'] = _exploit_count()
+        stats['exploit_vulnerable'] = _exploit_count()
+        stats['exploit_attempted'] = _exploit_stat('attempted')
+        stats['exploit_host_count'] = _exploit_stat('host_count')
         response = jsonify(stats)
         response.headers['Cache-Control'] = 'public, max-age=3'
         return response
