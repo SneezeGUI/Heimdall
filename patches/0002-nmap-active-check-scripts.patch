@@ -1,0 +1,78 @@
+diff --git a/actions/nmap_vuln_scanner.py b/actions/nmap_vuln_scanner.py
+index dfe122bc..b5adf631 100755
+--- a/actions/nmap_vuln_scanner.py
++++ b/actions/nmap_vuln_scanner.py
+@@ -321,6 +321,32 @@ class NmapVulnScanner:
+         except Exception as e:
+             logger.error(f"Error updating database with vulnerabilities: {e}")
+ 
++    # Default NSE set. `vulners.nse` alone is CPE-string matching and yields
++    # hundreds of non-applicable CVEs per host. The `*-vuln-*` scripts below
++    # are *active checks* that produce a real VULNERABLE / not-vulnerable
++    # verdict, which is what the exploit engine can actually act on.
++    DEFAULT_NSE_SCRIPTS = (
++        "vulners.nse",
++        "smb-vuln-ms17-010.nse",
++        "smb-vuln-cve-2009-3103.nse",
++        "smb-vuln-cve2009-3103.nse",
++        "smb-vuln-regsvc-dos.nse",
++        "ssl-heartbleed.nse",
++        "ssl-poodle.nse",
++        "ssl-ccs-injection.nse",
++        "ssl-dh-params.nse",
++        "http-vuln-cve2017-5638.nse",
++        "http-vuln-cve2014-0160.nse",
++    )
++
++    def _nse_script_spec(self) -> str:
++        """Return the comma-joined NSE script list (config-overridable)."""
++        raw = self.shared_data.config.get("nmap_vuln_scripts")
++        if isinstance(raw, str) and raw.strip():
++            return raw.strip()
++        if isinstance(raw, (list, tuple)) and raw:
++            return ",".join(str(x).strip() for x in raw if str(x).strip())
++        return ",".join(self.DEFAULT_NSE_SCRIPTS)
+ 
+     def scan_vulnerabilities(self, ip, hostname, mac, ports):
+         combined_result = ""
+@@ -359,8 +385,10 @@ class NmapVulnScanner:
+                     "-Pn",
+                     "-sT",  # TCP connect scan (works on Wi-Fi)
+                     "-sV",  # Service version detection
++                    "--version-intensity", "7",
+                     "--script",
+-                    "vulners.nse",
++                    self._nse_script_spec(),
++                    "--script-timeout", "60s",
+                     "--top-ports",
+                     "50",
+                     ip,
+@@ -375,8 +403,10 @@ class NmapVulnScanner:
+                     "-Pn",  # Treat host as up (skip ping)
+                     "-sT",  # TCP connect scan (works on Wi-Fi)
+                     "-sV",  # Service version detection
++                    "--version-intensity", "7",
+                     "--script",
+-                    "vulners.nse",
++                    self._nse_script_spec(),
++                    "--script-timeout", "60s",
+                     "-p",
+                     ",".join(ports_to_scan),
+                     ip,
+@@ -540,9 +570,15 @@ class NmapVulnScanner:
+                         continue
+                     port_key = port_candidate
+                     current_port = port_key
+-                    # Extract service information (usually at index 2 or later)
++                    # Extract service information (usually at index 2 or later).
++                    # Keep the FULL banner (`OpenSSH 7.6p1`, `Samba smbd 4.x`)
++                    # — version-based CVE matching needs the product+version,
++                    # not just the bare service name.
+                     if len(parts) >= 3:
+                         current_service = parts[2]
++                        banner = " ".join(parts[3:]).strip()
++                        if banner and banner not in ("?", "unknown"):
++                            current_service = f"{parts[2]} {banner}"
+                     elif len(parts) >= 2:
+                         current_service = parts[1]
+                     else:
