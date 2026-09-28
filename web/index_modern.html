@@ -5066,6 +5066,7 @@
         <div id="threat-intel-tab" class="tab-content hidden">
             <div class="flex flex-wrap items-center gap-1 mb-5 border-b border-slate-800 pb-2">
                 <button id="ti-subtab-vulns" onclick="showThreatIntelSubtab('vulns')" class="ti-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors bg-Ragnar-600 text-white">Vulnerabilities by Host</button>
+                <button id="ti-subtab-exploits" onclick="showThreatIntelSubtab('exploits')" class="ti-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors text-slate-400 hover:bg-slate-700 hover:text-white">Exploit Verification</button>
                 <button id="ti-subtab-compliance" onclick="showThreatIntelSubtab('compliance')" class="ti-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors text-slate-400 hover:bg-slate-700 hover:text-white">Compliance</button>
             </div>
             <div id="ti-sub-vulns">
@@ -5288,6 +5289,41 @@
             </div>
             </div><!-- End legacy threat intel section -->
             </div><!-- End #ti-sub-vulns -->
+
+            <div id="ti-sub-exploits" class="hidden">
+                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-4 gap-3">
+                    <div>
+                        <h2 class="text-2xl font-bold text-white">🎯 Exploit Verification</h2>
+                        <p class="text-slate-400 text-sm mt-1">What was checked, how it was checked, and what to do about it. Verification only — no destructive payloads.</p>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <select id="exploit-findings-outcome" onchange="loadExploitFindings()" class="px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-sm text-white">
+                            <option value="">All outcomes</option>
+                            <option value="vulnerable" selected>Vulnerable</option>
+                            <option value="not_vulnerable">Not vulnerable</option>
+                            <option value="skipped">Skipped</option>
+                            <option value="error">Errors</option>
+                        </select>
+                        <select id="exploit-findings-severity" onchange="loadExploitFindings()" class="px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-sm text-white">
+                            <option value="">All severities</option>
+                            <option value="critical">Critical</option>
+                            <option value="high">High</option>
+                            <option value="medium">Medium</option>
+                            <option value="low">Low</option>
+                            <option value="info">Info</option>
+                        </select>
+                        <button onclick="loadExploitFindings()" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded-lg transition-colors text-sm">
+                            <svg class="w-4 h-4 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                            Refresh
+                        </button>
+                    </div>
+                </div>
+
+                <div id="exploit-findings-summary" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-5"></div>
+                <div id="exploit-findings-list" class="space-y-3">
+                    <div class="text-slate-500 text-sm py-8 text-center">Loading findings…</div>
+                </div>
+            </div><!-- End #ti-sub-exploits -->
 
             <div id="ti-sub-compliance" class="hidden">
                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-4 gap-3">

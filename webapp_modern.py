@@ -27227,6 +27227,34 @@ def get_exploit_stats():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/exploits/findings')
+def get_exploit_findings():
+    """Enriched findings for the exploit detail page.
+
+    Answers what / how / now-what per result without re-running anything.
+    Query params: outcome (vulnerable|not_vulnerable|error|skipped),
+    host (ip), severity (critical|high|medium|low|info), limit (int).
+    """
+    try:
+        from actions.exploit_engine import get_findings
+        outcome = request.args.get('outcome')
+        host = request.args.get('host')
+        severity = request.args.get('severity')
+        try:
+            limit = max(1, min(500, int(request.args.get('limit', 200))))
+        except Exception:
+            limit = 200
+        payload = get_findings(outcome=outcome, host=host, severity=severity,
+                               limit=limit)
+        payload['enabled'] = shared_data.config.get('exploit_enabled', False)
+        response = jsonify(payload)
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    except Exception as e:
+        logger.error(f"exploit findings error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/dashboard/quick')
 def get_dashboard_quick():
     """OPTIMIZED: Combined fast endpoint that returns all essential dashboard data in one call.
