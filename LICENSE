@@ -1,10 +1,25 @@
-Ragnar License
-==============
+Heimdall License
+================
 
-Ragnar is a derivative work of Bjorn (https://github.com/infinition/Bjorn),
-which is distributed under the MIT License. Ragnar therefore carries two sets
-of terms: the original MIT License for the Bjorn-derived portions, and
-Supplemental Terms from Pierre Gode covering Ragnar's own contributions.
+Heimdall is a derivative work in the Bjorn lineage:
+
+    Bjorn     (c) 2024     infinition          https://github.com/infinition/Bjorn
+    Ragnar    (c) 2024-26  Pierre Gode         https://github.com/PierreGode/Ragnar
+    Heimdall  (c) 2026     SneezeGUI
+
+Ragnar is itself a derivative work of Bjorn. Heimdall therefore carries three
+sets of terms. Each governs its own portions; none of them relicense the
+portions belonging to the others.
+
+  * Part A — MIT License, governing the original Bjorn-derived portions.
+  * Part B — Supplemental Terms (Ragnar Contributions), retained verbatim from
+    the Ragnar project and still governing Ragnar's own code, assets, branding,
+    and documentation as they appear in this repository.
+  * Part C — Heimdall Contributions, covering SneezeGUI's original additions.
+
+Where these parts conflict for a given portion, the part that governs that
+portion controls. In particular, Part A governs Bjorn-derived code; Part B
+governs Ragnar-derived code; Part C governs only Heimdall-original code.
 
 
 PART A — MIT License (original Bjorn portions)
@@ -35,6 +50,10 @@ PART B — Supplemental Terms (Ragnar contributions)
 --------------------------------------------------
 
 Copyright (c) 2024-2026 Pierre Gode <pierre@gode.one>
+
+Retained verbatim from https://github.com/PierreGode/Ragnar. These terms are
+not modified, extended, or reinterpreted by Heimdall. They continue to govern
+everything in this repository that is part of the Ragnar work.
 
 These Supplemental Terms apply to all original Ragnar code, assets, branding,
 and documentation authored by Pierre Gode and contributors (the "Ragnar
@@ -70,3 +89,48 @@ Pierre Gode <pierre@gode.one>.
 
 Where Part A (MIT) and Part B conflict for the Bjorn-derived portions, Part A
 governs those portions; Part B governs the Ragnar Contributions.
+
+
+PART C — Supplemental Terms (Heimdall contributions)
+----------------------------------------------------
+
+Copyright (c) 2026 SneezeGUI
+
+These Supplemental Terms apply to original Heimdall code, documentation, and
+assets authored by SneezeGUI and contributors (the "Heimdall Contributions").
+They do NOT apply to the Bjorn-derived or Ragnar-derived portions, which remain
+governed by Part A and Part B respectively.
+
+Permission is granted, free of charge, to use, copy, modify, and share the
+Heimdall Contributions for personal, educational, research, and internal
+non-commercial purposes, subject to the following conditions:
+
+  1. Attribution. The name "SneezeGUI", the "Heimdall" name, this LICENSE, and
+     the lineage notices naming Bjorn (infinition) and Ragnar (Pierre Gode)
+     must be retained in all copies and derivative works.
+
+  2. No sale as a product. The Heimdall Contributions may NOT be sold, resold,
+     licensed for a fee, offered as a paid product or paid service, or
+     otherwise commercially exploited, without prior written permission.
+
+  3. Authorized use only. This software performs active network scanning and
+     exploitation. Use only against systems you own or are explicitly
+     authorized to test. The authors are not liable for any use.
+
+  4. As-is. The Heimdall Contributions are provided "AS IS", without warranty
+     of any kind.
+
+Note on naming: Heimdall is a continuation of the Bjorn lineage. It is NOT the
+official Ragnar and does not claim to be. The canonical Ragnar source is
+https://github.com/PierreGode/Ragnar.git
+
+For licensing questions, open an issue on the Heimdall repository.
+
+
+Lineage summary
+---------------
+
+Bjorn (infinition) is the origin. Ragnar (Pierre Gode) is Bjorn's successor
+and remains independently maintained at its canonical source. Heimdall
+(SneezeGUI) continues from Ragnar, keeps both upstreams' terms intact, and
+shares bugfixes upstream where appropriate.
