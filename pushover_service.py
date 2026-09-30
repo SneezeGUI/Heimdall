@@ -4,13 +4,20 @@ Pushover Notification Service for Ragnar
 Sends push notifications via the Pushover API for security events.
 """
 
+import json
 import logging
+import os
 import threading
 import time
 
 logger = logging.getLogger(__name__)
 
 PUSHOVER_API_URL = "https://api.pushover.net/1/messages.json"
+
+try:
+    from notify_sinks import deliver as _sinks_deliver
+except Exception:
+    _sinks_deliver = None
 
 
 class PushoverService:
@@ -101,6 +108,36 @@ class PushoverService:
         """Return True when Pushover is both configured and enabled in config."""
         return self.shared_data.config.get("pushover_enabled", False) and self.is_configured()
 
+    def sinks_enabled(self):
+        """True when any ntfy / webhook sink is configured."""
+        cfg = self.shared_data.config
+        ntfy = bool(cfg.get("ntfy_enabled")) and bool((cfg.get("ntfy_topic") or "").strip())
+        hook = bool(cfg.get("webhook_enabled")) and bool((cfg.get("webhook_url") or "").strip())
+        return ntfy or hook
+
+    def delivery_enabled(self):
+        """Pushover *or* any sink is live."""
+        return self.is_enabled() or self.sinks_enabled()
+
+    def _dispatch(self, message, title="Ragnar", priority=0, sound="pushover"):
+        """Fan out to Pushover and to every configured sink.
+
+        Every notify_* method routes through here so adding a sink never means
+        editing the callers.
+        """
+        if self.is_enabled():
+            self.send(message, title=title, priority=priority, sound=sound)
+        if _sinks_deliver is not None and self.sinks_enabled():
+            try:
+                from notify_sinks import get_sinks
+                get_sinks(self.shared_data).reload()
+            except Exception:
+                pass
+            try:
+                _sinks_deliver(title, message, priority, shared_data=self.shared_data)
+            except Exception as exc:
+                logger.debug("sink deliver failed: %s", exc)
+
     # ------------------------------------------------------------------
     # Core send
     # ------------------------------------------------------------------
@@ -158,7 +195,7 @@ class PushoverService:
 
     def notify_new_devices(self, new_ips):
         """Notify about devices that have NEVER been seen before (deduped against DB)."""
-        if not self.is_enabled():
+        if not self.delivery_enabled():
             return
         if not self.shared_data.config.get("pushover_notify_new_device", True):
             return
@@ -174,11 +211,11 @@ class PushoverService:
         ip_list = ", ".join(sorted(truly_new)[:5])
         suffix = f" (+{count - 5} more)" if count > 5 else ""
         msg = f"⚔️ {count} new device(s) discovered on the network for the first time:\n{ip_list}{suffix}"
-        threading.Thread(target=self.send, args=(msg, "Ragnar — New Device"), daemon=True).start()
+        threading.Thread(target=self._dispatch, args=(msg, "Ragnar — New Device"), daemon=True).start()
 
     def notify_device_lost(self, lost_ips):
         """Notify when devices go offline (and remember them for back-online detection)."""
-        if not self.is_enabled():
+        if not self.delivery_enabled():
             return
         # Always track offline state even if notifications are disabled, so back-online works
         self._offline_devices.update(lost_ips)
@@ -193,11 +230,11 @@ class PushoverService:
         ip_list = ", ".join(sorted(lost_ips)[:5])
         suffix = f" (+{count - 5} more)" if count > 5 else ""
         msg = f"🛡️ {count} device(s) went offline:\n{ip_list}{suffix}"
-        threading.Thread(target=self.send, args=(msg, "Ragnar — Device Lost"), daemon=True).start()
+        threading.Thread(target=self._dispatch, args=(msg, "Ragnar — Device Lost"), daemon=True).start()
 
     def notify_device_back_online(self, appeared_ips):
         """Notify when a previously known device that went offline comes back online."""
-        if not self.is_enabled():
+        if not self.delivery_enabled():
             return
         if not self.shared_data.config.get("pushover_notify_device_back_online", False):
             return
@@ -212,11 +249,11 @@ class PushoverService:
         ip_list = ", ".join(sorted(back_online)[:5])
         suffix = f" (+{count - 5} more)" if count > 5 else ""
         msg = f"📶 {count} device(s) back online:\n{ip_list}{suffix}"
-        threading.Thread(target=self.send, args=(msg, "Ragnar — Device Back Online"), daemon=True).start()
+        threading.Thread(target=self._dispatch, args=(msg, "Ragnar — Device Back Online"), daemon=True).start()
 
     def notify_new_vulnerabilities(self, new_total):
         """Notify about newly discovered vulnerabilities (compares against last notified count)."""
-        if not self.is_enabled():
+        if not self.delivery_enabled():
             return
         if not self.shared_data.config.get("pushover_notify_new_vulnerability", True):
             return
@@ -230,11 +267,11 @@ class PushoverService:
             logger.debug(f"Pushover: suppressed vuln alert (delta={delta}) during startup grace")
             return
         msg = f"🔥 {delta} new vulnerability/vulnerabilities found! (total: {new_total})"
-        threading.Thread(target=self.send, args=(msg, "Ragnar — Vulnerability Alert", 1), daemon=True).start()
+        threading.Thread(target=self._dispatch, args=(msg, "Ragnar — Vulnerability Alert", 1), daemon=True).start()
 
     def notify_new_credentials(self, new_count, total):
         """Notify when new credentials are captured."""
-        if not self.is_enabled():
+        if not self.delivery_enabled():
             return
         if not self.shared_data.config.get("pushover_notify_new_credential", True):
             return
@@ -248,17 +285,17 @@ class PushoverService:
             logger.debug(f"Pushover: suppressed credential alert during startup grace")
             return
         msg = f"🗝️ {new_count} new credential(s) captured! (total: {total})"
-        threading.Thread(target=self.send, args=(msg, "Ragnar — Credentials"), daemon=True).start()
+        threading.Thread(target=self._dispatch, args=(msg, "Ragnar — Credentials"), daemon=True).start()
 
     def notify_wardrive_upload(self, message, title="Ragnar — Wardrive upload", priority=0):
         """Summary of a finished wardrive's auto-upload (one per drive, sent once
         every service has a final result). Gated by pushover_enabled +
         pushover_notify_wardrive_upload."""
-        if not self.is_enabled():
+        if not self.delivery_enabled():
             return False
         if not self.shared_data.config.get("pushover_notify_wardrive_upload", True):
             return False
-        threading.Thread(target=self.send, args=(message[:1024], title, priority), daemon=True).start()
+        threading.Thread(target=self._dispatch, args=(message[:1024], title, priority), daemon=True).start()
         return True
 
     # ------------------------------------------------------------------
@@ -279,7 +316,7 @@ class PushoverService:
 
     def rusense_enabled(self, kind):
         """True when RuSense alerts are on, Pushover is usable, and `kind` is enabled."""
-        if not self.is_enabled():
+        if not self.delivery_enabled():
             return False
         if not self.shared_data.config.get("rusense_notify_enabled", False):
             return False
@@ -310,7 +347,7 @@ class PushoverService:
                 return False
             self._rusense_last_sent[kind] = now
         threading.Thread(
-            target=self.send, args=(message, title, priority, sound), daemon=True
+            target=self._dispatch, args=(message, title, priority, sound), daemon=True
         ).start()
         return True
 
@@ -322,7 +359,7 @@ class PushoverService:
         on a transition into a bad verdict, and this adds a cooldown backstop).
         Sent on a daemon thread so the monitor loop never blocks. Returns True if
         a send was dispatched."""
-        if not self.is_enabled():
+        if not self.delivery_enabled():
             return False
         if not self.shared_data.config.get("pushover_notify_net_integrity", True):
             return False
@@ -337,10 +374,91 @@ class PushoverService:
                 return False
             self._net_integrity_last_sent = now
         threading.Thread(
-            target=self.send,
+            target=self._dispatch,
             args=(message, "Ragnar — Network integrity", priority, sound),
             daemon=True,
         ).start()
+        return True
+
+    # ------------------------------------------------------------------
+    # Exploit findings (Heimdall)
+    # ------------------------------------------------------------------
+    def _exploit_seen_path(self):
+        return os.path.join(self.shared_data.datadir, "exploits", "notified.json")
+
+    def _exploit_seen_load(self):
+        try:
+            with open(self._exploit_seen_path(), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _exploit_seen_save(self, seen):
+        try:
+            path = self._exploit_seen_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(seen, fh)
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.debug("exploit seen-ledger write failed: %s", exc)
+
+    @staticmethod
+    def exploit_key(finding):
+        """Stable identity for a finding so a re-scan does not re-alert."""
+        return "%s|%s|%s|%s" % (
+            finding.get("ip", ""),
+            finding.get("port", ""),
+            finding.get("cve_id", "-"),
+            finding.get("poc_id", "") or finding.get("title", ""),
+        )
+
+    def notify_exploit_finding(self, finding):
+        """Alert on a NEW vulnerable finding. Deduped across sweep cycles.
+
+        `finding` is a dict from ExploitResult.to_dict() — it carries what /
+        evidence / how / remediation, so the alert can be useful on its own.
+        """
+        if not self.delivery_enabled():
+            return False
+        if not self.shared_data.config.get("notify_on_exploit", True):
+            return False
+        if (finding.get("outcome") or "").lower() != "vulnerable":
+            return False
+
+        key = self.exploit_key(finding)
+        seen = self._exploit_seen_load()
+        if key in seen:
+            return False          # already alerted for this exact finding
+        seen[key] = time.time()
+        # keep the ledger from growing without bound
+        if len(seen) > 5000:
+            for k in sorted(seen, key=lambda x: seen[x])[:1000]:
+                seen.pop(k, None)
+        self._exploit_seen_save(seen)
+
+        sev = (finding.get("severity") or "high").lower()
+        icon = {"critical": "🔴", "high": "🟠", "medium": "🟡"}.get(sev, "🔵")
+        priority = {"critical": 2, "high": 1}.get(sev, 0)
+        title = "%s %s" % (icon, finding.get("title") or finding.get("cve_id") or "Exploit finding")
+        lines = [
+            "Host: %s:%s" % (finding.get("ip"), finding.get("port")),
+            "Severity: %s (%s)" % (sev, finding.get("confidence") or "confirmed"),
+        ]
+        if finding.get("cve_id") and finding.get("cve_id") != "-":
+            lines.append("CVE: %s" % finding["cve_id"])
+        if finding.get("evidence"):
+            lines.append("Evidence: %s" % finding["evidence"][:180])
+        if finding.get("remediation"):
+            lines.append("Fix: %s" % finding["remediation"][:180])
+        msg = "\n".join(lines)
+        threading.Thread(
+            target=self._dispatch,
+            args=(msg[:1024], title, priority), daemon=True
+        ).start()
+        logger.info("exploit alert sent: %s", title)
         return True
 
     def notify_watchtower(self, message, priority=1, sound="siren"):
@@ -352,7 +470,7 @@ class PushoverService:
         The caller (the Watchtower monitor loop) already dedupes per finding, so
         this is the last line of defence against notification spam. Sent on a
         daemon thread so the poll loop never blocks. Returns True if dispatched."""
-        if not self.is_enabled():
+        if not self.delivery_enabled():
             return False
         if not self.shared_data.config.get("watchtower_notify_enabled", True):
             return False
@@ -367,7 +485,7 @@ class PushoverService:
                 return False
             self._watchtower_last_sent = now
         threading.Thread(
-            target=self.send,
+            target=self._dispatch,
             args=(message, "Ragnar — Watchtower", priority, sound),
             daemon=True,
         ).start()

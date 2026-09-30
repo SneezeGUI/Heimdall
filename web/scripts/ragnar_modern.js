@@ -587,6 +587,26 @@ const configMetadata = {
         label: "Exploit AI — model override",
         description: "Optional. Blank = use the main AI model. Set a stronger model for better exploit triage."
     },
+    notify_on_exploit: {
+        label: "Alert on Exploit Findings",
+        description: "Push a notification (Pushover / ntfy / webhook) when a NEW vulnerable finding appears. Deduped per finding, so re-scans do not spam. Uses the sinks configured in Notifications."
+    },
+    exploit_nuclei_concurrency: {
+        label: "Nuclei Concurrency",
+        description: "Nuclei thread count (1-64). Default 5 is safe for 512 MB boards. Raise on boards with real RAM — 25 works well on 4 GB+. Applies to both targeted and broad scans."
+    },
+    exploit_nuclei_broad: {
+        label: "Broad Nuclei Scans",
+        description: "When a harvested CVE has no matching template, run a service-aware Nuclei sweep instead (http/vulnerabilities, network, ssl, dns). Finds real issues nmap's CPE matching misses. Slower per port — meant for scheduled runs."
+    },
+    exploit_nuclei_severity: {
+        label: "Nuclei Severity Floor",
+        description: "Which template severities to run: critical,high (default) or critical,high,medium. Lower floors mean more templates and more time."
+    },
+    exploit_nuclei_timeout: {
+        label: "Nuclei Scan Timeout (s)",
+        description: "Per-port time budget for a broad scan. 480 default. A timed-out scan is recorded as 'incomplete', never as clean."
+    },
     wardriving_enabled: {
         label: "Enable Wardriving",
         description: "Enable the wardriving tab for WiFi network discovery with GPS mapping. Requires a USB GPS module for location data. Note: Automatic AP mode is disabled while wardriving is enabled — AP mode (hostapd) would take over wlan0 and block WiFi scanning."
@@ -22767,10 +22787,10 @@ function displayConfigForm(config) {
         'Network': ['network_max_failed_pings'],
         'Timing': ['startup_delay', 'web_delay', 'screen_delay', 'scan_interval'],
         'Display': ['epd_type', 'screen_reversed', 'spi_clock_mhz', 'gc9a01_mascot_color', 'ssd1306_i2c_address', 'lcd1602_i2c_address', 'max7219_spi_port', 'max7219_spi_device', 'max7219_block_orientation', 'display_brightness'],
-        'Exploits': ['exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'exploit_allowlist', 'exploit_min_cvss', 'exploit_max_per_host', 'exploit_ai_triage', 'exploit_ai_model']
+        'Exploits': ['notify_on_exploit', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'exploit_allowlist', 'exploit_min_cvss', 'exploit_max_per_host', 'exploit_ai_triage', 'exploit_ai_model', 'exploit_nuclei_concurrency', 'exploit_nuclei_broad', 'exploit_nuclei_severity', 'exploit_nuclei_timeout']
     };
     
-    const knownBooleans = ['manual_mode', 'debug_mode', 'scan_vuln_running', 'scan_vuln_no_ports', 'enable_attacks', 'blacklistcheck', 'wardriving_enabled', 'wardriving_display', 'wardriving_auto_export', 'wardriving_wigle_include_zigbee', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'exploit_ai_triage'];
+    const knownBooleans = ['notify_on_exploit', 'exploit_nuclei_broad', 'exploit_ai_triage', 'manual_mode', 'debug_mode', 'scan_vuln_running', 'scan_vuln_no_ports', 'enable_attacks', 'blacklistcheck', 'wardriving_enabled', 'wardriving_display', 'wardriving_auto_export', 'wardriving_wigle_include_zigbee', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'exploit_ai_triage'];
     const alwaysShowKeys = new Set(['network_max_failed_pings', 'gc9a01_mascot_color', 'ssd1306_i2c_address', 'lcd1602_i2c_address', 'spi_clock_mhz', 'max7219_spi_port', 'max7219_spi_device', 'max7219_block_orientation', 'display_brightness', 'wardriving_scan_interval', 'wardriving_gps_port', 'wardriving_gps_baudrate']);
     const fallbackValues = {
         network_max_failed_pings: 15,
