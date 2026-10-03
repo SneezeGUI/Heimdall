@@ -28328,10 +28328,32 @@ def _install_tools_worker(names, log_path):
                   "python3 -c \"import zipfile;zipfile.ZipFile('/tmp/n.zip').extractall('/usr/local/bin')\" && "
                   "chmod +x /usr/local/bin/nuclei && rm -f /tmp/n.zip"], timeout=900)
         elif kind == "zap":
-            _run(["bash", "-c",
-                  "mkdir -p /opt && cd /opt && "
-                  "curl -sL https://github.com/zaproxy/zaproxy/releases/latest/download/"
-                  "ZAP_2.15.0_Linux.tar.gz -o zap.tgz && tar xzf zap.tgz && rm -f zap.tgz"], timeout=1800)
+            # Resolve the asset name from the GitHub API rather than hardcoding
+            # a version - a pinned filename 404s the moment they tag a release.
+            import json as _json
+            asset = None
+            try:
+                r = _sp.run(["curl", "-sL",
+                             "https://api.github.com/repos/zaproxy/zaproxy/releases/latest"],
+                            capture_output=True, text=True, timeout=60)
+                rel = _json.loads(r.stdout or "{}")
+                for a in rel.get("assets", []):
+                    n = (a.get("name") or "").lower()
+                    if n.endswith(".tar.gz") and "linux" in n:
+                        asset = a["name"]
+                        break
+            except Exception as e:
+                _log(f"  release lookup failed: {e}")
+            if not asset:
+                _log("  could not resolve ZAP release asset - skipping")
+            else:
+                _log(f"  resolved asset: {asset}")
+                _run(["bash", "-c",
+                      "mkdir -p /opt && cd /opt && "
+                      f"curl -fL --retry 3 --retry-delay 2 "
+                      f"https://github.com/zaproxy/zaproxy/releases/download/"
+                      f"{rel.get('tag_name','latest')}/{asset} -o zap.tgz && "
+                      "tar xzf zap.tgz && rm -f zap.tgz"], timeout=1800)
         else:
             _log(f"  no installer for kind={kind}")
         st = _tool_status(name)
