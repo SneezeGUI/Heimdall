@@ -25,6 +25,7 @@ declare -a SPECS=(
   "shared.py|shared-exploit-helpers|dashboard stat helpers"
   "webapp_modern.py|webapp-exploit-endpoints|API exploit fields"
   "web/scripts/ragnar_modern.js|web-dashboard-exploit-tile|dashboard tile + live update"
+  "wifi_defense.py|wifi-monitor-adapter-selection|never monitor on the uplink radio"
   "config/actions.json|actions-json-exploit-runner|ExploitRunner registry"
 )
 
