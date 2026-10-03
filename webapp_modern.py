@@ -28020,6 +28020,116 @@ def save_zap_credentials():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/api/zap/detect-auth', methods=['POST'])
+def zap_detect_auth():
+    """Probe a target and recommend the scan auth type.
+
+    Cheap and read-only: one GET (follow one redirect) and a look at
+    WWW-Authenticate / the login form / any IdP redirect. Returns the auth
+    type the UI should preselect plus the evidence, so the operator is never
+    asked to guess. Detection gets the *type*; it cannot supply credentials.
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        target = (payload.get('target') or '').strip()
+        if not target:
+            return jsonify({'error': 'target required'}), 400
+        if not re.match(r'^https?://', target, re.I):
+            target = 'http://' + target
+
+        import urllib.request as _urlreq
+        import urllib.error as _urlerr
+
+        evidence = []
+        auth_type = 'none'
+        detail = ''
+        final_url = target
+
+        try:
+            req = _urlreq.Request(target, method='GET', headers={
+                'User-Agent': 'Heimdall-AuthDetect/1.0',
+                'Accept': 'text/html,application/json,*/*',
+            })
+            opener = _urlreq.build_opener(_urlreq.HTTPRedirectHandler())
+            with opener.open(req, timeout=8) as resp:
+                body = resp.read(400000).decode('utf-8', 'replace')
+                headers = {k.lower(): v for k, v in resp.headers.items()}
+                final_url = resp.geturl() or target
+        except _urlerr.HTTPError as e:
+            body = e.read(200000).decode('utf-8', 'replace') if e.fp else ''
+            headers = {k.lower(): v for k, v in (e.headers or {}).items()}
+            evidence.append(f'HTTP {e.code}')
+        except Exception as e:
+            return jsonify({'error': f'probe failed: {e}', 'auth_type': 'none',
+                            'evidence': [str(e)]}), 200
+
+        www = (headers.get('www-authenticate') or '').lower()
+        if www:
+            evidence.append(f'WWW-Authenticate: {headers.get("www-authenticate")[:80]}')
+
+        # 1) WWW-Authenticate wins: the server literally names the scheme.
+        if 'basic' in www:
+            auth_type, detail = 'http_basic', 'server advertises Basic auth'
+        elif 'digest' in www:
+            auth_type, detail = 'http_basic', 'server advertises Digest auth'
+        elif 'bearer' in www or 'negotiate' in www or 'ntlm' in www:
+            auth_type, detail = 'http_basic', 'server advertises a token/challenge scheme'
+
+        # 2) IdP redirect -> browser-based OAuth2.
+        idp_hits = [h for h in ('login.microsoftonline.com', 'login.live.com',
+                                'accounts.google.com', 'auth0.com',
+                                'okta.com', 'keycloak', '/oauth2/',
+                                '/openid-connect', 'adfs') if h in final_url.lower()]
+        if idp_hits and auth_type == 'none':
+            auth_type = 'oauth2_bba'
+            detail = f'redirects to an identity provider ({idp_hits[0]})'
+            evidence.append(f'final URL: {final_url[:100]}')
+
+        # 3) Login form -> form-based.
+        if auth_type == 'none':
+            low = body.lower()
+            has_form = '<form' in low and ('type="password"' in low or "type='password'" in low)
+            has_login_action = any(k in low for k in
+                                   ('action="/login', 'action="/signin', 'action="/auth',
+                                    'action="/account/login', 'action="/session', 'id="password"'))
+            if has_form:
+                auth_type = 'form'
+                detail = 'HTML login form with a password field'
+                evidence.append('found <form> + password input')
+            elif has_login_action:
+                auth_type = 'form'
+                detail = 'login form action detected'
+                evidence.append('login-form action attribute')
+
+        # 4) Token endpoint / API-style -> client credentials.
+        if auth_type == 'none':
+            low = body.lower()
+            if any(k in low for k in ('token_url', 'grant_type', 'client_credentials',
+                                      'authorization_endpoint', '/oauth/token')):
+                auth_type = 'oauth2_client_creds'
+                detail = 'OAuth2 token endpoint signature in the response'
+                evidence.append('token-endpoint signature')
+
+        # 5) API key hints.
+        if auth_type == 'none':
+            low = body.lower()
+            if any(k in low for k in ('x-api-key', 'api_key', 'apikey', 'bearer_token')):
+                auth_type = 'api_key'
+                detail = 'API-key header naming present'
+                evidence.append('api-key header hints')
+
+        return jsonify({
+            'auth_type': auth_type,
+            'detail': detail,
+            'evidence': evidence,
+            'final_url': final_url,
+            'recommended': auth_type != 'none',
+        })
+    except Exception as e:
+        logger.error(f"zap detect-auth error: {e}")
+        return jsonify({'error': str(e), 'auth_type': 'none'}), 500
+
+
 @app.route('/api/zap/credentials/check', methods=['GET', 'POST'])
 def check_zap_credentials():
     """Check if credentials exist for a target (used by scan form)"""

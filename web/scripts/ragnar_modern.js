@@ -35235,6 +35235,57 @@ function hideAdvVulnNotAvailable() {
     if (notice) notice.classList.add('hidden');
 }
 
+// --- Scanner selection: sticky, intent-preserving -------------------------
+// The status refresh used to clobber the operator's choice the moment any
+// tool looked unavailable, so 'Full Scan (All Tools)' kept flipping back to
+// 'nuclei'. Persist the choice and only move it when the *chosen* option is
+// genuinely disabled; default to Full whenever everything is present.
+
+const SCANNER_SELECT_KEY = 'adv_vuln_scanner_choice';
+
+function getScannerChoices(scanners) {
+    const all = ['nuclei', 'nikto', 'sqlmap', 'nmap_vuln', 'whatweb', 'zap'];
+    return {
+        all: all.every(k => !!scanners[k]),
+        usable: all.filter(k => !!scanners[k]),
+    };
+}
+
+function applyScannerSelection(scanners) {
+    const sel = document.getElementById('adv-vuln-scanner');
+    if (!sel) return;
+    const { all, usable } = getScannerChoices(scanners);
+    const saved = localStorage.getItem(SCANNER_SELECT_KEY) || '';
+    const options = Array.from(sel.options).map(o => o.value);
+
+    // 1. Honour the operator's persisted choice whenever it is still usable.
+    if (saved && options.includes(saved)) {
+        const needsZap = saved.startsWith('zap_') || saved === 'full';
+        const zapOk = !!scanners.zap;
+        const needsNuclei = saved === 'nuclei' || saved === 'full';
+        const nucleiOk = !!scanners.nuclei;
+        if ((!needsZap || zapOk) && (!needsNuclei || nucleiOk)) {
+            if (sel.value !== saved) sel.value = saved;
+            return;
+        }
+    }
+
+    // 2. Nothing usable yet - leave it alone.
+    if (!usable.length) return;
+
+    // 3. Default to Full Scan when every scanner is present; otherwise the
+    //    first usable single scanner. Never silently pick 'nuclei' unless it
+    //    is actually one of the usable ones.
+    const prefer = all ? 'full' : (usable.includes('nuclei') ? 'nuclei' : usable[0]);
+    if (options.includes(prefer) && sel.value !== prefer) {
+        sel.value = prefer;
+    }
+}
+
+function rememberScannerSelection(value) {
+    try { localStorage.setItem(SCANNER_SELECT_KEY, value); } catch (e) { /* private mode */ }
+}
+
 function updateScannerStatus(scanners, nucleiTemplates) {
     if (!scanners) return;
     // Normalise once, at the top. `scanners` comes from server_capabilities,
@@ -35324,12 +35375,10 @@ function updateScannerStatus(scanners, nucleiTemplates) {
         nucleiOption.textContent = scanners.nuclei ? 'Nuclei (Templates)'
             : meshNuclei ? `Nuclei (via ${_mesh.nuclei.viking})`
             : 'Nuclei (needs 900MB RAM)';
-        const sel = document.getElementById('adv-vuln-scanner');
-        if (!nucleiEff && sel && sel.value === 'nuclei') {
-            const fallback = ['nikto', 'sqlmap', 'nmap_vuln', 'whatweb'].find(k => scanners[k]);
-            sel.value = fallback || 'full';
-        }
     }
+
+    // Selection is sticky and intent-preserving - see applyScannerSelection.
+    applyScannerSelection(scanners);
 
     // Update ZAP control panel visibility and status
     updateZapControlPanel(scanners, meshZap, meshZapViking);
@@ -35569,6 +35618,7 @@ async function loadAdvVulnFindings() {
 async function quickRescanHost(host) {
     const scannerSelect = document.getElementById('adv-vuln-scanner');
     const scanType = scannerSelect ? scannerSelect.value : 'nmap_vuln';
+    if (scannerSelect && scannerSelect.value) rememberScannerSelection(scannerSelect.value);
 
     try {
         const response = await fetch('/api/vuln-advanced/scan', {
@@ -36269,10 +36319,6 @@ function updateZapControlPanel(scanners, meshZap, meshZapViking) {
                 opt.textContent = `ZAP Full Scan (via ${meshZapViking})`;
             }
         });
-        const scannerSelect = document.getElementById('adv-vuln-scanner');
-        if (!zapUsable && scannerSelect && scannerSelect.value.startsWith('zap_')) {
-            scannerSelect.value = 'nuclei';
-        }
     }
 
     if (!panel) return;
@@ -36659,7 +36705,81 @@ function toggleCredentialFields() {
 /**
  * Toggle scan form auth fields based on selected auth type
  */
+// --- Scan auth auto-detection -------------------------------------------
+// Probes the target and preselects the auth type so the operator never has to
+// guess. Detection gets the TYPE; it cannot supply credentials.
+
+const AUTH_DETECT_CACHE = {};
+
+function targetForAuthDetect() {
+    const el = document.getElementById('adv-vuln-target');
+    return (el && el.value || '').trim();
+}
+
+async function detectScanAuth(force) {
+    const target = targetForAuthDetect();
+    if (!target) {
+        addConsoleMessage('Enter a target before auto-detecting auth', 'warning');
+        return;
+    }
+    const sel = document.getElementById('zap-auth-type');
+    const out = document.getElementById('zap-auth-autodetect');
+    if (!force && AUTH_DETECT_CACHE[target]) {
+        applyDetectedAuth(AUTH_DETECT_CACHE[target], out, sel);
+        return;
+    }
+    if (out) {
+        out.classList.remove('hidden');
+        out.textContent = 'Probing ' + target + ' …';
+    }
+    try {
+        const d = await fetchAPI('/api/zap/detect-auth', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ target })
+        });
+        AUTH_DETECT_CACHE[target] = d;
+        applyDetectedAuth(d, out, sel);
+    } catch (e) {
+        if (out) {
+            out.textContent = 'Detection failed: ' + e.message;
+            out.className = 'text-xs text-red-400 mt-1';
+        }
+    }
+}
+
+function applyDetectedAuth(d, out, sel) {
+    if (!d) return;
+    const type = d.auth_type || 'none';
+    if (sel && Array.from(sel.options).some(o => o.value === type)) {
+        sel.value = type;
+        if (typeof toggleScanAuthFields === 'function') toggleScanAuthFields();
+    }
+    if (out) {
+        const label = { '': 'None', none: 'None', form: 'Form-based',
+            http_basic: 'HTTP Basic', bearer_token: 'Bearer token',
+            api_key: 'API key', cookie: 'Cookie',
+            oauth2_bba: 'OAuth2 (browser)', oauth2_client_creds: 'OAuth2 (client creds)',
+            script_auth: 'Script' }[type] || type;
+        out.classList.remove('hidden');
+        out.className = d.recommended
+            ? 'text-xs text-emerald-400 mt-1'
+            : 'text-xs text-slate-400 mt-1';
+        out.textContent = 'Detected: ' + label
+            + (d.detail ? ' — ' + d.detail : '')
+            + (d.recommended ? '  (credentials still required)' : '');
+    }
+    if (type !== 'none' && type !== '') {
+        addConsoleMessage('Scan auth detected for ' + (targetForAuthDetect() || 'target') + ': ' + type, 'success');
+    }
+}
+
 function toggleScanAuthFields() {
+    const _sel = document.getElementById('zap-auth-type');
+    if (_sel && _sel.value === 'auto') {
+        detectScanAuth(true);
+        return;
+    }
     const authType = document.getElementById('zap-auth-type');
     const authFieldsWrapper = document.getElementById('zap-auth-fields-wrapper');
     const loginUrlContainer = document.getElementById('zap-login-url-container');
