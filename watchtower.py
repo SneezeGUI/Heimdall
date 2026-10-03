@@ -115,6 +115,11 @@ DEFAULT_SOURCES = {
                        'paths': ['/var/log/ragnar/mikrotik_guard.jsonl']},
     'aruba_guard': {'label': 'Aruba Guard (ArubaOS PAPI)',
                     'paths': ['/var/log/ragnar/aruba_guard.jsonl']},
+    'apc_guard': {'label': 'APC Guard (NMC Ripple20)',
+                  'paths': ['/var/log/ragnar/apc_guard.jsonl']},
+    # Continuous apcguard@<iface> daemon (python/apcguard.py, scripts/apcguard@.service).
+    'apcguard': {'label': 'APC Guard daemon (NMC Ripple20)',
+                 'paths': ['/var/log/ragnar/apcguard.jsonl']},
     # In-app L5-L7 passive observers (ssh_watch / telnet_watch do_*_watch) emit
     # their non-info findings here so the unified pane tails them too.
     'ssh_watch':     {'label': 'SSH Watch (regreSSHion / Terrapin)',
@@ -263,7 +268,7 @@ def normalize(raw, source):
     if ts is None:
         ts = time.time()
     codes = _codes(raw)
-    title = _first(raw, 'summary', 'reason', 'detail', 'message', 'msg',
+    title = _first(raw, 'summary', 'reason', 'title', 'detail', 'message', 'msg',
                    'signal', 'sni', 'subject_cn')
     if not title:
         title = ', '.join(codes) if codes else source
@@ -484,6 +489,11 @@ def _self_test():
     ck('igmp sev HIGH->high', igmp['severity'] == 'high')
     ck('igmp rule->codes', igmp['codes'] == ['querier_spoof'])
     ck('igmp signal as title', igmp['title'] == 'rogue querier')
+    apc = normalize({'module': 'apcguard', 'code': 'APC-101', 'severity': 'critical',
+                     'title': 'Fragmented IPv4-in-IP tunnel datagram sent to an NMC',
+                     'detail': {'ident': 7}, 'src': '8.8.8.8'}, 'apcguard')
+    ck('apcguard title beats dict detail', apc['title'].startswith('Fragmented')
+       and apc['severity'] == 'critical')
 
     snmp = normalize({'module': 'snmpwatch', 'severity': 'CRITICAL',
                       'src': '10.0.0.7', 'dst': '10.0.0.1', 'reason': 'SNMP write'},

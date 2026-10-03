@@ -315,6 +315,15 @@ if ! command -v rtl_test >/dev/null 2>&1; then
         echo -e "  ${YELLOW}⚠${NC} Could not install rtl-sdr/rtl-433 — RTL-SDR features stay disabled until they're present"
     fi
 fi
+# uhubctl lets the SDR self-healer cut a USB port's 5 V for a few seconds — the
+# software equivalent of replugging a dongle that is stuck on the bus.
+if ! command -v uhubctl >/dev/null 2>&1; then
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends uhubctl >/dev/null 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Installed uhubctl (SDR self-healing: USB port power-cycle)"
+    else
+        echo -e "  ${YELLOW}⚠${NC} Could not install uhubctl — SDR recovery falls back to a USB controller reset"
+    fi
+fi
 if command -v rtl_test >/dev/null 2>&1 || dpkg -s rtl-sdr >/dev/null 2>&1; then
     _rtl_bl=/etc/modprobe.d/blacklist-rtl-sdr.conf
     if ! grep -q "dvb_usb_rtl28xxu" "$_rtl_bl" 2>/dev/null; then
@@ -589,6 +598,78 @@ if [ -n "$BOOT_CFG" ] && grep -qaE 'Raspberry Pi 5|Raspberry Pi 500' /proc/devic
     fi
 fi
 
+echo -e "${BLUE}Step 6.66: USB HID keyboard gadget (Rubber Ducky)...${NC}"
+# OPT-IN only: enable with RAGNAR_HID_GADGET=1, or once the marker file
+# /etc/ragnar/hid_gadget.enabled exists (written by a prior opt-in or the web
+# UI). Default OFF leaves the plain ECM gadget — and boards like the Cardputer
+# — untouched. When enabled it: (1) adds the dwc2 peripheral controller so a UDC
+# exists, (2) drops the legacy g_ether that otherwise claims the UDC and de-dupes
+# the cmdline, (3) adds the hid.usb0 function to the gadget script. Boot-config
+# changes apply on the next reboot; usb0 networking is not disturbed live.
+GADGET_SH=/usr/local/bin/usb-gadget.sh
+if [ "${RAGNAR_HID_GADGET:-0}" = "1" ] || [ -f /etc/ragnar/hid_gadget.enabled ]; then
+    mkdir -p /etc/ragnar && touch /etc/ragnar/hid_gadget.enabled
+    if [ -f /boot/firmware/config.txt ] && ! grep -qE '^[[:space:]]*dtoverlay=dwc2' /boot/firmware/config.txt; then
+        cp /boot/firmware/config.txt "/boot/firmware/config.txt.ragnar-$(date +%Y%m%d-%H%M%S)"
+        printf '\n[all]\n# Ragnar: dwc2 USB peripheral controller for HID gadget\ndtoverlay=dwc2,dr_mode=peripheral\n' >> /boot/firmware/config.txt
+        echo -e "  ${GREEN}✓${NC} Added dwc2 peripheral overlay (reboot to apply)"
+    fi
+    if [ -f /boot/firmware/cmdline.txt ] && grep -q 'g_ether' /boot/firmware/cmdline.txt; then
+        cp /boot/firmware/cmdline.txt "/boot/firmware/cmdline.txt.ragnar-$(date +%Y%m%d-%H%M%S)"
+        python3 - /boot/firmware/cmdline.txt <<'PYEOF'
+import sys, re
+p = sys.argv[1]; s = open(p).read().strip()
+s = s.replace('modules-load=dwc2,g_ether', '').strip()
+s = re.sub(r'\s+', ' ', s)
+if 'modules-load=dwc2' not in s:
+    s = s.replace('rootwait', 'rootwait modules-load=dwc2', 1)
+open(p, 'w').write(s + '\n')
+PYEOF
+        echo -e "  ${GREEN}✓${NC} Removed legacy g_ether from cmdline (reboot to apply)"
+    fi
+    echo "blacklist g_ether" > /etc/modprobe.d/ragnar-no-g_ether.conf
+    if [ -f "$GADGET_SH" ] && ! grep -q 'hid.usb0' "$GADGET_SH"; then
+        cp "$GADGET_SH" "${GADGET_SH}.ragnar-$(date +%Y%m%d-%H%M%S)"
+        if python3 - "$GADGET_SH" <<'PYEOF'
+import sys
+path = sys.argv[1]
+block = r'''
+# HID keyboard function (Rubber Ducky) — only when opted in.
+if [ -f /etc/ragnar/hid_gadget.enabled ]; then
+    if [ ! -d functions/hid.usb0 ]; then
+        mkdir -p functions/hid.usb0
+        echo 1 > functions/hid.usb0/protocol
+        echo 1 > functions/hid.usb0/subclass
+        echo 8 > functions/hid.usb0/report_length
+        printf '\x05\x01\x09\x06\xa1\x01\x05\x07\x19\xe0\x29\xe7\x15\x00\x25\x01\x75\x01\x95\x08\x81\x02\x95\x01\x75\x08\x81\x03\x95\x05\x75\x01\x05\x08\x19\x01\x29\x05\x91\x02\x95\x01\x75\x03\x91\x03\x95\x06\x75\x08\x15\x00\x25\x65\x05\x07\x19\x00\x29\x65\x81\x00\xc0' > functions/hid.usb0/report_desc
+    fi
+    if [ -L configs/c.1/hid.usb0 ]; then
+        rm configs/c.1/hid.usb0
+    fi
+    ln -s functions/hid.usb0 configs/c.1/
+fi
+'''
+anchor = 'ln -s functions/ecm.usb0 configs/c.1/\n'
+s = open(path).read()
+if 'hid.usb0' in s:
+    sys.exit(0)
+if anchor not in s:
+    sys.exit(3)
+open(path, 'w').write(s.replace(anchor, anchor + block, 1))
+sys.exit(0)
+PYEOF
+        then
+            echo -e "  ${GREEN}✓${NC} Added HID keyboard function to USB gadget (reboot to expose /dev/hidg0)"
+        else
+            echo -e "  ${YELLOW}!${NC} Could not patch $GADGET_SH automatically; reinstall to enable the HID gadget"
+        fi
+    elif [ -f "$GADGET_SH" ]; then
+        echo -e "  ${GREEN}✓${NC} HID gadget function already present"
+    fi
+else
+    echo -e "  ${GREEN}·${NC} HID keyboard gadget not enabled (opt in with RAGNAR_HID_GADGET=1)"
+fi
+
 echo -e "${BLUE}Step 6.7: Refreshing kiosk wrapper (if installed)...${NC}"
 # Existing kiosk installs keep a COPY of the wrapper at /usr/local/bin; the
 # active copy only updates when kiosk is re-installed. Refresh it here so the
@@ -775,6 +856,17 @@ elif [ "$_MESH_WANTED" = true ]; then
     echo -e "  ${YELLOW}⚠${NC} Mesh is enabled but scripts/setup_mesh.sh is missing"
 else
     echo -e "  ${GREEN}✓${NC} Mesh not enabled on this unit — nothing to do"
+fi
+
+echo -e "${BLUE}Step 6.97: Cellular uplink fallback hooks...${NC}"
+# A USB-tethered hotspot/phone must stay a BACKUP uplink: pin its route metric
+# above Wi-Fi/Ethernet (NetworkManager conf.d + dhcpcd hook). Idempotent.
+if [ -f "$(dirname "$0")/cellular_uplink.py" ]; then
+    if python3 "$(dirname "$0")/cellular_uplink.py" install >/dev/null 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Cellular fallback hooks in place"
+    else
+        echo -e "  ${YELLOW}⚠${NC} Cellular fallback hook install failed (the service retries at start)"
+    fi
 fi
 
 echo -e "${BLUE}Step 7: Starting ragnar service...${NC}"

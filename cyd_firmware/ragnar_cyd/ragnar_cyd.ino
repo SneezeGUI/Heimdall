@@ -2199,6 +2199,8 @@ void loop() {
   if (g_wfActive) {
     serialSendWfReq(true);
     wasWf = true;
+    static uint32_t lastWfIngest = 0;
+    if (millis() - lastWfIngest > 15000) { lastWfIngest = millis(); serialSendIngest(); }
     pollTouchFor(1500);                  // drains wf frames, renders, handles touch
     return;
   }
@@ -2208,6 +2210,8 @@ void loop() {
   if (g_meshActive || g_wifiActive) {
     if (g_meshActive) { serialSendMeshReq(true); wasMesh = true; }
     if (g_wifiActive) { serialSendWifiReq(true); wasWifi = true; }
+    static uint32_t lastStreamIngest = 0;
+    if (millis() - lastStreamIngest > 15000) { lastStreamIngest = millis(); serialSendIngest(); }
     pollTouchFor(1500);
     return;
   }

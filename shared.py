@@ -787,6 +787,25 @@ class SharedData:
             "ethernet_scan_enabled": True,
             "ethernet_prefer_over_wifi": True,
             "ethernet_auto_detect": True,
+            # Cellular uplink fallback (cellular_uplink.py): a USB-tethered
+            # hotspot/phone/LTE modem is pinned to a high route metric so it
+            # only carries traffic when Ethernet and Wi-Fi are down, and is
+            # never used as a scan target (metered data, carrier LAN).
+            "cellular_fallback_enabled": True,
+            "cellular_route_metric": 20000,
+            "cellular_allow_scan": False,
+            # Space/comma-separated overrides for detection by driver/vendor.
+            "cellular_force_ifaces": "",
+            "cellular_exclude_ifaces": "",
+            # Heartbeat failover: probe public targets THROUGH each primary
+            # uplink every ~10 s; fail over after N bad rounds (only if the
+            # cellular link passes too), fail back after M good rounds.
+            "cellular_heartbeat_enabled": True,
+            "cellular_heartbeat_targets": "1.1.1.1:443 8.8.8.8:443 9.9.9.9:443",
+            "cellular_heartbeat_min_ok": 1,
+            "cellular_failover_after": 3,
+            "cellular_failback_after": 6,
+            "cellular_promoted_metric": 50,
             # When True, the e-Paper shows an Ethernet-focused network
             # diagnostic screen (link / IP / switch port), auto-cycling pages
             # every 5s. Web-toggled from Network > Diagnostics. e-Paper only.
@@ -878,6 +897,11 @@ class SharedData:
             "ai_max_tokens": 500,
             "ai_temperature": 0.7,
 
+            "__title_pushover__": "Push Notifications",
+            # Master switch for push notifications (key name kept for compat).
+            # Delivered to every configured channel: Pushover and/or Slack
+            # (RAGNAR_SLACK_WEBHOOK_URL in .env).
+
             # Exploitation engine (actions/exploit_engine.py).
             # OFF by default: exploitation can crash services. Scope is
             # RFC1918-only unless allowlisted / opted in. See docs/EXPLOIT_ENGINE.md
@@ -891,8 +915,6 @@ class SharedData:
             "exploit_max_per_host": 5,
             "exploit_ai_triage": True,
             "exploit_ai_model": "",
-
-            "__title_pushover__": "Pushover Notifications",
             "pushover_enabled": False,
             "pushover_notify_new_device": True,
             "pushover_notify_new_vulnerability": True,
@@ -900,6 +922,7 @@ class SharedData:
             "pushover_notify_device_lost": False,
             "pushover_notify_device_back_online": False,
             "pushover_notify_wardrive_upload": True,  # summary after each auto-uploaded wardrive
+            "pushover_notify_cellular": True,  # uplink failover to / restore from a tethered cellular hotspot
 
             "__title_rusense_pushover__": "RuSense Sensing Alerts",
             # Master switch for camera-free (WiFi-CSI) surveillance alerts. Sent
@@ -975,6 +998,8 @@ class SharedData:
             "wardriving_scan_interval": 2,
             "wardriving_gps_port": "auto",
             "wardriving_gps_baudrate": 9600,
+            "wardriving_gps_assist": True,
+            "wardriving_gps_set_clock": True,
             "wardriving_interfaces": [],
             "wardriving_auto_export": True,
             "wardriving_wigle_include_zigbee": False,
@@ -1304,6 +1329,11 @@ class SharedData:
         self.display_should_exit = False
         self.orchestrator_should_exit = False
         self.webapp_should_exit = False
+        # Set True while a wardriving session is active. The orchestrator reads
+        # this to pause its active scans (nmap port/vuln, attacks): on a small
+        # board those scans thrash RAM/CPU and starve gpsd, so cold-start GPS
+        # never completes while wardriving. Passive wardriving keeps running.
+        self.wardriving_session_active = False
         self.web_portal_active = True  # Tracks whether the web portal is currently running
         self.ragnar_instance = None
         self.gateway_info = {}  # Populated by NetworkScanner.get_gateway_info()

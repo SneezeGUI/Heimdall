@@ -155,6 +155,8 @@ scoped and fail‑closed in `webapp_modern.py`'s `check_authentication()`.
   cabled to the Pi, no WiFi/token. PTY-loopback verified.
 - ✅ On-device captive-portal provisioning for the WiFi build (no secrets in `config.h`).
 - ✅ ESP Web Tools flasher page (`flasher/index.html`) + committed bins (serial build).
+- ✅ Waterfall/Mesh/WiFi screens send periodic ingest (every 15 s) so the node
+  stays live in the registry instead of going stale.
 
 See [cyd-hybrid-node.md](cyd-hybrid-node.md) for the full design
 and API reference.

@@ -14,7 +14,7 @@ import sqlite3
 import threading
 import subprocess
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger("Wardriving")
 
@@ -117,8 +117,15 @@ SESSION_FINISHED_HOOKS = []
 
 # A row whose position is within this many metres of the GPS track (inside the
 # row's own first..last-seen window, plus slack) is re-timed to that moment.
-_ALIGN_MAX_M = 300
+_ALIGN_MAX_M = 50
 _ALIGN_SLACK_S = 15
+# Between two consecutive fixes a row is timed by interpolating along the
+# segment joining them - the track is logged only every ~9 s, so snapping to
+# the nearest fix gave rows 100 m apart the same second (a 300+ km/h "jump"
+# to Wardrift). A segment longer than this, or faster than any car, is a lost
+# fix / glitch and is never interpolated across.
+_ALIGN_SEG_MAX_S = 30
+_ALIGN_SEG_MAX_MPS = 70
 
 
 def _ts_to_epoch(s):
@@ -190,10 +197,21 @@ def _align_rows_to_track(recs, track):
             # Bound the scan on very long sightings (a network heard for hours).
             step = max(1, (hi - lo) // 4000)
             for i in range(lo, hi, step):
-                _, tlat, tlon = track[i]
-                d2 = ((tlat - lat) * 110540.0) ** 2 + ((tlon - lon) * kx) ** 2
-                if best is None or d2 < best[0]:
-                    best = (d2, track[i][0])
+                ta, alat, alon = track[i]
+                ax, ay = (alon - lon) * kx, (alat - lat) * 110540.0
+                cand = (ax * ax + ay * ay, ta)
+                if step == 1 and i + 1 < len(track):
+                    tb, blat, blon = track[i + 1]
+                    bx, by = (blon - lon) * kx, (blat - lat) * 110540.0
+                    sx, sy = bx - ax, by - ay
+                    seg2 = sx * sx + sy * sy
+                    dt = tb - ta
+                    if 0 < dt <= _ALIGN_SEG_MAX_S and seg2 > 0 and seg2 <= (_ALIGN_SEG_MAX_MPS * dt) ** 2:
+                        f = min(1.0, max(0.0, -(ax * sx + ay * sy) / seg2))
+                        px, py = ax + f * sx, ay + f * sy
+                        cand = (px * px + py * py, ta + f * dt)
+                if best is None or cand[0] < best[0]:
+                    best = cand
             if best is not None and best[0] <= _ALIGN_MAX_M ** 2:
                 when = best[1]
             else:
@@ -538,10 +556,61 @@ class WardrivingSession:
                     value TEXT
                 )
             """)
+            # INSERT OR IGNORE: only a NEW session gets its start time here.
+            # _init_db also runs every time an existing session is opened
+            # (viewing, export, upload, backfill), and REPLACE used to stamp
+            # "now" over the real start — old drives then showed up in the
+            # session list under whatever date they were last opened.
             conn.execute(
-                "INSERT OR REPLACE INTO session_info (key, value) VALUES (?, ?)",
+                "INSERT OR IGNORE INTO session_info (key, value) VALUES (?, ?)",
                 ('start_time', datetime.now(timezone.utc).isoformat())
             )
+
+    _TIMED_TABLES = ('networks', 'network_observations', 'bluetooth_devices',
+                     'cell_towers', 'zigbee_devices')
+
+    def shift_times(self, delta, cutoff_epoch):
+        """Move every timestamp recorded before a wall-clock step forward by
+        the step.
+
+        A Pi has no RTC: booted away from Wi-Fi it runs on the last saved
+        time until NTP or GPS corrects it, and everything recorded until then
+        is stamped with the wrong clock. When the clock steps forward by
+        `delta` seconds, rows stamped before `cutoff_epoch` (the moment of the
+        step on the OLD clock) are shifted, so the session reads in real time.
+        Rows written after the step already carry the corrected clock.
+        """
+        def _shift_iso(v):
+            if not v:
+                return v
+            try:
+                t = datetime.fromisoformat(v.replace('Z', '+00:00'))
+            except ValueError:
+                return v
+            if t.timestamp() >= cutoff_epoch:
+                return v
+            return (t + timedelta(seconds=delta)).isoformat()
+
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.create_function('ragnar_shift_iso', 1, _shift_iso)
+                for t in self._TIMED_TABLES:
+                    try:
+                        conn.execute(f"UPDATE {t} SET first_seen = ragnar_shift_iso(first_seen), "
+                                     f"last_seen = ragnar_shift_iso(last_seen)")
+                    except sqlite3.OperationalError:
+                        pass                    # table absent in an old session
+                conn.execute("UPDATE gps_track SET timestamp = timestamp + ? WHERE timestamp < ?",
+                             (delta, cutoff_epoch))
+                conn.execute("UPDATE session_info SET value = ragnar_shift_iso(value) "
+                             "WHERE key = 'start_time'")
+                prev = conn.execute("SELECT value FROM session_info WHERE key = 'clock_steps'").fetchone()
+                note = f"{datetime.now(timezone.utc).isoformat()} {delta:+.1f}s"
+                conn.execute("INSERT OR REPLACE INTO session_info (key, value) VALUES ('clock_steps', ?)",
+                             ((prev[0] + '; ' if prev else '') + note,))
+            if self.start_time < cutoff_epoch:
+                self.start_time += delta
+            self._stats_cache = None
 
     def upsert_network(self, bssid, ssid, security, channel, frequency,
                        rssi, lat, lon, alt, speed, hdop, interface=''):
@@ -2245,7 +2314,9 @@ class WardrivingEngine:
             gps_port = None
         self._gps = GPSManager(
             port=gps_port, exclude_ports=esp_exclude,
-            state_file=os.path.join(self.data_dir, 'last_gps.json'))
+            state_file=os.path.join(self.data_dir, 'last_gps.json'),
+            assist=self.shared_data.config.get('wardriving_gps_assist', True),
+            set_clock=self.shared_data.config.get('wardriving_gps_set_clock', True))
         gps_ok = self._gps.start()
         if not gps_ok:
             logger.warning(f"GPS not available: {self._gps.error}. Wardriving without GPS.")
@@ -2254,6 +2325,12 @@ class WardrivingEngine:
         self.session = WardrivingSession(self.data_dir)
         self._running = True
         self._starting = False
+        # Tell the orchestrator to pause its active scans (nmap/attacks) while
+        # we drive — they thrash a small board and starve cold-start GPS.
+        try:
+            self.shared_data.wardriving_session_active = True
+        except Exception:
+            pass
         self.error = None
         self.scans_completed = 0
         self.bt_count = 0
@@ -2272,6 +2349,11 @@ class WardrivingEngine:
         # Start scanning threads
         self._thread = threading.Thread(target=self._scan_loop, daemon=True, name="wardriving")
         self._thread.start()
+
+        # Repair the session when the wall clock steps (NTP or GPS correcting
+        # an RTC-less Pi that booted on a stale time).
+        threading.Thread(target=self._clock_watch_loop, daemon=True,
+                         name="wardriving-clock").start()
 
         # Start Bluetooth scanning thread
         self._bt_thread = threading.Thread(target=self._bt_scan_loop, daemon=True, name="wardriving-bt")
@@ -2499,6 +2581,11 @@ class WardrivingEngine:
 
         self._running = False
         self._starting = False
+        # Let the orchestrator resume active scans now that we've stopped.
+        try:
+            self.shared_data.wardriving_session_active = False
+        except Exception:
+            pass
         if self.session:
             self.session.close()
         if self._gps:
@@ -3197,6 +3284,8 @@ class WardrivingEngine:
                 sid = f[8:-3]  # strip 'session_' and '.db'
                 db_path = os.path.join(wd_dir, f)
                 size = os.path.getsize(db_path)
+                if size == 0 and not os.path.exists(db_path + '-wal'):
+                    continue  # created, never written (power cut at start): nothing to show
                 try:
                     with sqlite3.connect(db_path) as conn:
                         conn.row_factory = sqlite3.Row
@@ -3204,13 +3293,25 @@ class WardrivingEngine:
                         info = {}
                         for row in conn.execute("SELECT key, value FROM session_info").fetchall():
                             info[row[0]] = row[1]
+                        first, last = conn.execute(
+                            "SELECT MIN(first_seen), MAX(last_seen) FROM networks").fetchone()
+                    start, end = info.get('start_time', ''), info.get('end_time', '')
+                    # The recorded data is the ground truth for when a drive
+                    # happened. A start_time later than the first sighting was
+                    # overwritten by an older build when the session was
+                    # reopened; a session cut off by a power loss never got
+                    # an end_time. Both are recovered from the networks table.
+                    if first and (not start or start > first):
+                        start = first
+                    if last and not end:
+                        end = last
                     sessions.append({
                         'session_id': sid,
                         'db_path': db_path,
                         'file_size': size,
                         'total_networks': total,
-                        'start_time': info.get('start_time', ''),
-                        'end_time': info.get('end_time', ''),
+                        'start_time': start,
+                        'end_time': end,
                     })
                 except Exception:
                     sessions.append({'session_id': sid, 'error': 'corrupt'})
@@ -3311,6 +3412,41 @@ class WardrivingEngine:
         except OSError:
             pass
         return False
+
+    # A wall-clock step at least this large during a session is treated as
+    # a correction (NTP sync, or the clock set from GPS) and repaired. Smaller
+    # wobble is ignored. Checked every second so rows written after the step
+    # are never mistaken for pre-step ones.
+    _CLOCK_STEP_MIN_S = 10.0
+
+    def _clock_watch_loop(self):
+        """Detect wall-clock steps (wall − monotonic changing) and shift the
+        running session's earlier timestamps by the step."""
+        ref = time.time() - time.monotonic()
+        while self._running:
+            time.sleep(1)
+            new_ref = time.time() - time.monotonic()
+            step = new_ref - ref
+            if abs(step) < self._CLOCK_STEP_MIN_S:
+                ref = new_ref if abs(step) > 0.5 else ref
+                continue
+            cutoff = time.monotonic() + ref          # "now" on the old clock
+            ref = new_ref
+            session = self.session
+            if session is None:
+                continue
+            if step < 0:
+                # A backwards step makes old and new stamps overlap; there is
+                # no safe way to tell them apart, so only report it.
+                logger.warning(f"Wall clock stepped {step:+.0f} s backwards during a "
+                               f"wardriving session; earlier timestamps left as recorded")
+                continue
+            try:
+                session.shift_times(step, cutoff)
+                logger.warning(f"Wall clock corrected by {step:+.0f} s during the session "
+                               f"(Pi has no RTC) — shifted this session's earlier timestamps")
+            except Exception as e:
+                logger.error(f"Session clock repair failed: {e}")
 
     def _scan_loop(self):
         """Main scanning loop — runs fast continuous scans."""
@@ -3553,7 +3689,7 @@ class WardrivingEngine:
                     for line in r.stdout.split('\n'):
                         if '(disabled)' in line.lower():
                             continue
-                        m = re.search(r'\*\s*(\d{4,5})\s*MHz', line)
+                        m = re.search(r'\*\s*(\d{4,5})(?:\.\d+)?\s*MHz', line)
                         if m:
                             supported.add(int(m.group(1)))
             except Exception as e:
@@ -3617,7 +3753,7 @@ class WardrivingEngine:
                         for line in r.stdout.split('\n'):
                             if '(disabled)' in line.lower():
                                 continue
-                            m = re.search(r'\*\s*(\d{4,5})\s*MHz', line)
+                            m = re.search(r'\*\s*(\d{4,5})(?:\.\d+)?\s*MHz', line)
                             if m:
                                 bands.add(self._freq_to_band(int(m.group(1))))
                 except Exception:

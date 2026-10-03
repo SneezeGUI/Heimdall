@@ -289,3 +289,6 @@ certs/
 *.key
 *.crt
 *.pem
+
+# Console scripts — seeded at runtime, user-editable (never overwrite on update)
+data/console_scripts/

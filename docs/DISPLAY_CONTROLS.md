@@ -141,6 +141,22 @@ become wardriving actions:
 | **KEY2** | **Reconnect** to a known Wi‑Fi (wardriving keeps running) |
 | **KEY3** | **Start / stop** the phone-access AP |
 
+> **What "known Wi‑Fi" means (KEY2 here, KEY4 on the 2.7" HAT):** Ragnar's own
+> saved networks first, then **every Wi‑Fi profile saved in NetworkManager** —
+> the ones added by the Pi Imager, `nmcli` or the desktop, which is where most
+> units keep them. It rescans, then brings up the best saved network **in
+> range** (NetworkManager priority first, then the one used most recently) with
+> `nmcli connection up`, using its stored password as-is. AP profiles, and
+> profiles pinned to a Wi‑Fi dongle that isn't plugged in, are skipped. This is
+> the reliable way back online after carrying the unit out of range and back:
+> NetworkManager stops retrying a profile after a few failed attempts, and this
+> clears that back-off. The web UI's **Reconnect** button runs the same code.
+> Previously, with Ragnar's own list empty, the key logged "No known networks
+> configured" and did nothing.
+>
+> KEY2 reconnects only on the **wardriving screens**. On the normal Ragnar
+> pages (after KEY1) it rotates the screen.
+
 The screens, in carousel order (the footer shows the key hints and an `n/6`
 counter):
 
@@ -217,7 +233,9 @@ The **IFACE** card picks which NIC the egress tests (**Speedtest**, **Ping GW**,
 **Ping WAN**) originate from: ↑/↓ highlights **Auto** or an interface, the
 centre press selects it (`*` marks the active choice, and each row shows the
 NIC's IP, *no IP*, or *down*). **Auto** follows a fixed priority — **built-in
-Ethernet → USB Ethernet → wlan1 → wlan0** — picking the first interface that is
+Ethernet → USB Ethernet → wlan1 → wlan0 → cellular** (a USB-tethered hotspot,
+see [Cellular Uplink Fallback](cellular-uplink.md); pin it to test the cellular
+link itself) — picking the first interface that is
 up, addressed and (for the speedtest) verified able to reach the internet, so a
 plugged-in cable is tested instead of whatever holds the default route. A pinned
 interface really binds the socket to that device; Ping GW then targets that
@@ -249,6 +267,8 @@ link's own gateway. The choice resets to Auto when the mode is switched on.
   normal portrait dashboard returns.
 - Headless installs (no display) accept the display toggles but have nothing to
   render on and no buttons to read.
+  To add a screen (e.g. this HAT) to a headless install, run
+  `sudo ./installhead.sh` — see [Install Guide](INSTALL.md#adding-a-screen-to-a-headless-install-installheadsh).
 
 ---
 

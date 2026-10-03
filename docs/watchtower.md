@@ -16,15 +16,20 @@ Pushover path. It is **read-only over the log files**: it never captures a
 packet or sends one. The watchers stay the sensors; Watchtower is the aggregator.
 
 Alongside the standalone daemons, the **in-app vendor CVE guards** —
-[`cisco_guard`, `juniper_guard`, `arista_guard`](nettools.md#vendor-cve-guards-cisco--juniper--arista)
-and [`comware_guard`](nettools.md#comware-guard) — append their findings as
+[`cisco_guard`, `juniper_guard`, `arista_guard`](nettools.md#vendor-cve-guards),
+[`comware_guard`](nettools.md#comware-guard), `mikrotik_guard`, `aruba_guard` and
+[`apc_guard`](nettools.md#apc-guard) — append their findings as
 JSON-lines to `/var/log/ragnar/<guard>.jsonl` (time-window deduplicated so the
 background rotation cannot spam the log with a standing condition). Watchtower
 picks them up through the same glob and treats them exactly like any other
-source, so a Cisco SNMP-overflow attempt or a Comware VRF-hop lands in the same
-pane and the same Pushover path as an ARP-poisoning or an evil-twin. Unlike the
-daemons, the guards need no systemd unit — they feed Watchtower automatically
-whenever **Extended Monitoring** is on.
+source, so a Cisco SNMP-overflow attempt, a Comware VRF-hop or a Ripple20 tunnel
+attack on an APC card lands in the same pane and the same Pushover path as an
+ARP-poisoning or an evil-twin. Unlike the daemons, the guards need no systemd
+unit — Cisco, Juniper, Arista and Comware feed Watchtower automatically whenever
+**Extended Monitoring** is on, and MikroTik, Aruba and APC on every scan. APC
+Guard also has an opt-in continuous daemon (`apcguard@<iface>`) that writes
+`/var/log/ragnar/apcguard.jsonl`; Watchtower reads its native `title` as the
+headline.
 
 The in-app **L5–L7 observers** [`ssh_watch`](nettools.md#ssh-watch) and
 [`telnet_watch`](nettools.md#telnet-watch) feed the pane the same way, appending

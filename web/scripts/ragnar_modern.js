@@ -161,12 +161,10 @@ function displayCredentials(data) {
     if (countEl) countEl.textContent = `Showing ${rows.length} of ${data.length} credential${data.length !== 1 ? 's' : ''}`;
 }
 
-function copyCredToClipboard(text) {
-    navigator.clipboard.writeText(text).then(() => {
-        addConsoleMessage('Password copied to clipboard', 'success');
-    }).catch(() => {
-        addConsoleMessage('Copy failed — check browser permissions', 'warning');
-    });
+async function copyCredToClipboard(text) {
+    // copyToClipboard has the execCommand fallback needed on plain-HTTP.
+    const ok = await copyToClipboard(text, { silent: true });
+    addConsoleMessage(ok ? 'Password copied to clipboard' : 'Copy failed — check browser permissions', ok ? 'success' : 'warning');
 }
 
 function exportCredentialsCSV() {
@@ -627,6 +625,14 @@ const configMetadata = {
         label: "GPS Baud Rate",
         description: "Serial baud rate for the GPS module. Most USB GPS modules use 9600. Some high-speed modules use 38400 or 115200."
     },
+    wardriving_gps_assist: {
+        label: "GPS Assisted Start",
+        description: "Pre-load the GPS with its last-known position, the NTP time and its own saved almanac/ephemeris at start, so a battery-less u-blox puck starts warm instead of cold and fixes much faster on a weak sky. Time is only sent when the clock is NTP-synced."
+    },
+    wardriving_gps_set_clock: {
+        label: "Set Clock from GPS",
+        description: "When the Pi's clock isn't NTP-synced (no RTC — e.g. booted away from Wi-Fi), set it from GPS time once there is a fix, and repair the running session's earlier timestamps when the clock is corrected. Without this, sessions recorded offline are stamped with the stale boot time."
+    },
     wardriving_auto_export: {
         label: "Auto Export on Stop",
         description: "Automatically export a WiGLE CSV file when a wardriving session is stopped."
@@ -753,6 +759,10 @@ document.addEventListener('DOMContentLoaded', function() {
     applyRusenseTabVisibility();
     applyTerminalVisibility();
     applyMeshTabVisibility();
+    // Ensure pentest tab is hidden initially (will be unhidden if manual_mode is enabled)
+    document.querySelectorAll('.pentest-nav-btn').forEach(btn => {
+        btn.classList.add('hidden');
+    });
     // localStorage gave us an instant paint above; now reconcile with the
     // server (the shared source of truth) without blocking startup.
     syncRusenseTabFromServer();
@@ -843,6 +853,10 @@ function initializeSocket() {
             displayConfigForm(config);
         }
         updateAttackWarningBanner(Boolean(config && config.enable_attacks));
+        // Ensure Pentest tab visibility is updated when config changes
+        if (config && typeof config.manual_mode !== 'undefined') {
+            syncManualModeUI(Boolean(config.manual_mode));
+        }
     });
 
     socket.on('scan_started', function(data) {
@@ -971,7 +985,7 @@ function initializeTabs() {
 function routeFromHash() {
     const raw = (window.location.hash || '').replace(/^#/, '').trim();
     if (!raw) return false;
-    const [tab, sub] = raw.split('/');
+    const [tab, sub, layer] = raw.split('/');
     const known = new Set([
         'dashboard', 'network', 'wifidef', 'discovered', 'rusense', 'pentest',
         'threat-intel', 'traffic', 'adv-vuln', 'wardriving', 'epaper', 'files',
@@ -988,13 +1002,8 @@ function routeFromHash() {
             const anchor = onDiag[sub];
             // Let the network tab finish mounting before selecting a subtab.
             setTimeout(() => {
-                try { showNetworkSubtab(realSub); } catch (e) {}
-                if (anchor) {
-                    setTimeout(() => {
-                        const el = document.getElementById(anchor);
-                        if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                    }, 120);
-                }
+                try { showNetworkSubtab(realSub, layer); } catch (e) {}
+                if (anchor) setTimeout(() => revealNetCard(anchor), 120);
             }, 60);
         }
         return true;
@@ -1395,6 +1404,25 @@ function initTerminal() {
     setTimeout(() => { try { _termFit.fit(); } catch (e) {} _sendTermResize(); }, 80);
 }
 
+// Auto clone/pull the external RagnarScripts library when the Dashboard or
+// Pentest tab opens, so newly-pushed shared scripts appear without a manual
+// git pull. Best-effort and throttled both here and server-side; if either
+// install section is open, it re-lists once the sync returns.
+let _ragnarScriptsSyncedAt = 0;
+async function ragnarScriptsAutoSync() {
+    const now = Date.now();
+    if (now - _ragnarScriptsSyncedAt < 20000) return;   // client-side throttle
+    _ragnarScriptsSyncedAt = now;
+    try {
+        await fetch('/api/ragnar-scripts/sync', { method: 'POST' });
+    } catch (e) { return; /* offline / best-effort */ }
+    // Re-list so freshly-pulled scripts appear: the ducky Payload Library (which
+    // now folds in the RagnarScripts payloads) and the console install section.
+    if (document.getElementById('rubber-ducky-library') && typeof rubberDuckyLoadLibrary === 'function') rubberDuckyLoadLibrary();
+    const s = document.getElementById('sc-library');
+    if (s && s.open && typeof scLoadLibrary === 'function') scLoadLibrary();
+}
+
 function showTab(tabName) {
     // Backward-compat: these tabs are now sub-tabs of Network / Discovered
     if (tabName === 'networks') { showTab('network'); showNetworkSubtab('archive'); return; }
@@ -1455,8 +1483,13 @@ function showTab(tabName) {
     
     loadTabData(tabName);
 
+    if (tabName === 'dashboard' || tabName === 'pentest') {
+        ragnarScriptsAutoSync();
+    }
+
     if (tabName === 'config') {
         try { refreshSensingInstallCard(); syncRusenseTabToggle(); syncTerminalToggle(); syncMeshTabToggle(); } catch (e) { /* ignore */ }
+        try { showConfigSubtab(localStorage.getItem('cfg-subtab') || 'system'); } catch (e) { /* ignore */ }
     }
 
     const mobileMenu = document.getElementById('mobile-menu');
@@ -1474,11 +1507,33 @@ function _setSubtabActive(btn, active) {
     btn.classList.toggle('hover:text-white', !active);
 }
 
-function showNetworkSubtab(name) {
+function showConfigSubtab(name) {
+    const views = {
+        system: 'cfg-sub-system',
+        network: 'cfg-sub-network',
+        bluetooth: 'cfg-sub-bluetooth',
+        wardriving: 'cfg-sub-wardriving',
+        security: 'cfg-sub-security',
+        integrations: 'cfg-sub-integrations',
+        advanced: 'cfg-sub-advanced'
+    };
+    if (!views[name]) name = 'system';
+    Object.keys(views).forEach(key => {
+        const el = document.getElementById(views[key]);
+        if (el) el.classList.toggle('hidden', key !== name);
+        _setSubtabActive(document.getElementById('cfg-subtab-' + key), key === name);
+    });
+    try { localStorage.setItem('cfg-subtab', name); } catch (e) { /* ignore */ }
+}
+
+function showNetworkSubtab(name, layer) {
+    // Diagnostics and the old "Switch & L2/L3" sub-tab are one Diagnostics view now,
+    // split into OSI-layer panels. 'switch' stays as an alias (its cards were mostly L2/L3).
+    if (name === 'switch') { name = 'diagnostics'; layer = layer || 'l2'; }
     const views = {
         hosts: 'net-sub-hosts', archive: 'net-sub-archive', assets: 'net-sub-assets',
         map: 'net-sub-map',
-        diagnostics: 'net-sub-diagnostics', switch: 'net-sub-switch', interfaces: 'net-sub-interfaces',
+        diagnostics: 'net-sub-diagnostics', interfaces: 'net-sub-interfaces',
         wifi: 'net-sub-wifi'
     };
     Object.keys(views).forEach(key => {
@@ -1494,9 +1549,19 @@ function showNetworkSubtab(name) {
         if (!_mapInitialized) { loadNetworkMap(); }
     } else if (name === 'hosts') {
         loadNetworkData();
-    } else if (name === 'switch') {
+    } else if (name === 'diagnostics') {
+        // Pick the layer panel first so a failing picker fill can't leave it blank.
+        showNetLayer(layer || _netLayerSaved());
+        populateMtrSources();
+        syncNetDiagDisplayFromServer();
+        syncNetIntegrityFromServer();
+        syncWatchtowerFromServer();
+        _macWatchFillIfaces();
+        _ntpFillIfaces();
+        _snmpFillIfaces();
+        _certFillIfaces();
+        _tlsFillIfaces();
         _lldpFillIfaces();
-        loadLldp();
         _arpScanFillIfaces();
         _pcapCapFillIfaces();
         _locateFillIfaces();
@@ -1517,24 +1582,65 @@ function showNetworkSubtab(name) {
         _isisFillIfaces();
         _fhrpFillIfaces();
         _bgpFillIfaces();
-        dhcpSnoopStatus();
     } else if (name === 'interfaces') {
         loadNetworkIdentity();
         loadInterfaces();
+        loadCellularUplink();
     } else if (name === 'wifi') {
         wifiInit();
-    } else if (name === 'diagnostics') {
-        populateMtrSources();
-        syncNetDiagDisplayFromServer();
-        syncNetIntegrityFromServer();
-        syncWatchtowerFromServer();
-        _macWatchFillIfaces();
-        _ntpFillIfaces();
-        _snmpFillIfaces();
-        _certFillIfaces();
-        _tlsFillIfaces();
     }
-    // Diagnostics tools run on demand; we only prefill the MTR start-point list.
+    // Diagnostics tools run on demand; opening the view only prefills interface pickers.
+}
+
+// ---- Diagnostics: one panel per OSI layer ----------------------------------
+const NET_LAYERS = ['overview', 'l7', 'l6', 'l5', 'l4', 'l3', 'l2', 'l1'];
+const _NET_LAYER_ON = ['bg-Ragnar-600', 'text-white'];
+const _NET_LAYER_OFF = ['text-slate-400', 'hover:bg-slate-700', 'hover:text-white'];
+
+function _netLayerSaved() {
+    try {
+        const v = localStorage.getItem('ragnar.netLayer');
+        return NET_LAYERS.includes(v) ? v : 'overview';
+    } catch (e) { return 'overview'; }
+}
+
+function showNetLayer(layer) {
+    if (!NET_LAYERS.includes(layer)) layer = 'overview';
+    NET_LAYERS.forEach(l => {
+        const panel = document.getElementById('net-layer-' + l);
+        if (panel) panel.classList.toggle('hidden', l !== layer);
+        const btn = document.getElementById('net-layer-btn-' + l);
+        if (btn) {
+            _NET_LAYER_ON.forEach(c => btn.classList.toggle(c, l === layer));
+            _NET_LAYER_OFF.forEach(c => btn.classList.toggle(c, l !== layer));
+            btn.setAttribute('aria-pressed', l === layer ? 'true' : 'false');
+        }
+    });
+    const panel = document.getElementById('net-layer-' + layer);
+    const desc = document.getElementById('net-layer-desc');
+    if (desc && panel) desc.textContent = (panel.dataset.desc || '') + ' Modules that act on more than one layer sit at the one they mostly watch.';
+    try { localStorage.setItem('ragnar.netLayer', layer); } catch (e) {}
+    // The two views that talk to the network when opened, only when you look at them.
+    if (layer === 'l2') loadLldp();
+    if (layer === 'l7') dhcpSnoopStatus();
+}
+
+// Visibility-matrix reference cards load their image the first time they are opened.
+function netMatrixLoad(d) {
+    if (!d || !d.open) return;
+    d.querySelectorAll('img[data-src]').forEach(img => {
+        img.src = img.dataset.src;
+        img.removeAttribute('data-src');
+    });
+}
+
+// Scroll to a Diagnostics card, switching to the layer panel that holds it.
+function revealNetCard(id) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const panel = el.closest('.net-layer');
+    if (panel) showNetLayer(panel.id.replace('net-layer-', ''));
+    setTimeout(() => el.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
 }
 
 // ============================================================================
@@ -2185,7 +2291,8 @@ function wifiSdrCheck() {
     ]).then(([d, hk]) => {
         if (!d) { box.innerHTML = '<span style="color:#f87171">SDR check failed — the endpoint did not respond.</span>'; return; }
         const tone = { ok: ['#34d399', '✅'], no_usb: ['#fb7185', '⛔'], tools_missing: ['#fbbf24', '⚙️'],
-                       dvb_held: ['#fbbf24', '🔒'], probe_timeout: ['#fbbf24', '⏱️'] }[d.state] || ['#94a3b8', 'ℹ️'];
+                       dvb_held: ['#fbbf24', '🔒'], probe_timeout: ['#fbbf24', '⏱️'],
+                       usb_stuck: ['#fbbf24', '🔁'], usb_flapping: ['#fb7185', '⚡'] }[d.state] || ['#94a3b8', 'ℹ️'];
         const col = tone[0], icon = tone[1];
         const fixes = (d.fix || []).map(s =>
             `<li style="display:flex;gap:.4rem"><span style="color:${col}">›</span><code class="font-mono text-xs" style="color:#e5e7eb;word-break:break-all">${escapeHtml(String(s))}</code></li>`).join('');
@@ -2197,6 +2304,18 @@ function wifiSdrCheck() {
             `blacklist: ${yn(d.blacklisted, 'set', 'absent')}`,
             d.throttled ? `power: ${d.undervoltage ? '<span style="color:#fb7185">under-voltage (' + escapeHtml(String(d.throttled)) + ')</span>' : '<span style="color:#34d399">ok</span>'}` : ''
         ].filter(Boolean).join(' · ');
+        // Self-healing: what the watcher is doing about the dongle, and a button
+        // to run the recovery ladder now (power-cycles a stuck port).
+        const h = d.heal || {};
+        const last = (h.history || []).slice(-1)[0];
+        const healLine = (h.state && h.state !== 'ok')
+            ? `<div class="mt-2 text-xs" style="color:#9ca3af">🩹 Self-heal: ${escapeHtml(String(h.message || h.state))}`
+              + (last ? ` <span style="color:#6b7280">(last: ${escapeHtml(String(last.action).replace('_', ' '))} ${escapeHtml(String(last.target || ''))} → ${last.back ? 'back' : 'not back yet'})</span>` : '')
+              + (h.enabled === false ? ' <span style="color:#fbbf24">— switched off</span>' : '') + `</div>`
+            : '';
+        const healBtn = (h.state && ['recovering', 'failed', 'flapping', 'unplugged'].indexOf(h.state) >= 0) || d.state === 'no_usb'
+            ? `<button type="button" onclick="wifiSdrHeal(this)" style="margin-top:.6rem;margin-left:.4rem;background:#0f766e;color:#fff;border:0;border-radius:6px;padding:.45rem .8rem;font-weight:600;cursor:pointer" title="Run the recovery ladder now: USB reset, or power-cycle the port the dongle is stuck on (the same as replugging it).">⭮ Recover now</button>`
+            : '';
         const hkline = hk && hk.detect
             ? `<div class="mt-2 text-xs" style="color:#9ca3af">HackRF (Wi-Fi bands): ${hk.detect.available ? '<span style="color:#34d399">detected</span>' : escapeHtml(String(hk.detect.error || 'not detected'))}</div>`
             : '';
@@ -2213,13 +2332,22 @@ function wifiSdrCheck() {
                <div style="flex:1;min-width:0">
                  <div class="font-semibold" style="color:${col}">${escapeHtml(String(d.summary || 'SDR check'))}</div>
                  ${fixes ? `<ul style="margin-top:.5rem;display:flex;flex-direction:column;gap:.25rem">${fixes}</ul>` : ''}
-                 ${actBtn}
+                 ${actBtn}${healBtn}
+                 ${healLine}
                  <div class="mt-2 text-xs" style="color:#9ca3af">${facts}</div>
                  ${hkline}
                </div>
                <button type="button" onclick="document.getElementById('wifi-sdr-diag').classList.add('hidden')" class="text-xs" style="color:#6b7280" title="Dismiss">✕</button>
              </div>`;
     });
+}
+
+// "Recover now": run the self-heal ladder once (it can take ~30 s: a stuck
+// dongle is power-cycled and then has to re-enumerate), then re-run the check.
+function wifiSdrHeal(btn) {
+    if (btn) { btn.disabled = true; btn.textContent = '⭮ Recovering… (up to ~40 s)'; }
+    fetch('/api/net/rtl/heal', { method: 'POST' }).then(r => r.json()).catch(() => null)
+        .then(() => wifiSdrCheck());
 }
 
 // One-click install/fix from the SDR check panel: apt-installs rtl-sdr+rtl-433
@@ -3437,9 +3565,10 @@ function _wifiApDetailHtml(a) {
     ${radHtml}`;
 }
 
-function wifiFsCopy(bssid) {
-    if (navigator.clipboard) navigator.clipboard.writeText(bssid).catch(() => {});
-    _wifiSetStatus('copied ' + bssid);
+async function wifiFsCopy(bssid) {
+    // copyToClipboard has the execCommand fallback needed on plain-HTTP.
+    const ok = await copyToClipboard(bssid, { silent: true });
+    _wifiSetStatus(ok ? 'copied ' + bssid : 'copy failed');
 }
 
 function wifiFsClearSelection() {
@@ -5746,7 +5875,7 @@ async function wifidefProbePortal(ssid) {
 }
 
 // ============================================================================
-// Network diagnostics (Diagnostics / Switch & L2 / Interfaces sub-tabs)
+// Network diagnostics (Diagnostics — per-OSI-layer panels — and Interfaces sub-tabs)
 // Backend: /api/net/* (see network_diagnostics.py)
 // ============================================================================
 
@@ -6762,7 +6891,7 @@ async function analyzeStoredPcap(el) {
 
 // PCAP source #3 — capture live traffic on an interface into a new pcap. The
 // interface <select> is static in the page (with "Auto (wired first)") and is
-// pre-filled on tab load like every other Switch & L2/L3 picker, so opening the
+// pre-filled on tab load like every other Diagnostics picker, so opening the
 // form just reveals it — no async populate.
 function _pcapCapFillIfaces() {
     const sel = document.getElementById('pcap-cap-iface');
@@ -7106,6 +7235,118 @@ async function checkVpnEgress() {
     }
 }
 
+// Cellular uplink fallback — USB-tethered hotspot / phone / LTE modem.
+async function loadCellularUplink() {
+    const out = document.getElementById('cellular-uplink-results');
+    if (!out) return;
+    try {
+        const d = await fetchAPI('/api/cellular/status');
+        if (!d.success) throw new Error(d.error || 'failed');
+        const set = (id, prop, v) => { const el = document.getElementById(id); if (el && document.activeElement !== el) el[prop] = v; };
+        set('cell-enabled', 'checked', !!d.enabled);
+        set('cell-allow-scan', 'checked', !!d.allow_scan);
+        set('cell-metric', 'value', d.metric);
+        set('cell-force', 'value', (d.force_ifaces || []).join(' '));
+        set('cell-exclude', 'value', (d.exclude_ifaces || []).join(' '));
+        set('cell-hb-enabled', 'checked', !!d.heartbeat_enabled);
+        set('cell-hb-targets', 'value', (d.heartbeat_targets || []).join(' '));
+        set('cell-hb-minok', 'value', d.heartbeat_min_ok);
+        set('cell-hb-fail', 'value', d.failover_after);
+        set('cell-hb-back', 'value', d.failback_after);
+        const pill = (txt, cls) => `<span class="px-2 py-0.5 rounded text-xs ${cls}">${escapeHtml(txt)}</span>`;
+        const uplink = d.active_uplink
+            ? (d.on_cellular ? pill('on cellular: ' + d.active_uplink, 'bg-amber-900/50 text-amber-300')
+                             : pill('primary: ' + d.active_uplink, 'bg-green-900/50 text-green-300'))
+            : pill('no internet uplink', 'bg-red-900/50 text-red-300');
+        const hooks = (d.nm_conf_installed || d.dhcpcd_hook_installed)
+            ? '' : ' ' + pill('route hooks not installed', 'bg-slate-700 text-slate-400');
+        let html = `<div class="flex flex-wrap items-center gap-2 mb-3">${uplink}${d.enabled ? '' : ' ' + pill('fallback pinning off', 'bg-red-900/50 text-red-300')}${hooks}</div>`;
+        html += _cellHeartbeatHtml(d, pill);
+        if (!(d.interfaces || []).length) {
+            html += '<p class="text-gray-400">No cellular device plugged in. Connect a hotspot or phone to a USB port and turn on its <strong>USB tethering</strong>; it shows up here within a few seconds.</p>';
+        } else {
+            html += '<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">' + d.interfaces.map(i => {
+                const role = i.role === 'active' ? pill('ACTIVE — carrying traffic', 'bg-amber-900/50 text-amber-300')
+                    : i.role === 'standby' ? pill('standby', 'bg-green-900/50 text-green-300')
+                    : pill(i.carrier ? 'no route (DHCP?)' : 'link down', 'bg-slate-700 text-slate-400');
+                const row = (k, v) => `<div class="flex justify-between gap-3"><span class="text-gray-500">${k}</span><span class="font-mono text-gray-300 break-all text-right">${escapeHtml(String(v))}</span></div>`;
+                return `<div class="bg-slate-900/40 border border-slate-700 rounded-lg p-3 space-y-1 min-w-0">
+                    <div class="flex flex-wrap items-center justify-between gap-2"><span class="font-mono font-semibold">${escapeHtml(i.name)}</span>${role}</div>
+                    ${row('Device', i.device || '—')}
+                    ${row('Detected by', i.reason || '—')}
+                    ${row('IPv4', (i.ipv4 || []).join(', ') || '—')}
+                    ${row('Gateway', i.gateway || '—')}
+                    ${row('Route metric', i.metric == null ? '—' : i.metric)}
+                    ${row('Data (rx / tx)', formatBytes(i.rx_bytes || 0) + ' / ' + formatBytes(i.tx_bytes || 0))}
+                </div>`;
+            }).join('') + '</div>';
+        }
+        if ((d.events || []).length) {
+            html += '<div class="mt-3 text-xs text-gray-500 space-y-1">' + d.events.slice(-5).reverse().map(e =>
+                `<div>${escapeHtml(new Date(e.ts * 1000).toLocaleString())} — ${escapeHtml(e.msg)}</div>`).join('') + '</div>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-red-400">' + escapeHtml(e.message || String(e)) + '</p>';
+    }
+}
+
+function _cellHeartbeatHtml(d, pill) {
+    const hb = d.heartbeat;
+    if (!d.heartbeat_enabled) return '<p class="text-xs text-gray-500 mb-3">Heartbeat failover off — cellular takes over only when Ethernet/Wi-Fi lose their link.</p>';
+    if (!hb) return '';
+    const t = ts => ts ? new Date(ts * 1000).toLocaleTimeString() : '—';
+    const dur = s => { s = Math.max(0, Math.round(s)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return (h ? h + 'h ' : '') + (h || m ? m + 'm ' : '') + (s % 60) + 's'; };
+    let state;
+    if (hb.state === 'failover') {
+        state = pill(`FAILED OVER since ${t(hb.failover_at)} — fail back ${hb.good_streak}/${d.failback_after}`, 'bg-amber-900/50 text-amber-300');
+    } else if (hb.bad_streak) {
+        state = pill(`primary failing ${hb.bad_streak}/${d.failover_after}`, 'bg-red-900/50 text-red-300');
+    } else if (Object.keys(hb.last_round || {}).length) {
+        state = pill('primary healthy', 'bg-green-900/50 text-green-300');
+    } else {
+        state = pill('idle — no cellular link to fail over to', 'bg-slate-700 text-slate-400');
+    }
+    const rounds = Object.entries(hb.last_round || {}).map(([iface, r]) => {
+        const good = r.total && r.ok >= d.heartbeat_min_ok;
+        const rtt = (r.results || []).filter(x => x.ok && x.ms != null).map(x => x.ms);
+        const detail = (r.results || []).map(x => `${x.target} ${x.ok ? '✓' : '✗'}`).join(' · ');
+        return `<div class="flex flex-wrap justify-between gap-2"><span class="font-mono">${escapeHtml(iface)}</span>`
+            + `<span class="${good ? 'text-green-400' : 'text-red-400'}">${r.ok}/${r.total} targets${rtt.length ? ' · ' + Math.min(...rtt) + ' ms' : ''}</span></div>`
+            + (detail ? `<div class="text-xs text-gray-500 break-all">${escapeHtml(detail)}</div>` : '')
+            + ((r.skipped || []).length ? `<div class="text-xs text-amber-300 break-all">skipped: ${escapeHtml(r.skipped.join(', '))}</div>` : '');
+    }).join('');
+    const lo = hb.last_outage;
+    const last = lo ? `<div class="text-xs text-gray-400 mt-2">Last outage: ${t(lo.start)} → ${t(lo.end)} (${dur(lo.duration)}), cellular carried ${formatBytes(lo.cellular_bytes || 0)}</div>` : '';
+    return `<div class="bg-slate-900/40 border border-slate-700 rounded-lg p-3 mb-3 space-y-1 min-w-0">
+        <div class="flex flex-wrap items-center justify-between gap-2"><span class="font-semibold">Heartbeat</span>${state}</div>
+        ${rounds || '<div class="text-xs text-gray-500">No primary uplink with a default route.</div>'}${last}</div>`;
+}
+
+async function saveCellularUplink() {
+    const st = document.getElementById('cell-save-status');
+    const payload = {
+        enabled: document.getElementById('cell-enabled').checked,
+        allow_scan: document.getElementById('cell-allow-scan').checked,
+        metric: parseInt(document.getElementById('cell-metric').value, 10),
+        force_ifaces: document.getElementById('cell-force').value,
+        exclude_ifaces: document.getElementById('cell-exclude').value,
+        heartbeat_enabled: document.getElementById('cell-hb-enabled').checked,
+        heartbeat_targets: document.getElementById('cell-hb-targets').value,
+        heartbeat_min_ok: parseInt(document.getElementById('cell-hb-minok').value, 10),
+        failover_after: parseInt(document.getElementById('cell-hb-fail').value, 10),
+        failback_after: parseInt(document.getElementById('cell-hb-back').value, 10)
+    };
+    try {
+        const d = await postAPI('/api/cellular/settings', payload);
+        if (!d.success) throw new Error(d.error || 'failed');
+        if (st) st.textContent = '✓ Saved' + ((d.applied || []).length ? ' — ' + d.applied.join('; ') : '');
+        loadCellularUplink();
+    } catch (e) {
+        if (st) st.textContent = '✗ ' + (e.message || e);
+    }
+}
+
 async function loadInterfaces() {
     const out = document.getElementById('interfaces-results');
     out.innerHTML = '<p class="text-gray-400">Loading…</p>';
@@ -7127,6 +7368,7 @@ async function loadInterfaces() {
         const typeLabel = (i) => {
             if (i.type === 'vpn') return '<span class="px-2 py-0.5 rounded text-xs bg-amber-900/50 text-amber-300">🔒 ' + escapeHtml(i.vpn_kind || 'VPN') + '</span>';
             if (i.type === 'wifi') return '<span class="px-2 py-0.5 rounded text-xs bg-sky-900/50 text-sky-300">wifi</span>';
+            if (i.type === 'cellular') return '<span class="px-2 py-0.5 rounded text-xs bg-amber-900/50 text-amber-300">📶 cellular</span>';
             return '<span class="px-2 py-0.5 rounded text-xs bg-slate-700 text-slate-300">ethernet</span>';
         };
         const rows = data.interfaces.map(i => {
@@ -8578,7 +8820,11 @@ async function _runGuard(module, label, btn) {
         _guardFillIfaces(module + '-guard-iface');
         const roleEl = document.getElementById(module + '-guard-role');
         const roleQs = (roleEl && roleEl.value) ? '&role=' + encodeURIComponent(roleEl.value) : '';
-        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '') + roleQs;
+        const cardsEl = document.getElementById(module + '-guard-cards');
+        const forgetEl = document.getElementById(module + '-guard-forget');
+        const cardsQs = (cardsEl && cardsEl.dataset.dirty === '1') ? '&cards=' + encodeURIComponent(cardsEl.value) : '';
+        const forgetQs = (forgetEl && forgetEl.checked) ? '&forget=1' : '';
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '') + roleQs + cardsQs + forgetQs;
         const d = await fetchAPI('/api/net/' + module + '-guard' + qs);
         if (!d || d.success === false) {
             const msg = (d && d.error) || 'failed';
@@ -8588,6 +8834,16 @@ async function _runGuard(module, label, btn) {
             return;
         }
         out.innerHTML = _renderGuardResult(d);
+        if (d.cards) {
+            if (cardsEl) { cardsEl.value = d.cards.declared || ''; cardsEl.dataset.dirty = '0'; }
+            if (forgetEl) forgetEl.checked = false;
+            const learned = d.cards.learned || [];
+            const fresh = d.cards.new || [];
+            out.insertAdjacentHTML('beforeend', '<p class="text-xs text-gray-400 mt-2 break-words">Known cards: '
+                + (d.cards.declared ? 'declared <span class="font-mono">' + escapeHtml(d.cards.declared) + '</span> · ' : 'none declared · ')
+                + learned.length + ' learned from SNMP' + (learned.length ? ' (<span class="font-mono">' + escapeHtml(learned.slice(0, 12).join(', ')) + (learned.length > 12 ? ', …' : '') + '</span>)' : '')
+                + (fresh.length ? ' · <span class="text-emerald-300">new: ' + escapeHtml(fresh.join(', ')) + '</span>' : '') + '</p>');
+        }
     } catch (e) {
         out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(e.message) + '</p>';
     } finally {
@@ -8600,6 +8856,7 @@ function runAristaGuard() { _runGuard('arista', 'Arista', (typeof event !== 'und
 function runComwareGuard() { _runGuard('comware', 'Comware', (typeof event !== 'undefined' && event && event.target) ? event.target : null); }
 function runMikroTikGuard() { _runGuard('mikrotik', 'MikroTik', (typeof event !== 'undefined' && event && event.target) ? event.target : null); }
 function runArubaGuard() { _runGuard('aruba', 'Aruba', (typeof event !== 'undefined' && event && event.target) ? event.target : null); }
+function runAPCGuard() { _runGuard('apc', 'APC', (typeof event !== 'undefined' && event && event.target) ? event.target : null); }
 // --- Dell Guard daemon control (standalone systemd sensor; enable/disable switch) ---
 function _dellGuardRender(d) {
     if (!d) return '<span class="text-red-400">No status returned.</span>';
@@ -11021,7 +11278,7 @@ async function runRoutingSelftest() {
                         bfd: 'BFD Watch (failover manipulation)', ptp: 'PTP Watch (IEEE-1588 grandmaster takeover)', srmpls: 'SR-MPLS Watch (MPLS segment injection)', ipsec: 'IPsec/IKE Watch (D(HE)at / weak-DH / SWEET32)',
                         dns_passive: 'DNS Watch (KeyTrap / NSEC3 / NXNSAttack / MaginotDNS / SAD DNS)',
                         cisco_guard: 'Cisco Guard (IOS/IOS-XE/NX-OS CVEs)', juniper_guard: 'Juniper Guard (J-Web/SSR/Space CVEs)', arista_guard: 'Arista Guard (EOS CVEs)', comware_guard: 'Comware Guard (VRF-hop / MPLS CVEs)',
-                        mikrotik_guard: 'MikroTik Guard (RouterOS CVEs)', aruba_guard: 'Aruba Guard (ArubaOS PAPI CVEs)', dell_guard: 'Dell Guard (OS10 SmartFabric CVE)',
+                        mikrotik_guard: 'MikroTik Guard (RouterOS CVEs)', aruba_guard: 'Aruba Guard (ArubaOS PAPI CVEs)', apc_guard: 'APC Guard (NMC Ripple20)', dell_guard: 'Dell Guard (OS10 SmartFabric CVE)',
                         bgp_speaker: 'BGP Speaker (codec/FSM/RIB)', path_asymmetry: 'Path Asymmetry (OWD)' };
         const overall = d.success
             ? '<div class="mb-2 px-3 py-2 rounded border bg-green-950/40 border-green-900 text-green-400 text-sm">✓ All detector self-tests passed' + (d.scapy_available ? ' (including Scapy end-to-end)' : ' — install Scapy for the end-to-end leg') + '</div>'
@@ -11030,7 +11287,7 @@ async function runRoutingSelftest() {
             '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
             '<tr class="text-left text-gray-500"><th class="px-2 py-1">Scanner</th><th class="px-2 py-1">Scenarios</th><th class="px-2 py-1">End-to-end</th><th class="px-2 py-1">Result</th></tr>' +
             '</thead><tbody>';
-        const order = ['igmp', 'ipv6', 'ndp', 'raguard', 'ntp', 'icmp', 'snmp', 'cert', 'tls', 'ssh', 'telnet', 'stp', 'smb', 'relay', 'ldap', 'dtp', 'cdp', 'vtp', 'eigrp', 'isis', 'fhrp', 'ospf', 'arp', 'mac', 'dhcp', 'dns', 'bgp', 'lacp', 'rpc', 'bfd', 'ptp', 'srmpls', 'ipsec', 'dns_passive', 'ftp', 'smtp', 'cisco_guard', 'juniper_guard', 'arista_guard', 'comware_guard', 'mikrotik_guard', 'aruba_guard', 'dell_guard', 'bgp_speaker', 'path_asymmetry'];
+        const order = ['igmp', 'ipv6', 'ndp', 'raguard', 'ntp', 'icmp', 'snmp', 'cert', 'tls', 'ssh', 'telnet', 'stp', 'smb', 'relay', 'ldap', 'dtp', 'cdp', 'vtp', 'eigrp', 'isis', 'fhrp', 'ospf', 'arp', 'mac', 'dhcp', 'dns', 'bgp', 'lacp', 'rpc', 'bfd', 'ptp', 'srmpls', 'ipsec', 'dns_passive', 'ftp', 'smtp', 'cisco_guard', 'juniper_guard', 'arista_guard', 'comware_guard', 'mikrotik_guard', 'aruba_guard', 'apc_guard', 'dell_guard', 'bgp_speaker', 'path_asymmetry'];
         // Append any suite the backend returned that isn't in the preferred order,
         // so a newly-wired detector can never again be counted toward pass/fail yet
         // stay invisible in the table.
@@ -11600,6 +11857,10 @@ async function loadInitialData() {
             // Update both stats and status from single response
             updateDashboardStats(quickData);
             updateDashboardStatus(quickData);
+            // Ensure Pentest tab visibility is set based on manual_mode on initial load
+            if (typeof quickData.manual_mode !== 'undefined') {
+                syncManualModeUI(Boolean(quickData.manual_mode));
+            }
         }
         
         // OPTIMIZATION: Defer WiFi + LAN status to after dashboard is visible
@@ -11774,6 +12035,7 @@ async function loadTabData(tabName) {
                 checkAirSnitchInstalled();
                 populateAirSnitchInterfaceDropdowns();
                 refreshAirSnitchResults();
+                rubberDuckyInit();
             } else {
                 addConsoleMessage('Enable Pentest Mode to access the Pentest tab', 'warning');
                 showTab('dashboard');
@@ -15048,16 +15310,16 @@ async function handleAuthSetup(event) {
     }
 }
 
-function copyRecoveryCodes() {
-    if (window._tempRecoveryCodes) {
-        const text = window._tempRecoveryCodes.join('\n');
-        navigator.clipboard.writeText(text).then(() => {
-            const btn = document.getElementById('copy-codes-btn');
-            btn.textContent = 'Copied!';
-            setTimeout(() => { btn.textContent = 'Copy All Codes'; }, 2000);
-        }).catch(() => {
-            addConsoleMessage('Failed to copy - please select and copy manually', 'warning');
-        });
+async function copyRecoveryCodes() {
+    if (!window._tempRecoveryCodes) return;
+    const text = window._tempRecoveryCodes.join('\n');
+    // copyToClipboard has the execCommand fallback needed on plain-HTTP.
+    const ok = await copyToClipboard(text, { silent: true });
+    if (ok) {
+        const btn = document.getElementById('copy-codes-btn');
+        if (btn) { btn.textContent = 'Copied!'; setTimeout(() => { btn.textContent = 'Copy All Codes'; }, 2000); }
+    } else {
+        addConsoleMessage('Failed to copy - please select and copy manually', 'warning');
     }
 }
 
@@ -21316,6 +21578,631 @@ async function runManualLynisPentest() {
 }
 
 // ============================================================================
+// RUBBER DUCKY SCRIPT EXECUTOR
+// ============================================================================
+
+// Which Ragnar the Rubber Ducky card drives. 'local' = this unit; otherwise a
+// mesh peer id, sent as X-Ragnar-Target so this unit's secret-gated mesh gateway
+// relays each call there (the peer must also tick "Allow mesh units to run
+// payloads"). Mirrors the Device Console's scState.
+const duckyState = { unit: 'local', units: [], gateway: false };
+
+function rdTarget() {
+    return (duckyState.unit && duckyState.unit !== 'local') ? duckyState.unit : null;
+}
+
+// fetch() that tags the request for the selected mesh unit when one is picked.
+function rdFetch(url, opts = {}) {
+    const t = rdTarget();
+    if (!t) return fetch(url, opts);
+    const o = Object.assign({}, opts);
+    o.headers = Object.assign({}, opts.headers || {}, { 'X-Ragnar-Target': t });
+    return fetch(url, o);
+}
+
+async function rubberDuckyInit() {
+    /**Initialize rubber ducky UI on pentest tab load*/
+    await rubberDuckyRefreshUnits();
+    await rubberDuckyLoadMeshAllow();
+    await rubberDuckyRefreshScripts();
+    await rubberDuckyRefreshDevices();
+    await rubberDuckyGadgetStatus();
+    rubberDuckyLoadLibrary();
+    revshellInit();
+}
+
+async function rubberDuckyRefreshUnits() {
+    /**Populate the "Run on" picker with this unit + mesh peers that have HID.*/
+    const sel = document.getElementById('rubber-ducky-unit');
+    if (!sel) return;
+    try {
+        const u = await (await fetch('/api/rubber-ducky/units')).json();
+        duckyState.units = u.units || [];
+        duckyState.gateway = !!u.gateway_ready;
+        const keep = duckyState.unit;
+        sel.innerHTML = duckyState.units.map(x => {
+            const tag = x.local ? 'This unit' : (x.name || x.id);
+            let note = '';
+            if (!x.local) {
+                if (!x.online) note = ' — offline';
+                else if (!x.reachable) note = ' — unreachable';
+                else if (!x.has_gadget) note = ' — no HID';
+                else note = x.mesh_allow ? ' — HID, mesh-allowed' : ' — HID (not allowed)';
+            } else if (!x.has_gadget) {
+                note = ' — no HID gadget';
+            }
+            return `<option value="${escapeHtml(x.id)}">${escapeHtml(tag + note)}</option>`;
+        }).join('');
+        sel.value = duckyState.units.some(x => x.id === keep) ? keep : 'local';
+        duckyState.unit = sel.value;
+    } catch (e) { /* mesh off/unavailable: stay on this unit */ }
+    rubberDuckyUpdateUnitNote();
+}
+
+function rubberDuckyCurrentUnit() {
+    return duckyState.units.find(x => x.id === duckyState.unit) || { id: duckyState.unit, local: duckyState.unit === 'local' };
+}
+
+function rubberDuckyUpdateUnitNote() {
+    /**Explain why a selected peer can't be driven yet (no secret / not allowed).*/
+    const note = document.getElementById('rubber-ducky-unit-note');
+    if (!note) return;
+    const u = rubberDuckyCurrentUnit();
+    let msg = '';
+    if (!u.local) {
+        if (!duckyState.gateway) msg = 'Driving another unit needs the mesh secret armed on both units (Config → Mesh).';
+        else if (u.online === false) msg = 'That unit is offline.';
+        else if (u.reachable === false) msg = 'That unit is unreachable over the mesh.';
+        else if (!u.has_gadget) msg = 'That unit has no USB HID gadget configured.';
+        else if (!u.mesh_allow) msg = 'That unit has not ticked “Allow mesh units to run payloads”. Enable it on that unit’s Rubber Ducky card.';
+    }
+    note.textContent = msg;
+    note.classList.toggle('hidden', !msg);
+}
+
+function rubberDuckyUnitChanged() {
+    const sel = document.getElementById('rubber-ducky-unit');
+    duckyState.unit = sel ? sel.value : 'local';
+    rubberDuckyUpdateUnitNote();
+    // Re-pull everything from the newly-selected unit.
+    rubberDuckyRefreshScripts();
+    rubberDuckyRefreshDevices();
+    rubberDuckyGadgetStatus();
+    rubberDuckyLoadLibrary();
+    const sea = document.getElementById('rubber-ducky-preview');
+    if (sea) sea.classList.add('hidden');
+}
+
+async function rubberDuckyLoadMeshAllow() {
+    /**Reflect THIS unit's "allow mesh HID" flag in the checkbox (always local).*/
+    const cb = document.getElementById('rubber-ducky-mesh-allow');
+    if (!cb) return;
+    try {
+        const d = await (await fetch('/api/rubber-ducky/mesh-allow')).json();
+        cb.checked = !!d.mesh_allow;
+    } catch (e) { /* leave unchecked */ }
+}
+
+async function rubberDuckyMeshAllowChanged() {
+    /**Set THIS unit's opt-in (never relayed — each unit governs its own HID).*/
+    const cb = document.getElementById('rubber-ducky-mesh-allow');
+    if (!cb) return;
+    try {
+        const r = await fetch('/api/rubber-ducky/mesh-allow', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ allow: cb.checked }) });
+        const d = await r.json();
+        if (!d.success) { cb.checked = !cb.checked; }
+    } catch (e) { cb.checked = !cb.checked; }
+}
+
+async function _rdJson(r) {
+    /**Parse a fetch Response as JSON, or throw a clear message when the backend
+       is stale (new routes return 404/HTML until the webapp is restarted).*/
+    const ct = r.headers.get('content-type') || '';
+    if (!ct.includes('json')) {
+        throw new Error(r.status === 404
+            ? 'endpoint not found — restart Ragnar to load the new routes'
+            : `unexpected ${r.status} response`);
+    }
+    return r.json();
+}
+
+async function rubberDuckyLoadLibrary() {
+    /**Fetch the bundled payload library AND the external RagnarScripts library,
+       then render both as one combined list with per-row Install buttons.*/
+    const box = document.getElementById('rubber-ducky-library');
+    if (!box) return;
+    box.innerHTML = '<p class="text-gray-500">Loading…</p>';
+    try {
+        // Fetch both sources; a failure of either (e.g. no RagnarScripts clone)
+        // must not blank the whole list, so each falls back to empty.
+        const [libData, ragData] = await Promise.all([
+            rdFetch('/api/rubber-ducky/library').then(_rdJson).catch(() => ({ payloads: [] })),
+            rdFetch('/api/rubber-ducky/ragnar-scripts').then(_rdJson).catch(() => ({ available: false, scripts: [] })),
+        ]);
+        const rows = [];
+        ((libData && libData.payloads) || []).forEach(p =>
+            rows.push({ name: p.name, description: p.description, source: 'bundled' }));
+        if (ragData && ragData.available) {
+            (ragData.scripts || []).forEach(p =>
+                rows.push({ name: p.name, description: p.description, source: 'ragnar', installed: p.installed }));
+        }
+        if (!rows.length) { box.innerHTML = '<p class="text-gray-500">No library payloads.</p>'; return; }
+        box.innerHTML = '';
+        rows.forEach(p => {
+            const row = document.createElement('div');
+            row.className = 'flex items-start justify-between gap-2 border-b border-slate-800 pb-2';
+            const tag = p.source === 'ragnar'
+                ? '<span class="text-[10px] uppercase tracking-wide bg-indigo-900/60 text-indigo-300 px-1.5 py-0.5 rounded shrink-0" title="From the RagnarScripts library">RagnarScripts</span>'
+                : '<span class="text-[10px] uppercase tracking-wide bg-slate-700 text-gray-300 px-1.5 py-0.5 rounded shrink-0" title="Bundled with Ragnar">bundled</span>';
+            row.innerHTML = `<div class="min-w-0"><div class="text-gray-200 truncate flex items-center gap-1.5"><span class="truncate">${escapeHtml(p.name)}</span>${tag}</div>`
+                + `<div class="text-gray-500 truncate">${escapeHtml(p.description || '')}</div></div>`;
+            const btn = document.createElement('button');
+            const installed = p.installed === true;
+            btn.className = 'text-xs px-2 py-1 rounded shrink-0 ' + (installed ? 'bg-slate-800 text-gray-400 hover:bg-slate-700' : 'bg-slate-700 hover:bg-slate-600 text-white');
+            btn.textContent = installed ? 'Reinstall' : 'Install';
+            btn.onclick = () => (p.source === 'ragnar' ? rubberDuckyInstallRagnar(p.name) : rubberDuckyInstall(p.name));
+            row.appendChild(btn);
+            box.appendChild(row);
+        });
+    } catch (e) {
+        box.innerHTML = `<p class="text-red-400">Error: ${escapeHtml(e.message)}</p>`;
+    }
+}
+
+async function rubberDuckyInstall(name) {
+    /**Copy a library payload into the scripts folder and select it*/
+    try {
+        const r = await rdFetch('/api/rubber-ducky/library/install', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name })
+        });
+        const data = await _rdJson(r);
+        if (!r.ok || !data.success) throw new Error(data.error || 'install failed');
+        await rubberDuckyRefreshScripts();
+        const sel = document.getElementById('rubber-ducky-script-select');
+        if (sel) { sel.value = data.name; rubberDuckyOnScriptSelect(); }
+    } catch (e) {
+        alert('Install failed: ' + e.message);
+    }
+}
+
+async function rubberDuckyInstallRagnar(name) {
+    /**Install a RagnarScripts payload (routed here from the combined Payload
+       Library list), then select it and refresh the list's Install/Reinstall.*/
+    try {
+        const r = await rdFetch('/api/rubber-ducky/ragnar-scripts/install', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name })
+        });
+        const data = await _rdJson(r);
+        if (!r.ok || !data.success) throw new Error(data.error || 'install failed');
+        await rubberDuckyRefreshScripts();
+        const sel = document.getElementById('rubber-ducky-script-select');
+        if (sel) { sel.value = data.name; rubberDuckyOnScriptSelect(); }
+        rubberDuckyLoadLibrary();   // refresh the installed/reinstall labels
+    } catch (e) {
+        alert('Install failed: ' + e.message);
+    }
+}
+
+function rubberDuckyEditNew() {
+    /**Clear the editor for a new script*/
+    const n = document.getElementById('rubber-ducky-edit-name');
+    const c = document.getElementById('rubber-ducky-edit-content');
+    if (n) n.value = '';
+    if (c) c.value = '';
+    if (n) n.focus();
+}
+
+async function rubberDuckyEditLoad() {
+    /**Load the selected script's contents into the editor*/
+    const name = document.getElementById('rubber-ducky-script-select').value;
+    if (!name) { alert('Select a script first'); return; }
+    try {
+        const r = await rdFetch(`/api/files/preview?path=${encodeURIComponent('/rubber-ducky/' + name)}`);
+        const data = await r.json();
+        if (data.type !== 'text') throw new Error('not a text file');
+        document.getElementById('rubber-ducky-edit-name').value = name;
+        document.getElementById('rubber-ducky-edit-content').value = data.content || '';
+    } catch (e) {
+        alert('Could not load: ' + e.message);
+    }
+}
+
+async function rubberDuckyEditSave() {
+    /**Save the editor contents as a script in files/rubber-ducky/*/
+    const name = document.getElementById('rubber-ducky-edit-name').value.trim();
+    const content = document.getElementById('rubber-ducky-edit-content').value;
+    const statusDiv = document.getElementById('rubber-ducky-status');
+    const statusMsg = document.getElementById('rubber-ducky-status-message');
+    try {
+        const r = await rdFetch('/api/rubber-ducky/save', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, content })
+        });
+        const data = await _rdJson(r);
+        if (!r.ok || !data.success) throw new Error(data.error || 'save failed');
+        await rubberDuckyRefreshScripts();
+        const sel = document.getElementById('rubber-ducky-script-select');
+        if (sel) { sel.value = data.name; rubberDuckyOnScriptSelect(); }
+        if (statusMsg) {
+            statusMsg.textContent = `✅ Saved ${data.name}`;
+            statusMsg.className = 'rounded-lg border border-green-700 bg-green-900/70 px-4 py-3 text-sm text-green-200';
+            statusDiv.classList.remove('hidden');
+        }
+    } catch (e) {
+        if (statusMsg) {
+            statusMsg.textContent = `❌ Save failed: ${e.message}`;
+            statusMsg.className = 'rounded-lg border border-red-700 bg-red-900/70 px-4 py-3 text-sm text-red-200';
+            statusDiv.classList.remove('hidden');
+        }
+    }
+}
+
+function rubberDuckyRenderGadget(data) {
+    /**Render the USB HID gadget status line from a status/enable/disable payload*/
+    const el = document.getElementById('rubber-ducky-gadget-status');
+    if (!el) return;
+    if (!data || data.ok === false) {
+        el.textContent = '⚠ ' + ((data && data.error) || 'gadget status unavailable');
+        el.className = 'text-xs text-yellow-300 mt-1';
+        return;
+    }
+    if (data.hidg0) {
+        const attached = data.state === 'configured' ? ' · host attached' :
+                         (data.state ? ` · host: ${data.state}` : '');
+        el.textContent = `Enabled — /dev/hidg0 ready${attached}`;
+        el.className = 'text-xs text-green-400 mt-1';
+    } else if (!data.udc) {
+        el.textContent = 'No USB device controller — enable the HID-gadget option in the installer/updater and reboot';
+        el.className = 'text-xs text-yellow-300 mt-1';
+    } else {
+        el.textContent = 'Disabled — /dev/hidg0 not present';
+        el.className = 'text-xs text-gray-400 mt-1';
+    }
+}
+
+async function rubberDuckyGadgetStatus() {
+    /**Fetch and render the HID gadget status*/
+    try {
+        const r = await rdFetch('/api/rubber-ducky/gadget/status');
+        rubberDuckyRenderGadget(await r.json());
+    } catch (e) {
+        rubberDuckyRenderGadget({ ok: false, error: e.message });
+    }
+}
+
+async function rubberDuckyGadget(action) {
+    /**Enable or disable the HID gadget on demand, then refresh status + devices*/
+    const el = document.getElementById('rubber-ducky-gadget-status');
+    if (el) { el.textContent = action === 'enable' ? 'Enabling…' : 'Disabling…'; el.className = 'text-xs text-blue-300 mt-1'; }
+    try {
+        const r = await rdFetch(`/api/rubber-ducky/gadget/${action}`, { method: 'POST' });
+        rubberDuckyRenderGadget(await r.json());
+    } catch (e) {
+        rubberDuckyRenderGadget({ ok: false, error: e.message });
+    }
+    // The device dropdown depends on /dev/hidg0, so refresh it too.
+    await rubberDuckyRefreshDevices();
+}
+
+async function rubberDuckyRefreshScripts() {
+    /**Fetch and populate script list*/
+    try {
+        const response = await rdFetch('/api/rubber-ducky/scripts');
+        const data = await response.json();
+
+        if (!data.success) {
+            console.error('Failed to load scripts:', data.error);
+            return;
+        }
+
+        const select = document.getElementById('rubber-ducky-script-select');
+        select.innerHTML = '<option value="">Select a script...</option>';
+
+        if (data.scripts.length === 0) {
+            select.innerHTML += '<option disabled>No scripts found in files/rubber-ducky/</option>';
+            return;
+        }
+
+        data.scripts.forEach(script => {
+            const option = document.createElement('option');
+            option.value = script.name;
+            option.textContent = `${script.name} (${script.size} bytes)`;
+            select.appendChild(option);
+        });
+    } catch (error) {
+        console.error('Error loading scripts:', error);
+    }
+}
+
+async function rubberDuckyUploadScript(input) {
+    /**Upload a .ducky/.txt script into files/rubber-ducky/ and select it*/
+    const file = input.files && input.files[0];
+    input.value = '';  // allow re-uploading the same filename later
+    if (!file) return;
+    const statusDiv = document.getElementById('rubber-ducky-status');
+    const statusMsg = document.getElementById('rubber-ducky-status-message');
+    try {
+        const fd = new FormData();
+        fd.append('file', file);
+        fd.append('path', '/rubber-ducky');
+        const r = await fetch('/api/files/upload', { method: 'POST', body: fd });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || data.error) throw new Error(data.error || `upload failed (${r.status})`);
+        await rubberDuckyRefreshScripts();
+        const sel = document.getElementById('rubber-ducky-script-select');
+        if (sel) { sel.value = file.name; rubberDuckyOnScriptSelect(); }
+        if (statusMsg) {
+            statusMsg.textContent = `✅ Uploaded ${file.name}`;
+            statusMsg.className = 'rounded-lg border border-green-700 bg-green-900/70 px-4 py-3 text-sm text-green-200';
+            statusDiv.classList.remove('hidden');
+        }
+    } catch (e) {
+        if (statusMsg) {
+            statusMsg.textContent = `❌ Upload failed: ${e.message}`;
+            statusMsg.className = 'rounded-lg border border-red-700 bg-red-900/70 px-4 py-3 text-sm text-red-200';
+            statusDiv.classList.remove('hidden');
+        }
+    }
+}
+
+async function rubberDuckyRefreshDevices() {
+    /**Fetch and populate HID device list*/
+    try {
+        const response = await rdFetch('/api/rubber-ducky/devices');
+        const data = await response.json();
+
+        if (!data.success) {
+            console.error('Failed to load devices:', data.error);
+            return;
+        }
+
+        const select = document.getElementById('rubber-ducky-device-select');
+        select.innerHTML = '<option value="">Select a device...</option>';
+
+        const hintEl = document.getElementById('rubber-ducky-device-hint');
+        if (data.devices.length === 0) {
+            select.innerHTML += '<option disabled>No HID keyboard gadget detected</option>';
+            if (hintEl) {
+                hintEl.textContent = data.hint || 'No USB HID keyboard gadget found.';
+                hintEl.classList.remove('hidden');
+            }
+            return;
+        }
+        if (hintEl) hintEl.classList.add('hidden');
+
+        data.devices.forEach(device => {
+            const option = document.createElement('option');
+            option.value = device.path;
+            option.textContent = device.name;
+            select.appendChild(option);
+        });
+    } catch (error) {
+        console.error('Error loading devices:', error);
+    }
+}
+
+async function rubberDuckyOnScriptSelect() {
+    /**Load and preview selected script*/
+    try {
+        const scriptName = document.getElementById('rubber-ducky-script-select').value;
+
+        if (!scriptName) {
+            document.getElementById('rubber-ducky-preview').classList.add('hidden');
+            return;
+        }
+
+        const response = await rdFetch('/api/rubber-ducky/preview', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ script: scriptName })
+        });
+
+        const data = await response.json();
+        const previewDiv = document.getElementById('rubber-ducky-preview');
+        const previewContent = document.getElementById('rubber-ducky-preview-content');
+
+        if (!data.success) {
+            previewContent.textContent = `Error: ${data.error || 'Failed to parse script'}`;
+            previewContent.className = 'text-red-400 text-xs font-mono whitespace-pre-wrap';
+        } else {
+            previewContent.textContent = data.preview;
+            previewContent.className = 'text-gray-300 text-xs font-mono whitespace-pre-wrap';
+        }
+
+        previewDiv.classList.remove('hidden');
+    } catch (error) {
+        console.error('Error loading preview:', error);
+        document.getElementById('rubber-ducky-preview-content').textContent = `Error: ${error.message}`;
+    }
+}
+
+async function rubberDuckyExecute() {
+    /**Execute the selected script on the target device*/
+    try {
+        const scriptName = document.getElementById('rubber-ducky-script-select').value;
+        const devicePath = document.getElementById('rubber-ducky-device-select').value;
+        const statusDiv = document.getElementById('rubber-ducky-status');
+        const statusMsg = document.getElementById('rubber-ducky-status-message');
+        const executeBtn = document.getElementById('rubber-ducky-execute-btn');
+
+        if (!scriptName || !devicePath) {
+            statusMsg.textContent = '⚠️ Please select both a script and a target device';
+            statusMsg.className = 'rounded-lg border border-yellow-700 bg-yellow-900/70 px-4 py-3 text-sm text-yellow-200';
+            statusDiv.classList.remove('hidden');
+            return;
+        }
+
+        // Disable button and show executing state
+        executeBtn.disabled = true;
+        executeBtn.textContent = 'Executing...';
+        statusMsg.textContent = '⏳ Running script on device...';
+        statusMsg.className = 'rounded-lg border border-blue-700 bg-blue-900/70 px-4 py-3 text-sm text-blue-200';
+        statusDiv.classList.remove('hidden');
+
+        const response = await rdFetch('/api/rubber-ducky/execute', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                script: scriptName,
+                device: devicePath
+            })
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            statusMsg.innerHTML = `✅ <strong>Script executed successfully!</strong><br>Executed ${result.executed}/${result.total} commands`;
+            statusMsg.className = 'rounded-lg border border-green-700 bg-green-900/70 px-4 py-3 text-sm text-green-200';
+        } else {
+            statusMsg.innerHTML = `❌ <strong>Execution failed:</strong><br>${result.error || 'Unknown error'}`;
+            statusMsg.className = 'rounded-lg border border-red-700 bg-red-900/70 px-4 py-3 text-sm text-red-200';
+        }
+
+        // Re-enable button
+        executeBtn.disabled = false;
+        executeBtn.textContent = 'Execute Script';
+    } catch (error) {
+        console.error('Error executing script:', error);
+        const statusMsg = document.getElementById('rubber-ducky-status-message');
+        statusMsg.textContent = `❌ Error: ${error.message}`;
+        statusMsg.className = 'rounded-lg border border-red-700 bg-red-900/70 px-4 py-3 text-sm text-red-200';
+        document.getElementById('rubber-ducky-status').classList.remove('hidden');
+
+        const executeBtn = document.getElementById('rubber-ducky-execute-btn');
+        executeBtn.disabled = false;
+        executeBtn.textContent = 'Execute Script';
+    }
+}
+
+// ============================================================================
+// REVERSE SHELL GENERATOR + LISTENER
+// ============================================================================
+
+let _revshellPollTimer = null;
+
+async function revshellInit() {
+    /**Prefill LHOST with the box LAN IP and sync listener state*/
+    try {
+        const ipEl = document.getElementById('revshell-ip');
+        if (ipEl && !ipEl.value) {
+            const r = await fetch('/api/revshell/lan-ip');
+            const d = await r.json();
+            if (d && d.ip) ipEl.value = d.ip;
+        }
+    } catch (e) { /* ignore */ }
+    revshellRefreshStatus();
+}
+
+async function revshellGenerate() {
+    /**Generate reverse-shell one-liners and render them with copy buttons*/
+    const box = document.getElementById('revshell-payloads');
+    const ip = document.getElementById('revshell-ip').value.trim();
+    const port = document.getElementById('revshell-port').value;
+    const shell = document.getElementById('revshell-shell').value.trim() || '/bin/bash';
+    box.innerHTML = '<p class="text-xs text-gray-500">Generating…</p>';
+    try {
+        const r = await fetch('/api/revshell/generate', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ip, port, shell })
+        });
+        const data = await _rdJson(r);
+        if (!r.ok || !data.success) throw new Error(data.error || 'generate failed');
+        const ipEl = document.getElementById('revshell-ip');
+        if (ipEl && !ipEl.value) ipEl.value = data.ip;
+        box.innerHTML = '';
+        (data.payloads || []).forEach(p => {
+            const row = document.createElement('div');
+            row.className = 'bg-slate-900/50 border border-slate-800 rounded p-2';
+            const head = document.createElement('div');
+            head.className = 'flex items-center justify-between mb-1';
+            head.innerHTML = `<span class="text-xs font-medium text-pink-200">${escapeHtml(p.name)}</span>`;
+            const copy = document.createElement('button');
+            copy.className = 'text-[11px] bg-slate-700 hover:bg-slate-600 text-white px-2 py-0.5 rounded';
+            copy.textContent = 'Copy';
+            copy.onclick = () => revshellCopy(p.payload, copy);
+            head.appendChild(copy);
+            const code = document.createElement('div');
+            code.className = 'text-[11px] font-mono text-gray-300 whitespace-pre-wrap break-all';
+            code.textContent = p.payload;
+            row.appendChild(head); row.appendChild(code);
+            box.appendChild(row);
+        });
+    } catch (e) {
+        box.innerHTML = `<p class="text-xs text-red-400">Error: ${escapeHtml(e.message)}</p>`;
+    }
+}
+
+async function revshellCopy(text, btn) {
+    // Route through copyToClipboard: a plain-HTTP Ragnar (http://192.168.x/100.x)
+    // has no navigator.clipboard, so this needs the execCommand fallback.
+    const ok = await copyToClipboard(text, { silent: true });
+    if (btn) { const t = btn.textContent; btn.textContent = ok ? 'Copied' : 'Copy failed'; setTimeout(() => { btn.textContent = t; }, 1200); }
+}
+
+async function revshellListener(action) {
+    /**Start or stop the catch listener*/
+    try {
+        const body = action === 'start'
+            ? JSON.stringify({ port: document.getElementById('revshell-port').value })
+            : '{}';
+        const r = await fetch(`/api/revshell/listener/${action}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body
+        });
+        const data = await _rdJson(r);
+        if (!r.ok || data.success === false) throw new Error(data.error || 'failed');
+        revshellRefreshStatus();
+    } catch (e) {
+        const c = document.getElementById('revshell-console');
+        if (c) c.textContent = 'Error: ' + e.message;
+    }
+}
+
+async function revshellRefreshStatus() {
+    /**Poll listener status and update the console; self-schedules while running*/
+    try {
+        const r = await fetch('/api/revshell/listener/status');
+        const s = await r.json();
+        const statusEl = document.getElementById('revshell-listener-status');
+        const con = document.getElementById('revshell-console');
+        if (statusEl) {
+            statusEl.textContent = s.running
+                ? (s.connected ? `Connected — ${s.peer}` : `Listening on :${s.port}`)
+                : 'Stopped';
+            statusEl.className = 'text-xs mt-1 ' + (s.connected ? 'text-green-400' : s.running ? 'text-blue-300' : 'text-gray-400');
+        }
+        if (con && typeof s.output === 'string') {
+            const atBottom = con.scrollHeight - con.scrollTop - con.clientHeight < 40;
+            con.textContent = s.output || (s.running ? '' : 'Listener stopped.');
+            if (atBottom) con.scrollTop = con.scrollHeight;
+        }
+        if (_revshellPollTimer) { clearTimeout(_revshellPollTimer); _revshellPollTimer = null; }
+        // Keep polling only while the tab is on Pentest and the listener runs.
+        if (s.running && currentTab === 'pentest') {
+            _revshellPollTimer = setTimeout(revshellRefreshStatus, 1500);
+        }
+    } catch (e) { /* ignore transient errors */ }
+}
+
+async function revshellSend() {
+    /**Send a command line to the connected session*/
+    const input = document.getElementById('revshell-cmd');
+    const data = input.value;
+    if (!data) return;
+    input.value = '';
+    try {
+        await fetch('/api/revshell/listener/send', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ data })
+        });
+        setTimeout(revshellRefreshStatus, 300);
+    } catch (e) { /* ignore */ }
+}
+
+// ============================================================================
 // API HELPERS
 // ============================================================================
 
@@ -21417,6 +22304,288 @@ const scState = { unit: 'local', last: 0, buf: [], timer: null, busy: false, gat
 const SC_MAX_DOM_LINES = 5000;
 const SC_MAX_BUF = 20000;
 
+function scUnit() {
+    return scState.units.find(x => x.id === scState.unit) || { id: scState.unit, local: scState.unit === 'local' };
+}
+
+// How the selected unit is reached: 'local'; 'gateway' (mesh secret — full view +
+// control); 'shared' (its operator opted in — view-only on tag trust); 'blocked'.
+function scMode() {
+    const u = scUnit();
+    if (u.local || scState.unit === 'local') return 'local';
+    if (scState.gateway) return 'gateway';
+    if (u.shared) return 'shared';
+    return 'blocked';
+}
+
+function scSetControls(mode) {
+    const lock = mode === 'shared' || mode === 'blocked';
+    ['sc-port', 'sc-baud', 'sc-start', 'sc-stop', 'sc-release'].forEach(id => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.disabled = lock;
+        el.classList.toggle('opacity-50', lock);
+    });
+    const wrap = document.getElementById('sc-share-wrap');
+    if (wrap) wrap.classList.toggle('hidden', mode !== 'local');
+    const ww = document.getElementById('sc-write-wrap');
+    if (ww) ww.classList.toggle('hidden', mode !== 'local');
+}
+
+function scUpdateWriteUI(st, mode) {
+    mode = mode || scMode();
+    const aw = !!(st && st.allow_write);
+    const sm = !!(st && st.share_mesh);
+    if (mode === 'local') {
+        const badge = document.getElementById('sc-badge');
+        if (badge) {
+            badge.textContent = aw ? 'READ-WRITE' : 'READ-ONLY';
+            badge.className = 'text-xs font-semibold px-2 py-0.5 rounded border '
+                + (aw ? 'bg-amber-900/60 text-amber-300 border-amber-800' : 'bg-emerald-900/60 text-emerald-300 border-emerald-800');
+        }
+        const box = document.getElementById('sc-write');
+        if (box) box.checked = aw;
+        const bar = document.getElementById('sc-cmd-bar');
+        if (bar) bar.classList.toggle('hidden', !aw);
+        const row = document.getElementById('sc-script-row');
+        if (row) row.classList.remove('hidden');
+        if (aw) scLoadScripts();
+        // update share label to reflect write state
+        const lbl = document.getElementById('sc-share-label');
+        if (lbl) lbl.textContent = aw ? 'Share with mesh (read-write)' : 'Share with mesh (view-only)';
+    } else {
+        // remote unit: show cmd bar if the peer has share_mesh + allow_write
+        const remoteWrite = !!(st && st.share_mesh_write);
+        const badge = document.getElementById('sc-badge');
+        if (badge) {
+            badge.textContent = remoteWrite ? 'REMOTE WRITE' : 'VIEW-ONLY';
+            badge.className = 'text-xs font-semibold px-2 py-0.5 rounded border '
+                + (remoteWrite ? 'bg-amber-900/60 text-amber-300 border-amber-800' : 'bg-sky-900/60 text-sky-300 border-sky-800');
+        }
+        const bar = document.getElementById('sc-cmd-bar');
+        if (bar) bar.classList.toggle('hidden', !remoteWrite);
+        // Scripts run on the target unit through the mesh gateway (mesh
+        // secret); a console that is only *shared* relays single commands.
+        const row = document.getElementById('sc-script-row');
+        if (row) row.classList.toggle('hidden', mode !== 'gateway');
+        if (remoteWrite && mode === 'gateway') scLoadScripts();
+    }
+}
+
+async function scShareChanged() {
+    const box = document.getElementById('sc-share');
+    if (!box) return;
+    try {
+        const r = await fetchAPI('/api/serial-console/share', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ share: box.checked }) });
+        box.checked = !!r.share_mesh;
+    } catch (e) {
+        box.checked = !box.checked;
+        scSetStatus(`<span class="text-red-400">${escapeHtml(e.message)}</span>`);
+    }
+}
+
+async function scWriteChanged() {
+    const box = document.getElementById('sc-write');
+    if (!box) return;
+    if (box.checked && !confirm('Enable writing to the device console? Commands you type will be sent to the device through the console cable.')) {
+        box.checked = false;
+        return;
+    }
+    try {
+        const r = await fetchAPI('/api/serial-console/allow-write', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ allow_write: box.checked }) });
+        scUpdateWriteUI(r);
+        if (r.status) scSetStatus(scDescribe(Object.assign({ reserved_port: (r.status || {}).port }, r.status)));
+    } catch (e) {
+        box.checked = !box.checked;
+        scSetStatus(`<span class="text-red-400">${escapeHtml(e.message)}</span>`);
+    }
+}
+
+async function scSendCmd() {
+    const inp = document.getElementById('sc-cmd-input');
+    if (!inp) return;
+    const cmd = inp.value;
+    if (!cmd) return;
+    const mode = scMode();
+    try {
+        let r;
+        if (mode === 'local' || mode === 'gateway') {
+            r = await fetchAPI('/api/serial-console/write', scOpts({
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ data: cmd + '\r' }) }));
+        } else {
+            r = await fetchAPI('/api/serial-console/peer-write', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ unit: scState.unit, data: cmd + '\r' }) });
+        }
+        if (r.success) {
+            inp.value = '';
+        } else {
+            scSetStatus(`<span class="text-red-400">Write failed: ${escapeHtml(r.error || 'unknown')}</span>`);
+        }
+    } catch (e) {
+        scSetStatus(`<span class="text-red-400">${escapeHtml(e.message)}</span>`);
+    }
+}
+
+let scScriptsLoadedAt = 0;
+let scScriptsUnit = null;
+async function scLoadScripts(force) {
+    // Called from every poll tick: throttle, and never clobber the user's pick.
+    // A unit switch always reloads — scripts come from the unit being viewed.
+    if (scScriptsUnit !== scState.unit) force = true;
+    if (!force && Date.now() - scScriptsLoadedAt < 15000) return;
+    scScriptsLoadedAt = Date.now();
+    scScriptsUnit = scState.unit;
+    try {
+        const d = await fetchAPI('/api/serial-console/scripts', scOpts());
+        const sel = document.getElementById('sc-script-sel');
+        if (!sel) return;
+        const scripts = d.scripts || [];
+        const html = '<option value="">Run script\u2026</option>' +
+            scripts.map(s => `<option value="${escapeHtml(s.id)}" title="${escapeHtml(s.description)}">${escapeHtml(s.name)} (${s.commands} cmds, ${escapeHtml(s.vendor)})</option>`).join('');
+        if (sel.dataset.html === html || document.activeElement === sel) return;
+        const keep = sel.value;
+        sel.innerHTML = html;
+        sel.dataset.html = html;
+        if (keep && scripts.some(s => s.id === keep)) sel.value = keep;
+    } catch (e) { /* scripts unavailable */ }
+}
+
+async function scRunScript() {
+    const sel = document.getElementById('sc-script-sel');
+    const sid = sel ? sel.value : '';
+    if (!sid) return;
+    const name = sel.options[sel.selectedIndex].textContent;
+    if (!confirm(`Run script "${name}" on the connected device? Each command will be sent sequentially.`)) return;
+    const statusEl = document.getElementById('sc-script-status');
+    try {
+        const r = await fetchAPI('/api/serial-console/run-script', scOpts({
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ script_id: sid }) }));
+        if (r.success) {
+            if (statusEl) statusEl.innerHTML = `<span class="text-emerald-300">Running ${escapeHtml(r.script)} (${r.steps} steps)…</span>`;
+            scPollScriptStatus();
+        } else {
+            if (statusEl) statusEl.innerHTML = `<span class="text-red-400">${escapeHtml(r.error)}</span>`;
+        }
+    } catch (e) {
+        if (statusEl) statusEl.innerHTML = `<span class="text-red-400">${escapeHtml(e.message)}</span>`;
+    }
+}
+
+async function scUploadScript(input) {
+    // Add a console script (.json) to this unit's library straight from the
+    // dashboard, then refresh the dropdown and pre-select it. Scripts are
+    // stored locally in data/console_scripts/ (same place list_scripts reads),
+    // so the upload always targets the local unit regardless of which unit is
+    // being *viewed* in the console.
+    const file = input.files && input.files[0];
+    input.value = '';  // allow re-uploading the same filename later
+    if (!file) return;
+    const statusEl = document.getElementById('sc-script-status');
+    const setStatus = (html) => { if (statusEl) statusEl.innerHTML = html; };
+    if (!/\.json$/i.test(file.name)) {
+        setStatus('<span class="text-red-400">Console scripts must be .json files</span>');
+        return;
+    }
+    setStatus(`<span class="text-amber-300">Uploading ${escapeHtml(file.name)}…</span>`);
+    try {
+        const fd = new FormData();
+        fd.append('file', file);
+        fd.append('path', '/console_scripts');
+        const r = await fetch(resolveNetworkAwareEndpoint('/api/files/upload'), { method: 'POST', body: fd });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || data.error || !data.success) throw new Error(data.error || `upload failed (${r.status})`);
+        await scLoadScripts(true);
+        const sel = document.getElementById('sc-script-sel');
+        const stem = file.name.replace(/\.json$/i, '');
+        if (sel && [...sel.options].some(o => o.value === stem)) sel.value = stem;
+        setStatus(`<span class="text-emerald-300">Added ${escapeHtml(file.name)}</span>`);
+    } catch (e) {
+        setStatus(`<span class="text-red-400">Upload failed: ${escapeHtml(e.message)}</span>`);
+    }
+}
+
+async function scLoadLibrary() {
+    /**Fetch the external RagnarScripts console-script library and render install buttons*/
+    const box = document.getElementById('sc-library-list');
+    const repoEl = document.getElementById('sc-library-repo');
+    if (!box) return;
+    box.innerHTML = '<p class="text-gray-500">Loading…</p>';
+    try {
+        const r = await fetch('/api/serial-console/library');
+        const data = await r.json();
+        if (!data.available) {
+            if (repoEl) repoEl.textContent = '';
+            box.innerHTML = '<p class="text-gray-500">RagnarScripts repo not found. Clone it with '
+                + '<code class="bg-slate-800 px-1 rounded">git clone https://github.com/PierreGode/RagnarScripts</code> '
+                + 'next to Ragnar, or set <code class="bg-slate-800 px-1 rounded">RAGNAR_SCRIPTS_DIR</code>.</p>';
+            return;
+        }
+        if (repoEl) repoEl.textContent = data.repo || '';
+        const list = data.scripts || [];
+        if (!list.length) { box.innerHTML = '<p class="text-gray-500">No scripts in RagnarScripts/console-scripts/.</p>'; return; }
+        box.innerHTML = '';
+        list.forEach(s => {
+            const meta = [s.vendor, (s.commands || 0) + ' cmds'].filter(Boolean).join(' · ');
+            const row = document.createElement('div');
+            row.className = 'flex items-start justify-between gap-2 border-b border-slate-800 pb-2';
+            row.innerHTML = `<div class="min-w-0"><div class="text-gray-200 truncate">${escapeHtml(s.name)} <span class="text-gray-500">(${escapeHtml(meta)})</span></div>`
+                + `<div class="text-gray-500 truncate">${escapeHtml(s.description || '')}</div></div>`;
+            const btn = document.createElement('button');
+            btn.className = 'text-xs px-2 py-1 rounded shrink-0 ' + (s.installed ? 'bg-slate-800 text-gray-400 hover:bg-slate-700' : 'bg-indigo-600 hover:bg-indigo-700 text-white');
+            btn.textContent = s.installed ? 'Reinstall' : 'Install';
+            btn.onclick = () => scInstallLibrary(s.id);
+            row.appendChild(btn);
+            box.appendChild(row);
+        });
+    } catch (e) {
+        box.innerHTML = `<p class="text-red-400">Error: ${escapeHtml(e.message)}</p>`;
+    }
+}
+
+async function scInstallLibrary(id) {
+    /**Install a console script from the RagnarScripts repo into the local library*/
+    const box = document.getElementById('sc-library-list');
+    try {
+        const r = await fetch('/api/serial-console/library/install', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ script_id: id })
+        });
+        const data = await r.json();
+        if (!r.ok || !data.success) throw new Error(data.error || 'install failed');
+        await scLoadScripts(true);                // refresh the Run-script picker
+        const sel = document.getElementById('sc-script-sel');
+        if (sel && [...sel.options].some(o => o.value === id)) sel.value = id;
+        scLoadLibrary();                          // refresh the installed/reinstall labels
+    } catch (e) {
+        if (box) box.insertAdjacentHTML('afterbegin', `<p class="text-red-400">Install failed: ${escapeHtml(e.message)}</p>`);
+    }
+}
+
+async function scPollScriptStatus() {
+    const statusEl = document.getElementById('sc-script-status');
+    try {
+        const r = await fetchAPI('/api/serial-console/script-status', scOpts());
+        if (r.running) {
+            if (statusEl) statusEl.innerHTML = `<span class="text-amber-300">Step ${r.step}/${r.total}…</span>`;
+            setTimeout(scPollScriptStatus, 500);
+        } else if (r.error) {
+            if (statusEl) statusEl.innerHTML = `<span class="text-red-400">Failed at step ${r.step}: ${escapeHtml(r.error)}</span>`;
+        } else {
+            if (statusEl) statusEl.innerHTML = `<span class="text-emerald-300">Done (${r.total} commands sent)</span>`;
+            setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 5000);
+        }
+    } catch (e) {
+        if (statusEl) statusEl.textContent = '';
+    }
+}
+
 function scOpts(extra = {}) {
     const headers = Object.assign({}, extra.headers || {});
     if (scState.unit && scState.unit !== 'local') headers['X-Ragnar-Target'] = scState.unit;
@@ -21434,13 +22603,14 @@ function scDescribe(st) {
     const baud = st.baud_setting === 'auto'
         ? `${st.baud} baud (auto${st.auto_settled ? ', locked' : ', detecting'})`
         : `${st.baud} baud`;
+    const rw = st.allow_write ? ' · <span class="text-amber-300">read-write</span>' : '';
     if (!st.running) {
         return st.reserved_port
-            ? `Stopped · port <span class="font-mono">${escapeHtml(st.reserved_port)}</span> stays reserved (read-only) — Start to view, or Release port.`
+            ? `Stopped · port <span class="font-mono">${escapeHtml(st.reserved_port)}</span> stays reserved — Start to view, or Release port.` + rw
             : 'Stopped. Pick the USB serial port wired to the device console and press Start.';
     }
     const colour = st.state === 'reading' ? 'text-emerald-300' : 'text-amber-300';
-    let line = `<span class="${colour}">● ${escapeHtml(st.state)}</span> · <span class="font-mono">${escapeHtml(st.port || '')}</span> · ${baud} · ${st.bytes || 0} bytes`;
+    let line = `<span class="${colour}">● ${escapeHtml(st.state)}</span> · <span class="font-mono">${escapeHtml(st.port || '')}</span> · ${baud} · ${st.bytes || 0} bytes` + rw;
     line += ago === null ? ' · nothing received yet (a quiet console is normal — boot output and console logging appear here)' : ` · last data ${ago}s ago`;
     if (st.error) line += ` · <span class="text-amber-300">${escapeHtml(st.error)}</span>`;
     return line;
@@ -21461,7 +22631,7 @@ async function scRefresh() {
                 if (!x.local) {
                     if (!x.online) note = ' — offline';
                     else if (!x.reachable) note = ' — unreachable';
-                    else note = x.has_console ? (x.running ? ' — console live' : ' — console cabled') : ' — no console';
+                    else note = x.has_console ? (x.running ? ' — console live' : ' — console cabled') + (x.shared ? ' (shared)' : '') : ' — no console';
                 } else if (x.has_console) {
                     note = x.running ? ' — console live' : ' — console cabled';
                 }
@@ -21472,8 +22642,19 @@ async function scRefresh() {
         }
     } catch (e) { /* mesh off or unavailable: stay on this unit */ }
 
-    if (scState.unit !== 'local' && !scState.gateway) {
-        scSetStatus('<span class="text-amber-300">Viewing another unit\'s console needs the mesh secret (Mesh settings) — the mesh gateway that relays it is secret-gated.</span>');
+    const mode = scMode();
+    scSetControls(mode);
+    if (mode === 'blocked') {
+        const u = scUnit();
+        scUpdateWriteUI({}, 'blocked');
+        scSetStatus(`<span class="text-amber-300">${escapeHtml(u.name || 'That unit')} has not shared its console. On that unit, tick <strong>Share with mesh (view-only)</strong> in this card — or arm the mesh secret on both units for full view + control.</span>`);
+        return;
+    }
+    if (mode === 'shared') {
+        const u = scUnit();
+        const writeNote = u.share_mesh_write ? ' · <span class="text-amber-300">write enabled</span>' : '';
+        scSetStatus(`<span class="text-emerald-300">${u.share_mesh_write ? 'Shared' : 'View-only'}:</span> ${escapeHtml(u.name || 'this unit')} shares its console with the mesh${u.port_label ? ' · ' + escapeHtml(u.port_label) : ''}${writeNote}. Start/stop happen on that unit.`);
+        scUpdateWriteUI({ share_mesh_write: u.share_mesh_write }, 'shared');
         return;
     }
     // Ports on the selected unit
@@ -21496,6 +22677,9 @@ async function scRefresh() {
         }
         const b = document.getElementById('sc-baud');
         if (b && st.baud_setting) b.value = String(st.baud_setting);
+        const sh = document.getElementById('sc-share');
+        if (sh && mode === 'local') sh.checked = !!st.share_mesh;
+        scUpdateWriteUI(st, mode);
         scSetStatus(scDescribe(st));
     } catch (e) {
         scSetStatus(`<span class="text-red-400">${escapeHtml(e.message)}</span>`);
@@ -21562,10 +22746,17 @@ function scAppend(lines) {
 
 async function scPoll() {
     if (scState.busy) return;
-    if (scState.unit !== 'local' && !scState.gateway) return;
+    const mode = scMode();
+    if (mode === 'blocked') return;
     scState.busy = true;
     try {
-        const d = await fetchAPI(`/api/serial-console/output?since=${scState.last}`, scOpts());
+        const d = mode === 'shared'
+            ? await fetchAPI(`/api/serial-console/peer-output?unit=${encodeURIComponent(scState.unit)}&since=${scState.last}`)
+            : await fetchAPI(`/api/serial-console/output?since=${scState.last}`, scOpts());
+        if (mode === 'shared' && d.shared === false) {
+            scSetStatus(`<span class="text-amber-300">${escapeHtml(scUnit().name || 'That unit')} stopped sharing its console.</span>`);
+            return;
+        }
         const lines = d.lines || [];
         if (d.last < scState.last) {            // viewer restarted remotely: resync
             scState.last = 0;
@@ -21576,7 +22767,12 @@ async function scPoll() {
             scAppend(lines);
         }
         if (d.status) {
-            scSetStatus(scDescribe(Object.assign({ reserved_port: d.status.port }, d.status)));
+            const smw = d.share_mesh_write || (d.status && d.status.share_mesh_write);
+            const prefix = mode === 'shared'
+                ? `<span class="text-emerald-300">${smw ? 'Shared' : 'View-only'}</span> · ${escapeHtml(scUnit().name || '')} · ` : '';
+            scSetStatus(prefix + scDescribe(Object.assign({ reserved_port: d.status.port }, d.status)));
+            const stForUI = Object.assign({}, d.status, { share_mesh_write: smw });
+            scUpdateWriteUI(stForUI, mode);
         }
     } catch (e) {
         scSetStatus(`<span class="text-red-400">${escapeHtml(e.message)}</span>`);
@@ -23050,7 +24246,7 @@ function displayConfigForm(config) {
     // Render wardriving config settings into the dedicated Wardriving section slot
     const wdSlot = document.getElementById('wardriving-config-slot');
     if (wdSlot) {
-        const wdKeys = ['wardriving_scan_interval', 'wardriving_gps_port', 'wardriving_gps_baudrate', 'wardriving_auto_export', 'wardriving_wigle_include_zigbee'];
+        const wdKeys = ['wardriving_scan_interval', 'wardriving_gps_port', 'wardriving_gps_baudrate', 'wardriving_gps_assist', 'wardriving_gps_set_clock', 'wardriving_auto_export', 'wardriving_wigle_include_zigbee'];
         let wdHtml = '<form id="wardriving-config-form" class="bg-slate-800 bg-opacity-50 rounded-lg p-4 mt-4"><h4 class="text-md font-bold mb-4 text-gray-300">Settings</h4><div class="grid grid-cols-1 md:grid-cols-2 gap-4">';
         wdKeys.forEach(key => {
             const hasKey = Object.prototype.hasOwnProperty.call(config, key);
@@ -23172,9 +24368,14 @@ async function saveConfig(form) {
 
         // If manual_mode was changed, refresh the dashboard to update UI
         if (config.hasOwnProperty('manual_mode')) {
+            console.log('manual_mode setting changed to:', config.manual_mode);
             setTimeout(() => {
                 refreshDashboard();
             }, 500);
+            // Also directly update the UI to ensure tab visibility updates immediately
+            setTimeout(() => {
+                syncManualModeUI(Boolean(config.manual_mode));
+            }, 100);
         }
         
     } catch (error) {
@@ -23509,7 +24710,7 @@ async function saveAIToken() {
     }
 }
 
-// ─── Pushover Notification Functions ───────────────────────────────────
+// ─── Push Notification Functions (Pushover + Slack) ────────────────────
 async function loadPushoverConfiguration(config) {
     // Sync toggle checkboxes from config
     const toggle = document.getElementById('pushover-enabled-toggle');
@@ -23521,7 +24722,8 @@ async function loadPushoverConfiguration(config) {
         'pushover-notify-new-cred': 'pushover_notify_new_credential',
         'pushover-notify-device-lost': 'pushover_notify_device_lost',
         'pushover-notify-device-back-online': 'pushover_notify_device_back_online',
-        'pushover-notify-wardrive-upload': 'pushover_notify_wardrive_upload'
+        'pushover-notify-wardrive-upload': 'pushover_notify_wardrive_upload',
+        'pushover-notify-cellular': 'pushover_notify_cellular'
     };
     for (const [elemId, key] of Object.entries(evtMap)) {
         const cb = document.getElementById(elemId);
@@ -23544,6 +24746,54 @@ async function loadPushoverConfiguration(config) {
     } catch (e) {
         console.error('Failed to fetch Pushover key status:', e);
     }
+
+    try {
+        const sw = await fetchAPI('/api/slack/webhook');
+        const whInput = document.getElementById('slack-webhook-url');
+        if (whInput) {
+            whInput.value = '';
+            whInput.placeholder = sw.configured ? `Configured: ${sw.preview || '••••'}` : 'https://hooks.slack.com/services/...';
+        }
+        const rm = document.getElementById('slack-webhook-remove');
+        if (rm) rm.classList.toggle('hidden', !sw.configured);
+    } catch (e) {
+        console.error('Failed to fetch Slack webhook status:', e);
+    }
+}
+
+async function saveSlackWebhook() {
+    const input = document.getElementById('slack-webhook-url');
+    const url = input ? input.value.trim() : '';
+    if (!url) {
+        showPushoverStatus('⚠ Please enter a Slack webhook URL.', 'yellow');
+        return;
+    }
+    try {
+        const result = await postAPI('/api/slack/webhook', { webhook_url: url });
+        if (result.success) {
+            showPushoverStatus('✓ Slack webhook saved!', 'green');
+            addConsoleMessage('Slack webhook saved', 'success');
+            const config = await fetchAPI('/api/config');
+            await loadPushoverConfiguration(config);
+        } else {
+            throw new Error(result.error || result.message || 'Save failed');
+        }
+    } catch (e) {
+        showPushoverStatus('✗ Failed to save Slack webhook: ' + (e.message || 'unknown error'), 'red');
+    }
+}
+
+async function removeSlackWebhook() {
+    try {
+        const resp = await networkAwareFetch('/api/slack/webhook', { method: 'DELETE' });
+        const result = await resp.json();
+        if (!resp.ok || !result.success) throw new Error(result.error || 'Remove failed');
+        showPushoverStatus('ℹ Slack webhook removed', 'blue');
+        const config = await fetchAPI('/api/config');
+        await loadPushoverConfiguration(config);
+    } catch (e) {
+        showPushoverStatus('✗ Failed to remove Slack webhook: ' + (e.message || 'unknown error'), 'red');
+    }
 }
 
 async function togglePushoverEnabled() {
@@ -23551,11 +24801,11 @@ async function togglePushoverEnabled() {
     if (!cb) return;
     try {
         await postAPI('/api/config', { pushover_enabled: cb.checked });
-        showPushoverStatus(cb.checked ? '✓ Pushover notifications enabled' : 'ℹ Pushover notifications disabled',
+        showPushoverStatus(cb.checked ? '✓ Push notifications enabled' : 'ℹ Push notifications disabled',
             cb.checked ? 'green' : 'blue');
     } catch (e) {
         cb.checked = !cb.checked;
-        showPushoverStatus('✗ Failed to toggle Pushover: ' + (e.message || 'unknown error'), 'red');
+        showPushoverStatus('✗ Failed to toggle push notifications: ' + (e.message || 'unknown error'), 'red');
     }
 }
 
@@ -23595,7 +24845,8 @@ async function savePushoverTriggers() {
         'pushover-notify-new-cred': 'pushover_notify_new_credential',
         'pushover-notify-device-lost': 'pushover_notify_device_lost',
         'pushover-notify-device-back-online': 'pushover_notify_device_back_online',
-        'pushover-notify-wardrive-upload': 'pushover_notify_wardrive_upload'
+        'pushover-notify-wardrive-upload': 'pushover_notify_wardrive_upload',
+        'pushover-notify-cellular': 'pushover_notify_cellular'
     };
     const payload = {};
     for (const [elemId, key] of Object.entries(evtMap)) {
@@ -23615,8 +24866,8 @@ async function testPushover() {
     try {
         const result = await postAPI('/api/pushover/test', {});
         if (result.success) {
-            showPushoverStatus('✓ Test notification sent! Check your device.', 'green', 5000);
-            addConsoleMessage('Pushover test notification sent', 'success');
+            showPushoverStatus('✓ ' + (result.message || 'Test notification sent') + ' — check your device/channel.', 'green', 6000);
+            addConsoleMessage('Push test notification sent', 'success');
         } else {
             throw new Error(result.message || 'Send failed');
         }
@@ -23758,10 +25009,21 @@ const SAFE_VDIR = '/__safe__';
 // Current subfolder within the Vault ('' = root), preserved across refreshes.
 let currentSafeDir = '';
 
-// Real-filesystem locations the user may create folders in / upload to.
+// Real-filesystem locations the user may create folders in, rename and move
+// within — the general-purpose writable trees.
 function isWritablePath(p) {
     return p === '/uploads' || p.startsWith('/uploads/') ||
            p === '/backups' || p.startsWith('/backups/');
+}
+
+// Locations the user may upload files into. A superset of the writable trees:
+// it also covers the two script libraries (console scripts and rubber-ducky
+// payloads), so a script can be added straight from the Files tab without the
+// full folder/move/rename toolset those libraries don't need.
+function isUploadablePath(p) {
+    return isWritablePath(p) ||
+           p === '/console_scripts' || p.startsWith('/console_scripts/') ||
+           p === '/rubber-ducky' || p.startsWith('/rubber-ducky/');
 }
 
 // ── File-explorer navigation (Back = history, Up = parent folder) ────────────
@@ -23983,14 +25245,18 @@ function displayFiles(files, path, highlightFile = null) {
 
     if (!fileList) return false;
 
-    // A contextual toolbar for writable locations: create folders and upload
-    // straight into the folder being browsed. Shown even when the folder is
-    // empty (so a freshly created folder can be filled).
-    const toolbar = isWritablePath(path) ? `
+    // A contextual toolbar for writable/uploadable locations: upload straight
+    // into the folder being browsed (and, in the general-purpose writable
+    // trees, create folders too). Shown even when the folder is empty — so a
+    // freshly created folder, or an empty script library, can be filled.
+    const newFolderBtn = isWritablePath(path)
+        ? `<button onclick="newFolder()" class="bg-slate-700 hover:bg-slate-600 text-white text-xs px-2.5 py-1.5 rounded transition-colors whitespace-nowrap">+ New folder</button>`
+        : '';
+    const toolbar = isUploadablePath(path) ? `
         <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 p-3 mb-1 bg-slate-800/60 border border-slate-700 rounded-lg">
             <span class="text-sm text-gray-300 truncate">📁 ${escapeHtml(path)}</span>
             <div class="flex items-center gap-2 flex-shrink-0">
-                <button onclick="newFolder()" class="bg-slate-700 hover:bg-slate-600 text-white text-xs px-2.5 py-1.5 rounded transition-colors whitespace-nowrap">+ New folder</button>
+                ${newFolderBtn}
                 <button onclick="uploadFile()" class="bg-green-700 hover:bg-green-800 text-white text-xs px-2.5 py-1.5 rounded transition-colors whitespace-nowrap">⬆ Upload here</button>
             </div>
         </div>` : '';
@@ -24226,7 +25492,20 @@ function downloadFile(filePath) {
     showFileSuccess(`Downloading ${filePath.split('/').pop()}`);
 }
 
-// ── File Preview ────────────────────────────────────────────────
+// ── File Preview & Editor ───────────────────────────────────────
+const _editState = { path: '', original: '', editing: false, editable: false };
+
+function _setEditBtns(editing, editable) {
+    const editBtn = document.getElementById('preview-edit-btn');
+    const saveBtn = document.getElementById('preview-save-btn');
+    const cancelBtn = document.getElementById('preview-cancel-btn');
+    const statusEl = document.getElementById('preview-save-status');
+    if (editBtn) editBtn.classList.toggle('hidden', !editable || editing);
+    if (saveBtn) saveBtn.classList.toggle('hidden', !editing);
+    if (cancelBtn) cancelBtn.classList.toggle('hidden', !editing);
+    if (statusEl) statusEl.classList.add('hidden');
+}
+
 function previewFile(filePath) {
     const modal = document.getElementById('file-preview-modal');
     const content = document.getElementById('preview-content');
@@ -24235,9 +25514,15 @@ function previewFile(filePath) {
     const dlBtn = document.getElementById('preview-download-btn');
     if (!modal) return;
 
+    _editState.path = filePath;
+    _editState.editing = false;
+    _editState.editable = false;
+    _editState.original = '';
+
     const name = filePath.split('/').pop();
     filename.textContent = name;
     truncBadge.classList.add('hidden');
+    _setEditBtns(false, false);
     content.innerHTML = `<div class="text-center text-gray-400 py-12">
         <svg class="w-8 h-8 inline animate-spin mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
@@ -24264,9 +25549,11 @@ function previewFile(filePath) {
                 renderPreviewVideo(content, resolveNetworkAwareEndpoint(`/api/files/download?path=${encodeURIComponent(filePath)}&inline=1`), name, data.mime, filePath);
             } else if (data.type === 'text') {
                 if (data.truncated) truncBadge.classList.remove('hidden');
+                _editState.editable = !!data.editable;
+                _editState.original = data.content;
+                _setEditBtns(false, _editState.editable);
                 const isCSV = name.toLowerCase().endsWith('.csv');
                 if (isCSV) {
-                    // Render CSV as table
                     const lines = data.content.split('\n').filter(l => l.trim());
                     if (lines.length > 0) {
                         const headers = lines[0].split(',');
@@ -24297,7 +25584,63 @@ function previewFile(filePath) {
         });
 }
 
+function toggleFileEdit() {
+    if (!_editState.editable || _editState.editing) return;
+    _editState.editing = true;
+    _setEditBtns(true, true);
+    const content = document.getElementById('preview-content');
+    if (!content) return;
+    content.innerHTML = `<textarea id="file-editor" spellcheck="false" class="w-full font-mono text-xs p-3 rounded border border-slate-600 resize-none" style="min-height:60vh;height:100%;background:#0b1220;color:#e5e7eb;caret-color:#fbbf24;outline:none;color-scheme:dark;tab-size:4;white-space:pre;overflow:auto"></textarea>`;
+    const ta = document.getElementById('file-editor');
+    if (ta) {
+        ta.value = _editState.original;
+        ta.focus();
+    }
+}
+
+function cancelFileEdit() {
+    if (!_editState.editing) return;
+    _editState.editing = false;
+    _setEditBtns(false, _editState.editable);
+    const content = document.getElementById('preview-content');
+    if (content) {
+        content.innerHTML = `<pre class="text-xs text-gray-300 font-mono whitespace-pre-wrap break-words leading-relaxed">${escapeHtml(_editState.original)}</pre>`;
+    }
+}
+
+async function saveFileEdit() {
+    const ta = document.getElementById('file-editor');
+    const statusEl = document.getElementById('preview-save-status');
+    if (!ta || !_editState.path) return;
+    const newContent = ta.value;
+    try {
+        if (statusEl) { statusEl.textContent = 'Saving…'; statusEl.classList.remove('hidden'); }
+        const r = await networkAwareFetch('/api/files/save', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: _editState.path, content: newContent })
+        }).then(r => r.json());
+        if (r.success) {
+            _editState.original = newContent;
+            _editState.editing = false;
+            _setEditBtns(false, true);
+            const content = document.getElementById('preview-content');
+            if (content) {
+                content.innerHTML = `<pre class="text-xs text-gray-300 font-mono whitespace-pre-wrap break-words leading-relaxed">${escapeHtml(newContent)}</pre>`;
+            }
+            if (statusEl) { statusEl.textContent = 'Saved'; statusEl.classList.remove('hidden'); }
+            setTimeout(() => { if (statusEl) statusEl.classList.add('hidden'); }, 3000);
+        } else {
+            if (statusEl) { statusEl.textContent = r.error || 'Save failed'; statusEl.className = 'text-xs text-red-400'; statusEl.classList.remove('hidden'); }
+        }
+    } catch (e) {
+        if (statusEl) { statusEl.textContent = e.message; statusEl.className = 'text-xs text-red-400'; statusEl.classList.remove('hidden'); }
+    }
+}
+
 function closeFilePreview() {
+    _editState.editing = false;
+    _editState.editable = false;
     const modal = document.getElementById('file-preview-modal');
     if (modal) { modal.classList.add('hidden'); modal.classList.remove('flex'); }
 }
@@ -24458,9 +25801,10 @@ function uploadFile() {
             formData.append('file', file);
         }
 
-        // Upload into the folder currently being browsed when it is writable
-        // (an /uploads or /backups subfolder); otherwise default to /uploads.
-        const target = isWritablePath(currentDirectory) ? currentDirectory : '/uploads';
+        // Upload into the folder currently being browsed when it accepts
+        // uploads (an /uploads or /backups subfolder, or a script library);
+        // otherwise default to /uploads.
+        const target = isUploadablePath(currentDirectory) ? currentDirectory : '/uploads';
         formData.append('path', target);
 
         let totalBytes = 0;
@@ -24498,7 +25842,7 @@ function uploadFile() {
             try { data = JSON.parse(xhr.responseText); } catch (_) { /* non-JSON */ }
             if (xhr.status >= 200 && xhr.status < 300 && data.success) {
                 progress.finish(true, `Uploaded ${files.length} file(s)`);
-                if (!isWritablePath(currentDirectory)) currentDirectory = target;
+                if (!isUploadablePath(currentDirectory)) currentDirectory = target;
                 refreshFiles();
             } else {
                 const msg = (data && data.error) ? data.error : `HTTP ${xhr.status}`;
@@ -26153,6 +27497,7 @@ function loadSystemData() {
     fetchSystemStatus();
     fetchNetworkStats();
     fetchPowerDetail();
+    fetchFanStatus();
 
     // Auto-refresh every 5 seconds when on system tab
     if (systemMonitoringInterval) {
@@ -26164,6 +27509,7 @@ function loadSystemData() {
             fetchSystemStatus();
             fetchNetworkStats();
             fetchPowerDetail();
+            if (!_fan.busy) fetchFanStatus();
         }
     }, 5000);
 }
@@ -26177,6 +27523,183 @@ function fetchPowerDetail() {
         .then(data => { if (!data || !data.error) updatePowerSystemView(data); })
         .catch(error => console.error('Error fetching power detail:', error));
 }
+
+// ---- Cooling fan (System tab) ---------------------------------------------
+// /api/fan is a handful of sysfs reads, cheap enough for the 5 s system loop.
+// The curve inputs are only rebuilt when the trip values change, so a poll
+// never overwrites a number the user is typing.
+const _fan = { busy: false, curveKey: null, mode: null };
+
+function fetchFanStatus() {
+    networkAwareFetch('/api/fan')
+        .then(r => r.json())
+        .then(d => updateFanView(d))
+        .catch(e => console.error('Error fetching fan status:', e));
+}
+
+function _fanPresence(d) {
+    if (d.connected === true) return { short: 'Connected', cls: 'pw-ok' };
+    if (d.connected === false) return { short: 'Not detected', cls: 'pw-bad' };
+    return { short: d.has_tach ? 'Idle' : 'Unknown', cls: 'pw-muted' };
+}
+
+function updateFanView(d) {
+    const card = document.getElementById('fan-card');
+    const panel = document.getElementById('fan-panel');
+    if (!d || !d.supported) {
+        [card, panel].forEach(el => el && el.classList.add('hidden'));
+        return;
+    }
+    const p = _fanPresence(d);
+    const pct = d.percent != null ? d.percent : 0;
+
+    if (card) {
+        card.classList.remove('hidden');
+        const st = document.getElementById('fan-card-status');
+        const det = document.getElementById('fan-card-details');
+        const bar = document.getElementById('fan-card-progress');
+        if (st) {
+            st.textContent = d.rpm ? `${d.rpm} rpm` : p.short;
+            st.className = 'sys-stat-value ' + (d.rpm ? '' : p.cls);
+        }
+        if (det) det.textContent = `${pct} % · ${d.mode === 'manual' ? 'manual' : 'auto'}`;
+        if (bar) bar.style.width = pct + '%';
+    }
+    if (!panel) return;
+    panel.classList.remove('hidden');
+    const drv = document.getElementById('fan-driver');
+    if (drv) drv.textContent = d.driver || '';
+
+    // Live values
+    const tiles = [
+        ['Fan', p.short, p.cls],
+        ['Speed', d.has_tach ? `${d.rpm || 0} rpm` : 'n/a', ''],
+        ['Duty', `${pct} %`, ''],
+    ];
+    if (d.state != null && d.max_state) tiles.push(['Step', `${d.state} / ${d.max_state}`, '']);
+    if (d.temp_c != null) tiles.push(['SoC temp', `${d.temp_c} °C`, d.temp_c >= 80 ? 'pw-bad' : d.temp_c >= 70 ? 'pw-warn' : '']);
+    if (d.max_rpm) tiles.push(['Max rpm', `${d.max_rpm}`, '']);
+    if (d.health_percent != null) tiles.push(['Health', `${d.health_percent} %`, d.health_percent < 70 ? 'pw-warn' : 'pw-ok']);
+    let html = `<div class="pw-tiles">${tiles.map(([l, v, c]) =>
+        `<div class="pw-tile"><div class="pw-tile-label">${l}</div><div class="pw-tile-value ${c}">${escapeHtml(v)}</div></div>`).join('')}</div>`;
+    html += `<div class="pw-muted">${escapeHtml(d.connected_reason || '')}</div>`;
+    if (d.last_failsafe) {
+        html += `<div class="pw-warn" style="font-size:13px;margin-top:6px">${escapeHtml(d.last_failsafe.reason)}</div>`;
+    }
+    const live = document.getElementById('fan-live');
+    if (live) live.innerHTML = html;
+
+    // Control
+    const autoBtn = document.getElementById('fan-mode-auto');
+    const manBtn = document.getElementById('fan-mode-manual');
+    const manual = d.mode === 'manual';
+    _fan.mode = d.mode;
+    if (autoBtn) autoBtn.classList.toggle('fan-on', !manual);
+    if (manBtn) manBtn.classList.toggle('fan-on', manual);
+    [autoBtn, manBtn].forEach(b => { if (b) b.disabled = !d.can_control || _fan.busy; });
+    const slider = document.getElementById('fan-speed');
+    if (slider && manual && d.manual && document.activeElement !== slider) {
+        slider.value = d.manual.percent;
+        document.getElementById('fan-speed-val').textContent = d.manual.percent + ' %';
+    }
+    const testBtn = document.getElementById('fan-test-btn');
+    if (testBtn) { testBtn.disabled = !d.has_tach || _fan.busy; }
+    const note = document.getElementById('fan-control-note');
+    if (note) {
+        note.textContent = manual
+            ? `Manual: fixed at ${d.manual ? d.manual.percent : pct} %. Returns to automatic at ${d.failsafe_c} °C and on reboot.`
+            : 'Automatic: the kernel steps the fan along the curve below. Pick a speed and press Manual to override.';
+    }
+
+    // Curve
+    const sec = document.getElementById('fan-curve-section');
+    const trips = d.trips || [];
+    if (sec) sec.classList.toggle('hidden', !trips.length);
+    const key = JSON.stringify(trips.map(t => t.temp_c));
+    const box = document.getElementById('fan-curve');
+    if (box && key !== _fan.curveKey) {
+        _fan.curveKey = key;
+        box.innerHTML = trips.map((t, i) => `
+            <div class="fan-step" data-step="${i}">
+                <div class="pw-tile-label">Step ${i + 1}${t.percent != null ? ' → ' + t.percent + ' %' : ''}</div>
+                <input type="number" inputmode="decimal" min="30" max="85" step="0.5" value="${t.temp_c}"
+                       ${d.curve_writable ? '' : 'disabled'} aria-label="Step ${i + 1} temperature °C">
+                <div class="pw-muted">°C${t.hyst_c ? ' · off at −' + t.hyst_c : ''}</div>
+            </div>`).join('');
+    }
+    if (box) trips.forEach((t, i) => {
+        const el = box.querySelector(`[data-step="${i}"]`);
+        if (el) el.classList.toggle('fan-step-on', !!t.active);
+    });
+    const persist = document.getElementById('fan-curve-persist');
+    if (persist) {
+        persist.disabled = !d.can_persist;
+        persist.parentElement.title = d.can_persist ? 'Writes dtparam=fan_tempN to config.txt (backup kept)' : 'Pi 5 fan header only';
+        if (!persist.dataset.touched) persist.checked = !!d.persisted_curve;
+    }
+}
+
+async function _fanPost(url, body, okMsg) {
+    _fan.busy = true;
+    try {
+        const res = await postAPI(url, body);
+        if (res && res.success) {
+            if (okMsg) showNotification(okMsg, 'success');
+            _fan.curveKey = null;
+            updateFanView(res);
+        } else {
+            showNotification((res && res.error) || 'Fan request failed', 'error');
+        }
+        return res;
+    } catch (e) {
+        showNotification('Fan: ' + (e.message || e), 'error');
+    } finally {
+        _fan.busy = false;
+        fetchFanStatus();
+    }
+}
+
+function setFanAuto() {
+    return _fanPost('/api/fan/mode', { mode: 'auto' }, 'Fan back on automatic control');
+}
+
+function setFanManual() {
+    const percent = Number((document.getElementById('fan-speed') || {}).value || 50);
+    return _fanPost('/api/fan/mode', { mode: 'manual', percent }, `Fan fixed at ${percent} %`);
+}
+
+async function runFanSpinTest() {
+    const btn = document.getElementById('fan-test-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Spinning…'; }
+    const res = await _fanPost('/api/fan/test', {});
+    if (btn) btn.textContent = 'Spin test';
+    if (res && res.success && res.spin_test) {
+        const st = res.spin_test;
+        showNotification(st.connected ? `Fan OK — ${st.rpm} rpm at full speed` : 'No fan detected: 0 rpm at full speed',
+                         st.connected ? 'success' : 'error');
+    }
+}
+
+function saveFanCurve() {
+    const temps = Array.from(document.querySelectorAll('#fan-curve input')).map(el => Number(el.value));
+    const persistEl = document.getElementById('fan-curve-persist');
+    const persist = !!(persistEl && persistEl.checked && !persistEl.disabled);
+    return _fanPost('/api/fan/curve', { temps, persist },
+                    persist ? 'Fan curve applied and saved to config.txt' : 'Fan curve applied (until reboot)');
+}
+
+function resetFanCurve() {
+    const persistEl = document.getElementById('fan-curve-persist');
+    if (persistEl) { persistEl.checked = false; delete persistEl.dataset.touched; }
+    return _fanPost('/api/fan/curve', { reset: true }, 'Fan curve reset to defaults');
+}
+
+document.addEventListener('change', e => {
+    if (!e.target) return;
+    if (e.target.id === 'fan-curve-persist') e.target.dataset.touched = '1';
+    // Already manual: releasing the slider applies the new speed directly.
+    if (e.target.id === 'fan-speed' && _fan.mode === 'manual') setFanManual();
+});
 
 function updatePowerSystemView(d) {
     const card = document.getElementById('power-card');
@@ -26346,14 +27869,14 @@ function updateProcessList(processes) {
         const memoryPercent = (proc.memory_percent || 0).toFixed(1);
         
         html += `
-            <div class="flex items-center justify-between p-2 bg-slate-800 rounded text-sm">
-                <div class="flex-1 truncate">
+            <div class="flex items-center justify-between gap-3 p-2 bg-slate-800 rounded text-sm">
+                <div class="flex-1 min-w-0 truncate" title="PID ${escapeHtml(String(proc.pid))}">
                     <span class="font-medium">${escapeHtml(String(proc.name || ''))}</span>
-                    <span class="text-gray-400 ml-2">${escapeHtml(String(proc.pid))}</span>
+                    <span class="text-gray-500 text-xs">${escapeHtml(String(proc.pid))}</span>
                 </div>
-                <div class="flex space-x-3 text-xs">
-                    <span class="text-blue-400">${cpuPercent}% CPU</span>
-                    <span class="text-green-400">${memoryPercent}% MEM</span>
+                <div class="flex gap-3 text-xs whitespace-nowrap" style="font-variant-numeric:tabular-nums">
+                    <span class="text-blue-400">CPU ${cpuPercent}%</span>
+                    <span class="text-green-400">MEM ${memoryPercent}%</span>
                 </div>
             </div>
         `;
@@ -26405,8 +27928,8 @@ function updateNetworkStats(data) {
     
     // Connection summary
     html += `
-        <div class="bg-slate-800 rounded p-3">
-            <h4 class="font-medium mb-2">Connections</h4>
+        <div class="bg-slate-800 rounded p-3 min-w-0">
+            <h4 class="font-medium mb-2 text-sm">Connections</h4>
             <div class="text-2xl font-bold text-blue-400">${data.total_connections}</div>
         </div>
     `;
@@ -26414,8 +27937,8 @@ function updateNetworkStats(data) {
     // Interface statistics
     Object.entries(data.interfaces).slice(0, 4).forEach(([name, stats]) => {
         html += `
-            <div class="bg-slate-800 rounded p-3">
-                <h4 class="font-medium mb-2">${escapeHtml(name)}</h4>
+            <div class="bg-slate-800 rounded p-3 min-w-0">
+                <h4 class="font-medium mb-2 text-sm truncate" title="${escapeHtml(name)}">${escapeHtml(name)}</h4>
                 <div class="text-xs space-y-1">
                     <div class="flex justify-between">
                         <span class="text-gray-400">Sent:</span>
@@ -30062,6 +31585,19 @@ function _wdFetchDiagExtra(force) {
         .finally(() => { _wdDiagExtraBusy = false; });
 }
 
+// "position, time (NTP), almanac 31 SV · 2m ago" — what gps_assist pre-loaded
+// at start, plus when orbit data was last saved for the next cold start.
+function _wdAssist(gps) {
+    const parts = [];
+    if (gps.assist && (gps.assist.items || []).length) {
+        parts.push(`${gps.assist.items.join(', ')} · ${_wdAge(gps.assist.at)}`);
+    }
+    if (gps.aid_saved) {
+        parts.push(`saved alm ${gps.aid_saved.alm} / eph ${gps.aid_saved.eph} SV ${_wdAge(gps.aid_saved.at)}`);
+    }
+    return parts.length ? parts.join(' · ') : null;
+}
+
 function _wdHas(v) { return v !== undefined && v !== null && v !== ''; }
 
 function _wdAge(ts) {
@@ -30248,6 +31784,10 @@ function renderWardrivingDiagnostics(status) {
         ['Searching for', _wdHas(gps.searching_seconds)
             ? `${_wdDur(gps.searching_seconds)} (no fix yet)` : null,
             gps.searching_seconds > 120 ? 'warn' : null],
+        ['Assisted start', _wdAssist(gps)],
+        ['Clock from GPS', gps.clock_set
+            ? (gps.clock_set.changed ? `set ${gps.clock_set.delta > 0 ? '+' : ''}${gps.clock_set.delta}s · ${_wdAge(gps.clock_set.at)}`
+                                     : 'clock already correct') : null],
         ['GPS error', gps.error, 'warn']
     ]));
 
@@ -32425,8 +33965,8 @@ function _renderAutoUpload(d) {
     const po = document.getElementById('wd-au-pushover');
     if (po) po.checked = !!d.notify_pushover;
     const poNote = document.getElementById('wd-au-pushover-note');
-    if (poNote) poNote.textContent = { missing: '(set up Pushover in Settings → Notifications)',
-                                       off: '(Pushover is switched off in Settings → Notifications)' }[d.pushover_ready] || '';
+    if (poNote) poNote.textContent = { missing: '(set up Pushover or Slack in Settings → Push Notifications)',
+                                       off: '(Push notifications are switched off in Settings → Push Notifications)' }[d.pushover_ready] || '';
     const st = document.getElementById('wd-auto-upload-status');
     if (st) {
         const missing = picked.filter(t => !ready[t]).map(t => ({ wigle: 'WiGLE', wdgwars: 'WDGWars', wardrift: 'Wardrift' })[t]);
@@ -32482,7 +34022,7 @@ async function uploadWardriveSession(sessionId, target) {
             const resp = res.response || {};
             let extra;
             if (target === 'wardrift') {
-                extra = res.duplicate ? '\nAlready uploaded — no double awards.'
+                extra = res.duplicate ? '\nWardrift already has this file — an earlier upload may still be processing. Check your routes on wardrift.net.'
                     : (res.mode === 'route' ? '\nWardrift is processing it — the result appears under Auto-upload → Recent uploads.'
                        : `\n+${resp.awarded_exp || 0} EXP, +${resp.awarded_currency || 0} currency (${resp.batches} batches)`);
             } else {
@@ -33959,20 +35499,27 @@ function formatDuration(seconds) {
     return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
 }
 
-async function copyToClipboard(text) {
+async function copyToClipboard(text, { silent = false } = {}) {
+    // Works on a plain-HTTP Ragnar too: navigator.clipboard only exists in a
+    // secure context (HTTPS/localhost), so fall back to execCommand('copy').
+    let ok = true;
     try {
         await navigator.clipboard.writeText(text);
-        showNotification('Copied to clipboard', 'success');
     } catch (err) {
-        // Fallback for older browsers
         const textarea = document.createElement('textarea');
         textarea.value = text;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'fixed';
+        textarea.style.top = '-1000px';
+        textarea.style.opacity = '0';
         document.body.appendChild(textarea);
+        textarea.focus();
         textarea.select();
-        document.execCommand('copy');
+        try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
         document.body.removeChild(textarea);
-        showNotification('Copied to clipboard', 'success');
     }
+    if (!silent) showNotification(ok ? 'Copied to clipboard' : 'Copy failed', ok ? 'success' : 'error');
+    return ok;
 }
 
 let advVulnScanMode = 'web';

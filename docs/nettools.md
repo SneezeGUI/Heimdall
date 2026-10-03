@@ -10,12 +10,28 @@ device that's already sitting on the segment you care about, so it sees what the
 segment sees — plus the everyday diagnostics you'd normally reach for a laptop
 and a bag of CLI tools to do.
 
-It is split into three sub-tabs: **Diagnostics**, **Switch & L2/L3**, and
-**Interfaces**.
+It is split into two sub-tabs: **Diagnostics** and **Interfaces**. Diagnostics
+holds every module, sorted by the **OSI layer** it mostly watches — a row of layer
+buttons (**Overview · L7 · L6 · L5 · L4 · L3 · L2 · L1**) switches between them, and
+each layer lists its passive detectors first and its active tools after. A module that
+acts on more than one layer sits at the one it mostly watches (the matrix below). The
+over-the-air RF tools live in **Signal Intelligence**.
 
 > **Co-authored by [Solarflere](https://www.instagram.com/solarflere).** The
 > Authority Verification suite was designed and built in collaboration with Solarflere.
-<img width="2160" height="4626" alt="image" src="https://github.com/user-attachments/assets/5fa8244a-5118-4ea2-965a-76d253481a4a" />
+### Module visibility matrix
+
+Every module by OSI layer and **vantage tier** — what a tap has to see for a clean
+verdict to mean anything (A VLAN-wide · B link-local · C on-path unicast · D configured
+peer · E active / local · RF over-the-air). The Diagnostics layer buttons follow it.
+
+The matrix is also in the web UI as a reference guide: **Overview** has a collapsible
+*Module visibility matrix* card with the whole graphic, and every layer panel (L7 … L1)
+opens with its own band of it (with the tier legend), so the tier of each module is right
+next to its card. The images load only when you expand a card; tap one to open the full
+matrix to zoom (`/web/images/osi/`).
+
+<img src="ragnar_osi_visibility_matrix.jpg" alt="Ragnar module visibility matrix: OSI layer × vantage tier" width="1080" />
 
 
 
@@ -23,68 +39,74 @@ It is split into three sub-tabs: **Diagnostics**, **Switch & L2/L3**, and
 
 | Tool | Sub-tab | Endpoint |
 |------|---------|----------|
-| [Ping](#ping) | Diagnostics | `POST /api/net/ping` |
-| [Traceroute](#traceroute) | Diagnostics | `POST /api/net/traceroute` |
-| [MTR](#mtr) | Diagnostics | `POST /api/net/mtr` |
-| [WHOIS](#whois) | Diagnostics | `POST /api/net/whois` |
-| [IP Attribution (country/ASN/ISP/abuse)](ip-intel.md) | Diagnostics | `POST /api/net/ip-intel` |
-| [DNS Doctor (poisoning check)](#dns-doctor) | Diagnostics | `POST /api/net/dns` |
-| [DNS Watch (passive)](#dns-watch) | Switch & L2/L3 | `GET /api/net/dns-watch` |
-| [ARP Poisoning](#arp-poisoning) | Diagnostics | `GET /api/net/arp-check`, `/arp-baseline` |
-| [MAC Watch](#mac-watch) | Diagnostics | `GET /api/net/mac-watch`, `POST /api/net/mac-watch-reset` |
-| [DHCP Guardian](#dhcp-guardian) | Switch & L2/L3 | `GET /api/net/dhcp-guardian`, `POST /api/net/dhcp-baseline` |
-| [DHCP Snooping (inline)](#dhcp-snooping-inline) | Switch & L2/L3 | `GET /api/net/dhcp-snoop` + `/dhcp-snoop/status`, `/config`, `/setup` |
-| [Network Integrity Monitor](#-network-integrity-monitor) | Diagnostics | `GET /api/net/integrity` + config |
-| [Watchtower (unified watcher alerts)](watchtower.md) | Diagnostics | `GET /api/net/watchtower` + config |
-| [Incident correlation (attack chains)](incident-correlation.md) | Diagnostics | `GET /api/net/incidents` + config |
-| [Path MTU / Black-hole](#path-mtu--black-hole) | Diagnostics | `POST /api/net/pmtu` |
-| [Captive Portal Check](#captive-portal-check) | Diagnostics | `GET /api/net/captive-portal` |
-| [LAN Throughput (iperf3)](#lan-throughput-iperf3) | Diagnostics | `POST /api/net/iperf3`, `/iperf3-server` |
-| [Speed Test](#speed-test) | Diagnostics | `POST /api/net/speedtest` |
-| [Live Flow Telemetry](#live-flow-telemetry) | Diagnostics | `GET /api/net/flows` |
-| [PTP Timing Detection](#ptp-timing-detection) | Diagnostics | `POST /api/net/ptp` |
-| [On-Screen Network Diagnostic Mode](#-on-screen-network-diagnostic-mode) | Diagnostics (toggle) | config `network_diagnostic_mode` |
-| [Switch Discovery + PoE](#switch-discovery-lldp--cdpv1v2--edp--fdp) | Switch & L2/L3 | `GET /api/net/lldp` |
-| [ARP Scan](#arp-scan) | Switch & L2/L3 | `GET /api/net/arp-scan` |
-| [L2 Link Health](#l2-link-health) | Switch & L2/L3 | `POST /api/net/l2-health` |
-| [IGMP Watch](#igmp-watch) | Switch & L2/L3 | `GET /api/net/igmp-watch`, `POST /api/net/igmp-baseline` |
-| [TLS Watch](#tls-watch) | Switch & L2/L3 | `GET /api/net/tls-watch` |
-| [IPv6 First-Hop Watch](#ipv6-first-hop-watch) | Switch & L2/L3 | `GET /api/net/ipv6-watch`, `POST /api/net/ipv6-baseline` |
-| [NDP Watch](#ndp-watch) | Switch & L2/L3 | `GET /api/net/ndp-watch`, `POST /api/net/ndp-baseline` |
-| [IPv6 RA Guard](#ipv6-ra-guard) | Diagnostics | `GET /api/net/raguard`, `POST /api/net/raguard` `{action: harden}` |
-| [NTP Watch](#ntp-watch) | Diagnostics | `GET /api/net/ntp-watch`, `POST /api/net/ntp-baseline` |
-| [ICMP Watch](#icmp-watch) | Switch & L2/L3 | `GET /api/net/icmp-watch`, `POST /api/net/icmp-baseline` |
-| [SNMP Watch](#snmp-watch) | Diagnostics | `GET /api/net/snmp-watch`, `POST /api/net/snmp-baseline` |
-| [Cert Watch](#cert-watch) | Diagnostics | `POST /api/net/cert-watch`, `POST /api/net/cert-baseline` |
-| [STP/BPDU Watch](#stpbpdu-watch) | Switch & L2/L3 | `GET /api/net/stp-watch`, `POST /api/net/stp-baseline` |
-| [DTP Watch](#dtp-watch) | Switch & L2/L3 | `GET /api/net/dtp-watch`, `POST /api/net/dtp-baseline` |
-| [CDP Watch](#cdp-watch) | Switch & L2/L3 | `GET /api/net/cdp-watch`, `POST /api/net/cdp-baseline` |
-| [VTP Watch](#vtp-watch) | Switch & L2/L3 | `GET /api/net/vtp-watch`, `POST /api/net/vtp-baseline` |
-| [SMB Watch](#smb-watch) | Switch & L2/L3 | `GET /api/net/smb-watch`, `POST /api/net/smb-baseline` |
-| [Relay/Coercion Watch](#relaycoercion-watch) | Switch & L2/L3 | `GET /api/net/relay-watch`, `POST /api/net/relay-baseline` |
-| [RPC / NetLogon Watch](#rpc--netlogon-watch) | Switch & L2/L3 | `GET /api/net/rpc-watch` |
-| [LACP Watch](#lacp-watch) | Switch & L2/L3 | `GET /api/net/lacp-watch` |
-| [BFD Watch](#bfd-watch) | Switch & L2/L3 | `GET /api/net/bfd-watch` |
-| [PTP Watch](#ptp-watch) | Switch & L2/L3 | `GET /api/net/ptp-watch` |
-| [SR-MPLS Watch](#sr-mpls-watch) | Switch & L2/L3 | `GET /api/net/srmpls-watch` |
-| [FTP Watch](#ftp-watch) | Switch & L2/L3 | `GET /api/net/ftp-watch` |
-| [SMTP Watch](#smtp-watch) | Switch & L2/L3 | `GET /api/net/smtp-watch` |
-| [IPsec / IKE Watch](#ipsec--ike-watch) | Switch & L2/L3 | `GET /api/net/ipsec-watch` |
-| [LDAP Watch](#ldap-watch) | Switch & L2/L3 | `GET /api/net/ldap-watch` |
-| [SSH Watch](#ssh-watch) | Switch & L2/L3 | `GET /api/net/ssh-watch` |
-| [Telnet Watch](#telnet-watch) | Switch & L2/L3 | `GET /api/net/telnet-watch` |
-| [FHRP Watch](#fhrp-watch) | Switch & L2/L3 | `GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline` |
-| [EIGRP Watch](#eigrp-watch) | Switch & L2/L3 | `GET /api/net/eigrp-watch`, `POST /api/net/eigrp-baseline` |
-| [IS-IS Watch](#is-is-watch) | Switch & L2/L3 | `GET /api/net/isis-watch`, `POST /api/net/isis-baseline` |
-| [OSPF Security Scanner](#ospf-security-scanner) | Switch & L2/L3 | `GET /api/net/ospf-watch`, `POST /api/net/ospf-baseline` |
-| [BGP Path Watch](#bgp-path-watch) | Switch & L2/L3 | `GET /api/net/bgp-watch`, `POST /api/net/bgp-baseline` |
-| [BGP Collector & Path Asymmetry](#bgp-collector--path-asymmetry-control-plane--data-plane) | Switch & L2/L3 | `GET/POST /api/net/bgp-collector`, `/api/net/owd-reflector`, `POST /api/net/path-asymmetry` |
-| [Cisco Guard](#cisco-guard) | Switch & L2/L3 | `GET /api/net/cisco-guard` |
-| [Juniper Guard](#juniper-guard) | Switch & L2/L3 | `GET /api/net/juniper-guard` |
-| [Arista Guard](#arista-guard) | Switch & L2/L3 | `GET /api/net/arista-guard` |
-| [Comware Guard](#comware-guard) | Switch & L2/L3 | `GET /api/net/comware-guard` |
-| [Locate Port](#locate-port) | Switch & L2/L3 | `POST /api/net/locate-port` |
-| [PCAP Analyzer](#pcap-analyzer) | Switch & L2/L3 | `POST /api/net/pcap` |
+| [Network Integrity Monitor](#-network-integrity-monitor) | Diagnostics · Overview | `GET /api/net/integrity` + config |
+| [Watchtower (unified watcher alerts)](watchtower.md) | Diagnostics · Overview | `GET /api/net/watchtower` + config |
+| [Incident correlation (attack chains)](incident-correlation.md) | Diagnostics · Overview | `GET /api/net/incidents` + config |
+| [Detector Self-Test](#detector-self-test) | Diagnostics · Overview | `GET /api/net/routing-selftest` |
+| [PCAP Analyzer](#pcap-analyzer) | Diagnostics · Overview | `POST /api/net/pcap` |
+| [On-Screen Network Diagnostic Mode](#-on-screen-network-diagnostic-mode) | Diagnostics · Overview (toggle) | config `network_diagnostic_mode` |
+| [DHCP Guardian](#dhcp-guardian) | Diagnostics · L7 | `GET /api/net/dhcp-guardian`, `POST /api/net/dhcp-baseline` |
+| [DNS Watch (passive)](#dns-watch) | Diagnostics · L7 | `GET /api/net/dns-watch` |
+| [NTP Watch](#ntp-watch) | Diagnostics · L7 | `GET /api/net/ntp-watch`, `POST /api/net/ntp-baseline` |
+| [SNMP Watch](#snmp-watch) | Diagnostics · L7 | `GET /api/net/snmp-watch`, `POST /api/net/snmp-baseline` |
+| [SMB Watch](#smb-watch) | Diagnostics · L7 | `GET /api/net/smb-watch`, `POST /api/net/smb-baseline` |
+| [LDAP Watch](#ldap-watch) | Diagnostics · L7 | `GET /api/net/ldap-watch` |
+| [RPC / NetLogon Watch](#rpc--netlogon-watch) | Diagnostics · L7 | `GET /api/net/rpc-watch` |
+| [Relay/Coercion Watch](#relaycoercion-watch) | Diagnostics · L7 | `GET /api/net/relay-watch`, `POST /api/net/relay-baseline` |
+| [SMTP Watch](#smtp-watch) | Diagnostics · L7 | `GET /api/net/smtp-watch` |
+| [FTP Watch](#ftp-watch) | Diagnostics · L7 | `GET /api/net/ftp-watch` |
+| [BGP Path Watch](#bgp-path-watch) | Diagnostics · L7 | `GET /api/net/bgp-watch`, `POST /api/net/bgp-baseline` |
+| [BGP Collector & Path Asymmetry](#bgp-collector--path-asymmetry-control-plane--data-plane) | Diagnostics · L7 | `GET/POST /api/net/bgp-collector`, `/api/net/owd-reflector`, `POST /api/net/path-asymmetry` |
+| [IPsec / IKE Watch](#ipsec--ike-watch) | Diagnostics · L7 | `GET /api/net/ipsec-watch` |
+| [Cisco Guard](#cisco-guard) | Diagnostics · L7 | `GET /api/net/cisco-guard` |
+| [Juniper Guard](#juniper-guard) | Diagnostics · L7 | `GET /api/net/juniper-guard` |
+| [Arista Guard](#arista-guard) | Diagnostics · L7 | `GET /api/net/arista-guard` |
+| [Comware Guard](#comware-guard) | Diagnostics · L7 | `GET /api/net/comware-guard` |
+| [Dell Guard (daemon control)](#dell-guard-standalone-daemon) | Diagnostics · L7 | `GET/POST /api/net/dell-guard` |
+| [MikroTik Guard](#mikrotik-switch-and-router-guard) | Diagnostics · L7 | `GET /api/net/mikrotik-guard` |
+| [Aruba Guard](#aruba-guard) | Diagnostics · L7 | `GET /api/net/aruba-guard` |
+| [APC Guard](#apc-guard) | Diagnostics · L7 | `GET /api/net/apc-guard` |
+| [DNS Doctor (poisoning check)](#dns-doctor) | Diagnostics · L7 | `POST /api/net/dns` |
+| [Captive Portal Check](#captive-portal-check) | Diagnostics · L7 | `GET /api/net/captive-portal` |
+| [DHCP Snooping (inline)](#dhcp-snooping-inline) | Diagnostics · L7 | `GET /api/net/dhcp-snoop` + `/dhcp-snoop/status`, `/config`, `/setup` |
+| [WHOIS](#whois) | Diagnostics · L7 | `POST /api/net/whois` |
+| [IP Attribution (country/ASN/ISP/abuse)](ip-intel.md) | Diagnostics · L7 | `POST /api/net/ip-intel` |
+| [Speed Test](#speed-test) | Diagnostics · L7 | `POST /api/net/speedtest` |
+| [TLS Watch](#tls-watch) | Diagnostics · L6 | `GET /api/net/tls-watch` |
+| [Cert Watch](#cert-watch) | Diagnostics · L6 | `POST /api/net/cert-watch`, `POST /api/net/cert-baseline` |
+| [SSH Watch](#ssh-watch) | Diagnostics · L5 | `GET /api/net/ssh-watch` |
+| [Telnet Watch](#telnet-watch) | Diagnostics · L5 | `GET /api/net/telnet-watch` |
+| [Live Flow Telemetry](#live-flow-telemetry) | Diagnostics · L4 | `GET /api/net/flows` |
+| [LAN Throughput (iperf3)](#lan-throughput-iperf3) | Diagnostics · L4 | `POST /api/net/iperf3`, `/iperf3-server` |
+| [IGMP Watch](#igmp-watch) | Diagnostics · L3 | `GET /api/net/igmp-watch`, `POST /api/net/igmp-baseline` |
+| [OSPF Security Scanner](#ospf-security-scanner) | Diagnostics · L3 | `GET /api/net/ospf-watch`, `POST /api/net/ospf-baseline` |
+| [EIGRP Watch](#eigrp-watch) | Diagnostics · L3 | `GET /api/net/eigrp-watch`, `POST /api/net/eigrp-baseline` |
+| [FHRP Watch](#fhrp-watch) | Diagnostics · L3 | `GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline` |
+| [IPv6 First-Hop Watch](#ipv6-first-hop-watch) | Diagnostics · L3 | `GET /api/net/ipv6-watch`, `POST /api/net/ipv6-baseline` |
+| [NDP Watch](#ndp-watch) | Diagnostics · L3 | `GET /api/net/ndp-watch`, `POST /api/net/ndp-baseline` |
+| [ICMP Watch](#icmp-watch) | Diagnostics · L3 | `GET /api/net/icmp-watch`, `POST /api/net/icmp-baseline` |
+| [BFD Watch](#bfd-watch) | Diagnostics · L3 | `GET /api/net/bfd-watch` |
+| [SR-MPLS Watch](#sr-mpls-watch) | Diagnostics · L3 | `GET /api/net/srmpls-watch` |
+| [Ping](#ping) | Diagnostics · L3 | `POST /api/net/ping` |
+| [Traceroute](#traceroute) | Diagnostics · L3 | `POST /api/net/traceroute` |
+| [MTR](#mtr) | Diagnostics · L3 | `POST /api/net/mtr` |
+| [Path MTU / Black-hole](#path-mtu--black-hole) | Diagnostics · L3 | `POST /api/net/pmtu` |
+| [IPv6 RA Guard](#ipv6-ra-guard) | Diagnostics · L3 | `GET /api/net/raguard`, `POST /api/net/raguard` `{action: harden}` |
+| [MAC Watch](#mac-watch) | Diagnostics · L2 | `GET /api/net/mac-watch`, `POST /api/net/mac-watch-reset` |
+| [ARP Poisoning](#arp-poisoning) | Diagnostics · L2 | `GET /api/net/arp-check`, `/arp-baseline` |
+| [Switch Discovery + PoE](#switch-discovery-lldp--cdpv1v2--edp--fdp) | Diagnostics · L2 | `GET /api/net/lldp` |
+| [STP/BPDU Watch](#stpbpdu-watch) | Diagnostics · L2 | `GET /api/net/stp-watch`, `POST /api/net/stp-baseline` |
+| [DTP Watch](#dtp-watch) | Diagnostics · L2 | `GET /api/net/dtp-watch`, `POST /api/net/dtp-baseline` |
+| [CDP Watch](#cdp-watch) | Diagnostics · L2 | `GET /api/net/cdp-watch`, `POST /api/net/cdp-baseline` |
+| [VTP Watch](#vtp-watch) | Diagnostics · L2 | `GET /api/net/vtp-watch`, `POST /api/net/vtp-baseline` |
+| [IS-IS Watch](#is-is-watch) | Diagnostics · L2 | `GET /api/net/isis-watch`, `POST /api/net/isis-baseline` |
+| [PTP Watch](#ptp-watch) | Diagnostics · L2 | `GET /api/net/ptp-watch` |
+| [PTP Timing Detection](#ptp-timing-detection) | Diagnostics · L2 | `POST /api/net/ptp` |
+| [LACP Watch](#lacp-watch) | Diagnostics · L2 | `GET /api/net/lacp-watch` |
+| [L2 Link Health](#l2-link-health) | Diagnostics · L2 | `POST /api/net/l2-health` |
+| [ARP Scan](#arp-scan) | Diagnostics · L2 | `GET /api/net/arp-scan` |
+| [Locate Port](#locate-port) | Diagnostics · L1 | `POST /api/net/locate-port` |
+| [Cellular Uplink Fallback](cellular-uplink.md) | Interfaces | `GET /api/cellular/status` |
 | [Interfaces](#interface-list) | Interfaces | `GET /api/net/interfaces` |
 | [Network Identity](#network-identity) | Interfaces | `GET /api/net/identity` |
 | [ISP / WAN + VPN Detection](#isp--wan-detection) | Interfaces | `GET /api/net/isp` |
@@ -112,13 +134,13 @@ Installable packages are whitelisted (`iputils-ping`, `traceroute`, `mtr-tiny`,
 command.
 
 **Scapy** (for the routing-scanner end-to-end self-test) is installable the same
-way — the **Detector Self-Test** panel in Switch & L2/L3 has an **Install Scapy**
+way — the **Detector Self-Test** panel (Diagnostics · Overview) has an **Install Scapy**
 button that installs `python3-scapy` (falling back to `pip`). It's optional: the
 IGMP / OSPF / BGP scanners work fully without it; Scapy only adds the end-to-end
 leg that crafts real packets → pcap → `tcpdump` → parse to exercise the whole
 capture path.
 
-### Detector Self-Test (Switch & L2/L3)
+### Detector Self-Test
 A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **NDP**, **RA Guard**,
 **NTP**, **ICMP**, **SNMP**, **TLS-cert**, **STP**, **DTP**, **CDP**, **VTP**, **SMB**, **Relay/Coercion**, **SSH** (regreSSHion/Terrapin), **Telnet**, **RPC/NetLogon** (Zerologon/DCSync/WinRM), **LACP** (LAG hijack), **BFD** (failover manipulation), **PTP** (grandmaster takeover), **SR-MPLS** (label/segment injection), **IPsec/IKE** (D(HE)at / weak-DH / SWEET32 / Aggressive-Mode), **DNS Watch** (KeyTrap / NSEC3 / NXNSAttack / MaginotDNS cache-poisoning / SAD DNS), **EIGRP**, **IS-IS**, **FHRP**, OSPF and BGP detectors — plus the cross-protocol **D(HE)at** (CVE-2002-20001) coverage that also names finite-field-DH exposure in TLS and SSH — the vendor CVE guards (**Cisco**, **Juniper**, **Arista**, **Comware**, **MikroTik**, **Aruba** and **Dell** — Dell Guard is a standalone daemon, so the panel runs its offline classifier self-test) — plus the **BGP speaker** (codec/framer/FSM/RIB) and
 **path-asymmetry / OWD** engine — by running each classifier against crafted attack
@@ -179,7 +201,8 @@ The display auto-cycles six pages every **5 seconds**:
    WAN) originate from. ↑/↓ highlights **Auto** or an interface, press selects
    it; `*` marks the active choice and each row shows the NIC's IP, *no IP* or
    *down*. **Auto** follows a fixed priority — **built-in Ethernet → USB
-   Ethernet → wlan1 → wlan0** — taking the first interface that is up and
+   Ethernet → wlan1 → wlan0 → cellular** (tethered hotspot, last; pin it to
+   test the cellular link) — taking the first interface that is up and
    addressed (and, for the speed test, verified able to reach the internet with
    a device-bound probe), so a plugged-in cable is what gets tested instead of
    whatever holds the default route. The selection resets to Auto each time the
@@ -242,7 +265,7 @@ press is never blocked, and the panel wakes immediately on a press rather than
 waiting out the 5 s cycle.
 
 The speed test and pings originate from the **priority interface** — built-in
-Ethernet → USB Ethernet → wlan1 → wlan0, first one up and addressed (the speed
+Ethernet → USB Ethernet → wlan1 → wlan0 → cellular, first one up and addressed (the speed
 test also verifies it can reach the internet) — not from whatever holds the
 default route, so plugging in a cable is enough to test the cable. The result
 page shows the interface used.
@@ -276,7 +299,7 @@ The functions selectable inside each card (Up/Down, then press):
 | **IP** | **Ping gateway** (LAN) · **Ping internet** (`8.8.8.8`, WAN) · **DNS Doctor** (poison/hijack verdict) · **Speed test** |
 | **DHCP** / **WIFI** / **SIGNAL** | read-only (no functions) |
 | **SPECTRUM** | Up/Down selects the **band** (2.4 / 5 / 6 GHz) whose live channel-occupancy spectrum is drawn (scanned on the widest-band adapter — plug in the Alfa for 5/6 GHz); press does nothing (nothing to run) |
-| **IFACE** | Up/Down highlights **Auto** or a NIC; press **pins the egress tests** (Speed test / pings) to it. Auto = built-in eth → USB eth → wlan1 → wlan0 |
+| **IFACE** | Up/Down highlights **Auto** or a NIC; press **pins the egress tests** (Speed test / pings) to it. Auto = built-in eth → USB eth → wlan1 → wlan0 → cellular |
 | **BT** | **Scan BT** — press runs a ~8 s Bluetooth/BLE discovery sweep; the card then shows that result (with its age) until you scan again |
 | **ZIGBEE** | **Scan Zigbee** — press runs a ~8 s 802.15.4 sniff on the HuginnESP; the card then shows that result (with its age) until you scan again |
 
@@ -296,11 +319,13 @@ page (tap) or restart the service (hold).
 
 ---
 
-## 🩺 Diagnostics
+## 🩺 Reachability & service checks
 
 Reachability, path and bandwidth testing to any target — plus application-layer
 service-security checks (**NTP** time integrity, **SNMP** cleartext exposure, and
-**TLS/certificate** hygiene).
+**TLS/certificate** hygiene). The sections below are grouped by topic; in the web UI
+each card sits under its OSI layer in **Diagnostics** — see the [tool index](#tool-index)
+for which layer.
 
 ### Ping
 ICMP echo to a host or IP. Reports the raw output plus a parsed summary
@@ -743,7 +768,7 @@ grandmaster takeover, time injection, gPTP peer-delay attacks — see
 
 ### IPv6 RA Guard
 The **defence** half of IPv6 first-hop security. Where
-[IPv6 First-Hop Watch](#ipv6-first-hop-watch) (Switch & L2/L3) **detects** a rogue
+[IPv6 First-Hop Watch](#ipv6-first-hop-watch) (Diagnostics · L3) **detects** a rogue
 RA / DHCPv6 / ICMPv6-Redirect on the wire, RA Guard audits **this host's own IPv6
 settings** so a rogue first-hop can't take effect even if it reaches you — and can
 **harden** them in one click. It is active but sends **no packets**: it reads
@@ -1037,9 +1062,13 @@ grades it through the real handshake path — no root, no network.
   `POST /api/net/cert-baseline` `{action: reset}` · Python: `cryptography` ·
   binary: `tcpdump` (discovery only)
 
-## 🔌 Switch & L2/L3
+## 🔌 Switch, routing & protocol watchers
 
-Layer-2 discovery: what switch you're plugged into, and what else is on the
+Switch discovery, then the passive protocol watchers from L2 to L7 and the vendor CVE
+guards. In the web UI each sits under its OSI layer in **Diagnostics** (see the
+[tool index](#tool-index)).
+
+Layer-2 discovery first: what switch you're plugged into, and what else is on the
 segment.
 
 ### Switch Discovery (LLDP / CDPv1/v2 / EDP / FDP)
@@ -3081,9 +3110,10 @@ It's **detection-only**, but the traceroute is *active probing*, so it runs
   covers the convergence engine too), aggregated into the Detector Self-Test panel
   (`GET /api/net/routing-selftest`).
 
-### Vendor CVE Guards (Cisco · Juniper · Arista)
+### Vendor CVE Guards
 
-Three passive, **detection-only** vendor guards watch a network segment and report
+Seven passive, **detection-only** vendor guards — Cisco, Juniper, Arista, Comware, MikroTik,
+Aruba and APC (plus the standalone Dell Guard daemon) — watch a network segment and report
 **three classes** of evidence about a tracked set of router/switch CVEs — never
 transmitting, probing, or authenticating:
 
@@ -3261,8 +3291,30 @@ response's own CNAME/DNAME/NS chain), and the IPv6-only **`MTK-007`** RDNSS RA o
 reads the RouterOS version from **MNDP** (UDP 5678) to raise **`MTK-011`** Chimay-Red
 posture (CVE-2017-20149) — version is *dispositive* because RouterOS ships one monolithic
 image with no downstream backporting — and **`MTK-C01`** correlates a gated exploit on a
-device already seen running management in the clear. **Dual-stack** (bare `port` clauses
-match v4 and v6; a narrow `ip6[6]` clause admits v6 behind an extension header).
+device already seen running management in the clear.
+
+**v2 — MikroTrick (`MTK-021`, CVE-2026-67276 + CVE-2026-86060, exploited in the wild since
+2 September 2026).** CVE-2026-67276 lets an attacker who knows a username and the public
+*modulus* of that user's authorized key forge a working key without the private half
+(RouterOS compared type and modulus but not the exponent); CVE-2026-86060 then turns the
+session administrative via a crafted username. **Neither half is passively detectable**:
+both sit in `SSH_MSG_USERAUTH_REQUEST`, after `NEWKEYS`, i.e. encrypted — and CERT Polska's
+indicators are on-device log artifacts. So `MTK-021` is an honest **exposure** finding, one
+code for both CVEs (they share one encrypted exchange): a RouterOS version inside the
+September 2026 fix train (below **6.49.21 / 7.23.4 / 7.24.2 / 7.25beta3**) *and* SSH seen on
+the wire. The version comes from **MNDP** — keyed on the sender and on the IPv4/IPv6
+addresses the device announces — or from the cleartext SSH identification string
+(`SSH-2.0-ROSSSH-7.23.3`); a non-RouterOS SSH server contributes nothing. The finding says
+outright that the attack cannot be seen and that silence is not evidence of safety, and
+tells you what to check on the device (`user -2` log lines, an unexpected `ops` account,
+the Flagged marker). One deliberate difference from the upstream module: a **7.25beta1 /
+beta2** build (which predates the beta3 fix) is treated as affected — upstream's version
+parser reads `7.25beta3` as plain `7.25` and would call every 7.25 pre-release fixed.
+
+**Dual-stack** (bare `port` clauses match v4 and v6; a narrow `ip6[6]` clause admits v6
+behind an extension header). SSH is captured as **SYNs and the banner only**: libpcap's
+`tcp[]` payload accessor is IPv4-only (it compiles but matches no IPv6 packet), so IPv6
+gets an explicit fixed-offset `ip6[]` twin — verified on both families.
 **Signature-based on the per-packet capture model**, so the standalone's codes that need
 state, config or raw L2 are deliberately **not** ported, each with a reason: the www/jsproxy
 **crash** codes (server teardown with no response — flow-close behaviour), the
@@ -3300,14 +3352,93 @@ admits PAPI behind an extension header (**`ARB-008`**).
 - Endpoint: `GET /api/net/aruba-guard` `{interface, seconds}` · binary: `tcpdump`
 - CLI: `python3 network_diagnostics.py aruba-guard [--iface I] [--seconds N] [--json]`
 
-> **Watchtower feed.** All six vendor guards append their findings as JSON-lines to
-> `/var/log/ragnar/<guard>.jsonl` (time-window deduplicated), so [Watchtower](#watchtower)
-> tails them into the unified alert pane and single Pushover path alongside the standalone
-> watcher daemons — automatically whenever Extended Monitoring is on.
+#### APC Guard
+*Card: **Diagnostics** sub-tab (after Cert Watch).* **APC / Schneider Network Management Cards** (NMC1, NMC2, NMC3 — rack PDUs, rack ATS, NMC-equipped
+UPS) against **Ripple20**, the Treck TCP/IP stack bugs. The detection engine is the vendored
+standalone module `python/apcguard.py` (pure Python over raw frames). The in-app scan captures a
+bounded window with `tcpdump` using the module's own filter
+(`udp port 161`, `udp port 53`, ICMP, IP protocols 4 and 41, IPv4 fragments, and all IPv6), then
+replays the capture through the module with packet timestamps as its clock. Sources: Schneider
+FA410359 / SEVD-2020-174-01 V2.3, the JSOF Ripple20 whitepaper, and the McAfee ATR / JSOF
+detection logic. Never transmits.
+
+- **Version gates (posture).** Reads the card's **SNMP sysDescr** and gates on the hardware
+  and application tokens in `PN`/`AN1` (e.g. `apc_hw05_rpdu2g_694.bin`) — not the model number,
+  which does not identify the platform. **`APC-001`** NMC2 AOS ≤ 6.9.4, **`APC-002`** NMC1 ≤ 3.9.2,
+  **`APC-003`** NMC3 ≤ 1.3.3.1. These say *version in range*, never *vulnerable*: sysDescr does not
+  prove patch state. NMC2 6.9.2 / 6.9.4 fixed 14 of the 15 Treck CVEs; CVE-2020-11901 was fixed
+  only in 6.9.6, and the finding says so. **`APC-010`** inventories each card; **`APC-011`**
+  reports a sysDescr it cannot gate (missing or unknown tokens, or a version between last-affected
+  and first-fixed — never assumed safe).
+- **Attack shapes (against a known card).** **`APC-101`** fragmented IPv4-in-IP tunnel datagram
+  and **`APC-102`** inner IPv4 length shorter than the data present (CVE-2020-11896; also
+  CVE-2020-11898 when the inner protocol is 0); **`APC-103`** the card decapsulated a flagged
+  datagram and answered with ICMP protocol-unreachable; **`APC-106`** that reply quotes bytes that
+  were not in the packet — **heap memory disclosed** (CVE-2020-11898; the finding carries counts
+  and offsets, never the leaked bytes); **`APC-105`** IPv6-in-IPv4 to a card (CVE-2020-11902);
+  **`APC-111`** a DNS answer whose CNAME overruns its RDLENGTH and **`APC-112`** an overlong,
+  looping or chained name (CVE-2020-11901).
+- **Tunnel observations.** **`APC-104`** tunnel traffic to a card that meets no CVE condition;
+  **`APC-107`/`APC-108`** the card rejected an IP-in-IP / IPv6-in-IPv4 packet (informational — a
+  statement about that address and path, not immunity); **`APC-109`** another device answered
+  for it; **`APC-110`** a card with a declared MAC answered SNMP from a different MAC.
+- **CVE-2020-11899** (CISA KEV) has no documented wire trigger, so it is carried by the version
+  gates only. **CVE-2020-11897** does not apply to APC products.
+
+In Ragnar the module's findings map to **POSTURE** (version gates, inventory, tunnel
+observations), **EXPOSURE** (`APC-104`, `APC-110`) and **ATTACK** (`APC-101`/`102`/`103`/`105`/
+`106`/`111`/`112`); severities `info`/`notice`/`warn`/`critical` become INFO/LOW/HIGH/CRITICAL.
+
+**Known cards.** Tunnel and DNS attempts are analysed only against cards the engine knows, and a
+20-second window rarely contains an SNMP poll. So cards seen answering SNMP are **remembered
+across scans** (up to 256, in `data/apc_guard.json`), and you can **declare cards** in the card's
+text box — `ADDR` or `ADDR=MAC`, comma-separated, IPv4 or IPv6. Declare a MAC only where the tap
+sees the card's own frames: in a routed topology every frame carries the router's MAC. **Forget
+learned cards** clears the remembered list. IPv4 + IPv6 (the tunnel CVEs are IPv4-outer by
+definition).
+
+- Endpoint: `GET /api/net/apc-guard` `{interface, seconds (5-60), cards?, forget?}` · binary: `tcpdump`
+- CLI: `python3 network_diagnostics.py apc-guard [--iface I] [--seconds N] [--cards 'ADDR[=MAC],…'] [--forget] [--json]`
+- Self-test: `apc-guard-selftest` — the module's own 516-check tier plus the in-app adapter
+  (pcap reader, finding mapping, card memory, declared-card parsing, and a real `tcpdump` replay
+  through the module's filter). `python/apcguard_scapy_xcheck.py` is the module's independent
+  scapy cross-check (114 checks; its live-sniff legs need root).
+
+**Continuous mode (opt-in daemon).** `scripts/apcguard@.service` runs the same engine
+continuously on one tapped interface, keeping the author's measured hardening (`CAP_NET_RAW`
+only, `AF_PACKET`/`AF_NETLINK` only, `MemoryDenyWriteExecute=yes` — verified on this project's
+Raspberry Pi 5 / ARM64, where the author had measured x86_64 only — syscall filter,
+`MemoryMax=160M`). It runs the module self-test before every start and streams findings to
+`/var/log/ragnar/apcguard.jsonl`, which Watchtower tails.
+
+```
+sudo cp scripts/apcguard@.service /etc/systemd/system/
+sudo install -d /etc/ragnar/apcguard
+sudo cp scripts/apcguard.conf.example /etc/ragnar/apcguard/apcguard.conf     # optional
+sudo cp scripts/apcguard-nmc.list.example /etc/ragnar/apcguard/nmc.list      # your cards
+sudo systemctl daemon-reload && sudo systemctl enable --now apcguard@eth1
+```
+
+`scripts/apcguard@eth1.service.d.iface.conf.example` pins the instance to its interface
+(`RestrictNetworkInterfaces=` needs a literal name, not `%I`).
+
+**Blind spots** (from the module): the sysDescr grammar was checked against 13 public captures,
+not your fleet, and application tokens without a public capture are unverified; SNMPv3 with
+privacy hides sysDescr (declare the card); DNS over TCP is not inspected; tunnel nesting beyond
+one level is not unwrapped; a reply is matched only to a request the tap also saw; and the
+module's lab has never run against a real NMC — `APC-103`/`APC-106` are exercised by an emulated
+Treck-style responder.
+
+> **Watchtower feed.** All seven vendor guards append their findings as JSON-lines to
+> `/var/log/ragnar/<guard>.jsonl` (time-window deduplicated) on every scan, so
+> [Watchtower](#watchtower) tails them into the unified alert pane and single Pushover path
+> alongside the standalone watcher daemons. Cisco, Juniper, Arista and Comware also run in the
+> Extended Monitoring rotation; MikroTik, Aruba and APC run when you scan them (and APC's
+> daemon, above, writes `apcguard.jsonl`).
 
 #### Dell Guard (standalone daemon)
 Dell **SmartFabric OS10** SSRF-egress sensor for **CVE-2025-22474** (CWE-918, CVSS 6.8,
-`C:H/I:N/A:N`). Unlike the four guards above, Dell Guard is **not** an on-demand in-app
+`C:H/I:N/A:N`). Unlike the in-app guards above, Dell Guard is **not** an on-demand in-app
 scan — it is an **opt-in standalone daemon** (`python/dellguard.py`, units
 `scripts/dellguard@.service` + `scripts/dellguard-learn@.service`) that feeds
 [Watchtower](#watchtower) via `/var/log/ragnar/dellguard.jsonl`. It lives outside the

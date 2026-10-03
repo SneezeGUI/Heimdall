@@ -258,6 +258,21 @@ trigger the swap with the hardware button while that page is open.
    ```
 3. Ragnar cleans up leftover state on startup (removes `mon0`, stops any lingering services)
 
+### Pi 5 power button (optional)
+
+On an all-in-one Pi 5 with no e-Paper HAT or PiSugar, you can repurpose the
+board's **on-board power button** as the swap control: a single short press
+toggles Ragnar ⟷ Pwnagotchi. It runs in both modes and swaps either direction.
+
+```bash
+sudo bash scripts/install_power_button.sh
+```
+
+A short press then toggles the mode instead of powering off (long-hold ~10 s
+still hard-offs; use `sudo poweroff` for a clean shutdown). Full details,
+including the systemd-logind note for SPI-TFT kiosk builds, are in
+[POWER_BUTTON.md](POWER_BUTTON.md).
+
 ### Manual (MANU) vs Auto mode
 
 By default Pwnagotchi boots in **AUTO** mode and immediately starts hunting handshakes. To boot it **paused** in **MANU** mode instead, enable **Start in Manual mode** in the **Swap Control** card (Config tab → Pwnagotchi Bridge) *before* switching. The preference persists and applies to every subsequent Pwnagotchi launch (swap, button, or reboot) until you turn it off.

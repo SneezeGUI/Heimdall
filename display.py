@@ -904,7 +904,15 @@ class Display:
         return self.shared_data.manual_mode
 
     def is_interface_connected(self, interface):
-        """Check if any device is connected to the specified interface."""
+        """Check if any device is connected to the specified interface.
+
+        A missing interface is a normal condition (e.g. ``usb0`` when the box is
+        not set up as a USB-ethernet gadget), so treat it as "not connected"
+        quietly instead of logging an error on every poll — ``ip neigh show dev
+        usb0`` otherwise fails with ``Cannot find device "usb0"`` every cycle.
+        """
+        if not os.path.exists(f'/sys/class/net/{interface}'):
+            return False
         try:
             result = subprocess.Popen(['ip', 'neigh', 'show', 'dev', interface], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             output, error = result.communicate()
@@ -917,17 +925,12 @@ class Display:
             return False
 
     def is_usb_connected(self):
-        """Check if any device is connected to the USB interface."""
-        try:
-            result = subprocess.Popen(['ip', 'neigh', 'show', 'dev', 'usb0'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            output, error = result.communicate()
-            if result.returncode != 0:
-                logger.error(f"Error executing 'ip neigh show dev usb0': {error}")
-                return False
-            return bool(output.strip())
-        except Exception as e:
-            logger.error(f"Error checking USB connection status: {e}")
-            return False
+        """Check if any device is connected to the USB (usb0) interface.
+
+        usb0 only exists when the box is a USB-ethernet gadget; on Wi-Fi /
+        Ethernet-HAT / dongle setups it is absent, which is not an error.
+        """
+        return self.is_interface_connected('usb0')
 
     def _sleep_interruptible(self, current_page):
         """Sleep for screen_delay but wake early if button changes the page.
@@ -1587,7 +1590,7 @@ class Display:
             lldp = data.get('lldp') or {}
             if not lldp.get('installed', True):
                 self._draw_stat_rows(draw, y, [("LLDP", "not installed"),
-                                               ("Enable via", "Switch tab")])
+                                               ("Enable via", "Diag > L2")])
                 return
             n = lldp.get('neighbor')
             if not n:

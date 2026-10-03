@@ -144,7 +144,7 @@ journalctl -u certwatch -f
 
 ## Relation to the existing TLS / Cert Watch
 
-- **`tls_watch.py`** (Switch & L2/L3 → TLS Watch) is a passive TLS/QUIC
+- **`tls_watch.py`** (Diagnostics → L6 → TLS Watch) is a passive TLS/QUIC
   *handshake* observer — fingerprints (JA4/JA3), SNI/ALPN, SNI↔cert mismatch. It
   shares its parsers with certwatch.
 - **Cert Watch** (`do_cert_watch`) is the *active* certificate/hygiene checker

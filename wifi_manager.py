@@ -2166,19 +2166,28 @@ class WiFiManager:
             return []
     
     def try_connect_known_networks(self):
-        """Try to connect to known networks in priority order"""
-        if not self.known_networks:
-            self.logger.info("No known networks configured")
-            return False
-        
-        # First, check if we're already connected to one of our known networks
+        """Try to connect to known networks in priority order: Ragnar's own
+        list first, then the Wi-Fi profiles saved in NetworkManager.
+
+        The NetworkManager fallback matters because most units never populate
+        Ragnar's list — their networks were added by the Pi Imager, nmcli or
+        the OS, and live only as NM profiles. Every caller here means
+        "reconnect me now" (LCD/e-Paper reconnect key, force_reconnect,
+        restart_networking), and with an empty Ragnar list this used to log
+        "No known networks configured" and do nothing at all.
+        """
+        # First, check if we're already connected to a known network
         current_ssid = self.get_current_ssid()
         if current_ssid:
             known_ssids = [net['ssid'] for net in self.known_networks]
-            if current_ssid in known_ssids:
+            if current_ssid in known_ssids or current_ssid in self._system_profile_ssids():
                 self.logger.info(f"Already connected to known network: {current_ssid}")
                 return True
-        
+
+        if not self.known_networks:
+            self.logger.info("No Ragnar known networks configured — trying saved system Wi-Fi profiles")
+            return self._try_connect_system_profiles()
+
         # Sort known networks by priority (highest first)
         sorted_networks = sorted(self.known_networks, key=lambda x: x.get('priority', 0), reverse=True)
         
@@ -2195,9 +2204,143 @@ class WiFiManager:
                     
             except Exception as e:
                 self.logger.error(f"Error connecting to {network.get('ssid', 'unknown')}: {e}")
-        
+
+        # None of Ragnar's own entries worked — the saved system profiles may.
+        return self._try_connect_system_profiles()
+
+    @staticmethod
+    def _nmcli_split(line):
+        """Split one `nmcli -t` line on unescaped ':' (nmcli escapes ':' and
+        '\\' inside values, e.g. a profile named "Cafe: 2nd floor")."""
+        parts, cur, esc = [], '', False
+        for ch in line:
+            if esc:
+                cur += ch
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == ':':
+                parts.append(cur)
+                cur = ''
+            else:
+                cur += ch
+        parts.append(cur)
+        return parts
+
+    def _system_wifi_profile_details(self):
+        """Saved NetworkManager Wi-Fi client profiles:
+        [{'name', 'ssid', 'priority', 'last_used', 'iface'}]. AP-mode profiles (Ragnar's own
+        hotspot) are left out — "reconnect" must never bring up an AP."""
+        profiles = []
+        try:
+            result = subprocess.run(['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show'],
+                                    capture_output=True, text=True, timeout=10)
+            if result.returncode != 0:
+                return profiles
+            for line in result.stdout.splitlines():
+                parts = self._nmcli_split(line)
+                if len(parts) < 2 or parts[1] != '802-11-wireless':
+                    continue
+                name = parts[0]
+                detail = subprocess.run(
+                    ['nmcli', '-t', '-f',
+                     '802-11-wireless.ssid,802-11-wireless.mode,'
+                     'connection.autoconnect-priority,connection.timestamp,'
+                     'connection.interface-name',
+                     'connection', 'show', name],
+                    capture_output=True, text=True, timeout=10)
+                if detail.returncode != 0:
+                    continue
+                fields = {}
+                for dl in detail.stdout.splitlines():
+                    key, _, val = dl.partition(':')
+                    fields[key] = val.replace('\\:', ':').strip()
+                if fields.get('802-11-wireless.mode') == 'ap':
+                    continue
+                try:
+                    priority = int(fields.get('connection.autoconnect-priority') or 0)
+                except ValueError:
+                    priority = 0
+                try:
+                    last_used = int(fields.get('connection.timestamp') or 0)
+                except ValueError:
+                    last_used = 0
+                iface = fields.get('connection.interface-name') or ''
+                profiles.append({'name': name,
+                                 'ssid': fields.get('802-11-wireless.ssid') or name,
+                                 'priority': priority,
+                                 'last_used': last_used,
+                                 'iface': '' if iface == '--' else iface})
+        except Exception as e:
+            self.logger.debug(f"Could not list system Wi-Fi profiles: {e}")
+        return profiles
+
+    def _system_profile_ssids(self):
+        return {p['ssid'] for p in self._system_wifi_profile_details()}
+
+    def _visible_ssids(self):
+        """SSIDs in range right now, from a fresh NetworkManager rescan on
+        every Wi-Fi radio. Empty when the scan itself fails."""
+        try:
+            subprocess.run(['nmcli', 'device', 'wifi', 'rescan'],
+                           capture_output=True, text=True, timeout=15)
+            time.sleep(3)
+            result = subprocess.run(['nmcli', '-t', '-f', 'SSID', 'device', 'wifi', 'list',
+                                     '--rescan', 'no'],
+                                    capture_output=True, text=True, timeout=15)
+            if result.returncode == 0:
+                return {self._nmcli_split(l)[0] for l in result.stdout.splitlines()
+                        if l.strip()}
+        except Exception as e:
+            self.logger.debug(f"Wi-Fi rescan failed: {e}")
+        return set()
+
+    def _try_connect_system_profiles(self):
+        """Bring up the best saved NetworkManager profile that is in range.
+
+        Uses `nmcli connection up` on the existing profile, so stored
+        credentials, pinned interface and settings are used as-is and nothing
+        is created or modified. This also clears NetworkManager's own
+        autoconnect back-off: after a few failed attempts while out of range NM
+        stops retrying a profile for a while, which is why a unit carried out
+        and back in does not always rejoin by itself.
+        """
+        profiles = [p for p in self._system_wifi_profile_details()
+                    # A profile pinned to a radio that isn't plugged in can't come up.
+                    if not p['iface'] or os.path.isdir(f"/sys/class/net/{p['iface']}")]
+        if not profiles:
+            self.logger.info("No saved system Wi-Fi profiles to connect to")
+            return False
+        visible = self._visible_ssids()
+        candidates = [p for p in profiles if p['ssid'] in visible] if visible else profiles
+        if not candidates:
+            self.logger.info("None of the saved Wi-Fi networks are in range "
+                             f"({', '.join(sorted(p['ssid'] for p in profiles))})")
+            return False
+        # NM priority first; among equals (usually all 0) the network used most
+        # recently — the one the unit was on before it left — goes first.
+        candidates.sort(key=lambda p: (p['priority'], p['last_used']), reverse=True)
+
+        if self.ap_mode_active:
+            self.logger.info("Stopping AP mode before connecting to a saved Wi-Fi profile...")
+            self.stop_ap_mode()
+            time.sleep(2)
+
+        for p in candidates:
+            self.logger.info(f"Connecting to saved Wi-Fi profile {p['name']!r} (SSID {p['ssid']!r})...")
+            try:
+                result = subprocess.run(['sudo', 'nmcli', '--wait', '25', 'connection', 'up',
+                                         'id', p['name']],
+                                        capture_output=True, text=True, timeout=35)
+                if result.returncode == 0:
+                    self.logger.info(f"Connected to {p['ssid']} via saved profile {p['name']!r}")
+                    return True
+                self.logger.warning(f"Saved profile {p['name']!r} failed: "
+                                    f"{(result.stderr or result.stdout).strip()[:200]}")
+            except Exception as e:
+                self.logger.warning(f"Saved profile {p['name']!r} error: {e}")
         return False
-    
+
     def connect_to_network(self, ssid, password=None):
         """Connect to a specific Wi-Fi network - NEVER deletes existing system profiles"""
         try:

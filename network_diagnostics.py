@@ -2,8 +2,8 @@
 
 Registers a set of /api/net/* routes that wrap standard Linux networking
 tools (ping, traceroute, mtr, whois, speedtest, arp-scan, lldpctl, ethtool,
-ip, nmcli) and surface the results as JSON for the Network > Diagnostics /
-Switch & L2 / Interfaces sub-tabs in the web UI.
+ip, nmcli) and surface the results as JSON for the Network > Diagnostics
+(per-OSI-layer panels) and Interfaces sub-tabs in the web UI.
 
 The whole module is self-contained (no import from webapp_modern) to avoid a
 circular import: webapp_modern imports register_network_diagnostics() and calls
@@ -391,7 +391,8 @@ def _egress_iface(preferred=None):
     dflt = _default_route_iface()
     wired = []
     for name in _list_iface_names(include_virtual=False):
-        if _is_wireless(name) or name.startswith(('tun', 'tap', 'wg', 'zt', 'tailscale')):
+        if _is_wireless(name) or name.startswith(('tun', 'tap', 'wg', 'zt', 'tailscale')) \
+                or _is_cellular(name):
             continue
         try:
             with open(f'/sys/class/net/{name}/carrier') as f:
@@ -519,7 +520,7 @@ def do_speedtest(interface=None):
 
 
 # --------------------------------------------------------------------------
-# Switch & L2: LLDP/CDP/EDP neighbor discovery + ARP scan
+# L2: LLDP/CDP/EDP neighbor discovery + ARP scan
 # --------------------------------------------------------------------------
 
 def do_lldp(interface=None):
@@ -2868,6 +2869,16 @@ def _is_vpn(iface):
     return _iface_vpn_info(iface)['is_vpn']
 
 
+def _is_cellular(iface):
+    """USB-tethered hotspot/phone/LTE modem (see cellular_uplink.py). It is a
+    fallback internet path, never a LAN segment to capture on or test."""
+    try:
+        import cellular_uplink
+        return cellular_uplink.is_cellular(iface)
+    except Exception:
+        return False
+
+
 def do_interfaces(include_virtual=False):
     interfaces = []
     for name in _list_iface_names(include_virtual=include_virtual):
@@ -2878,9 +2889,11 @@ def do_interfaces(include_virtual=False):
             itype = 'wifi'
         elif vpn['is_vpn']:
             itype = 'vpn'
+        elif _is_cellular(name):
+            itype = 'cellular'
         else:
             itype = 'ethernet'
-        eth = _iface_ethtool(name) if itype == 'ethernet' else {
+        eth = _iface_ethtool(name) if itype in ('ethernet', 'cellular') else {
             'speed': None, 'duplex': None, 'autoneg': None, 'link_detected': None}
         method = _iface_ip_method(name, v4)
         interfaces.append({
@@ -3055,7 +3068,8 @@ def _capture_iface(preferred=None):
         return preferred
     wired = []
     for name in _list_iface_names(include_virtual=False):
-        if _is_wireless(name) or name.startswith(('tun', 'tap', 'wg', 'zt', 'tailscale')):
+        if _is_wireless(name) or name.startswith(('tun', 'tap', 'wg', 'zt', 'tailscale')) \
+                or _is_cellular(name):
             continue
         try:
             with open(f'/sys/class/net/{name}/carrier') as f:
@@ -3080,7 +3094,8 @@ def _wired_capture_iface(preferred=None):
         return preferred
     wired = []
     for name in _list_iface_names(include_virtual=False):
-        if _is_wireless(name) or name.startswith(_VPN_IFACE_PREFIXES):
+        if _is_wireless(name) or name.startswith(_VPN_IFACE_PREFIXES) \
+                or _is_cellular(name):
             continue
         try:
             with open(f'/sys/class/net/{name}/carrier') as f:
@@ -21340,7 +21355,17 @@ _MIKROTIK_NPK_ORIGINS = ('mikrotik.com',)
 _MIKROTIK_GUARD_BPF = (
     'tcp port 80 or tcp port 8080 or tcp port 139 or tcp port 445 or '
     'tcp port 8291 or tcp port 21 or udp port 53 or udp port 5678 or '
-    'udp portrange 33434-33534 or icmp6 or ' + _GUARD_IP6_EXTHDR_BPF)
+    'udp portrange 33434-33534 or icmp6 or '
+    # MTK-021: SSH SYN + the cleartext SSH banner only, so a bulk SSH/scp session
+    # cannot eat the packet budget. libpcap's tcp[] accessor is IPv4-ONLY (it
+    # compiles, but returns 0 for every IPv6 packet), so IPv6 gets an explicit
+    # fixed-offset ip6[] form; IPv6 behind extension headers is admitted by the
+    # shared _GUARD_IP6_EXTHDR_BPF clause.
+    '(tcp port 22 and (tcp[tcpflags] & tcp-syn != 0 or '
+    'tcp[((tcp[12:1] & 0xf0) >> 2):4] = 0x5353482d)) or '
+    '(ip6 and ip6[6] = 6 and (ip6[40:2] = 22 or ip6[42:2] = 22) and '
+    '((ip6[53] & 0x02) != 0 or ip6[(40 + ((ip6[52] & 0xf0) >> 2)):4] = 0x5353482d)) or '
+    + _GUARD_IP6_EXTHDR_BPF)
 
 _MIKROTIK_WINBOX_TRAVERSAL = (b'../', b'..\\', b'%2e%2e%2f', b'%2e%2e/')      # MTK-003
 _MIKROTIK_WINBOX_CRED_PATHS = (b'user.dat', b'/rw/store/', b'/flash/rw/store')
@@ -21376,12 +21401,45 @@ _MIKROTIK_REGISTRY = {
     'MTK-017': ('HOTSPOT_OOB_READ', 'CVE-2022-45313'),
     'MTK-019': ('DNS_UNRELATED_DATA_CACHE_POISON', 'CVE-2019-3979'),
     'MTK-020': ('AUTOUPGRADE_ORIGIN_BYPASS', 'CVE-2019-3977'),
+    # One code for both halves of MikroTrick: they share one encrypted exchange.
+    'MTK-021': ('MIKROTRICK_SSH_EXPOSURE', 'CVE-2026-67276'),
 }
+_MIKROTIK_MTK021_CVES = ['CVE-2026-67276', 'CVE-2026-86060']
+_MIKROTIK_SSH_PORT = 22
+_MIKROTIK_ROSSSH_RE = re.compile(rb'^SSH-\d+\.\d+-[^\r\n]*?ROSSSH[-_]?([0-9][0-9.]*(?:beta\d+|rc\d+)?)',
+                                 re.IGNORECASE)
 
 
 def _mikrotik_version_tuple(ver):
     m = re.match(r'^(\d+)\.(\d+)(?:\.(\d+))?', (ver or '').strip())
     return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)) if m else None
+
+
+def _mikrotik_sept2026_affected(version):
+    """The September 2026 CERT Polska fix train: 6.49.21 / 7.23.4 / 7.24.2 /
+    7.25beta3 — MikroTrick (CVE-2026-67276 + CVE-2026-86060, MTK-021). Upstream
+    shares it with the btest code MTK-004, which this in-app guard does not port
+    (it needs control-channel flow state). Tighter than upstream on one point: the
+    upstream parser reads '7.25beta3' as plain 7.25, which would call 7.25beta1 /
+    beta2 fixed although they predate the fix; here a 7.25 beta below 3 stays
+    affected (rc and release builds come after beta3 and are fixed)."""
+    t = _mikrotik_version_tuple(version)
+    if t is None:
+        return None
+    if t[0] == 6:
+        return t < (6, 49, 21)
+    if t[0] == 7:
+        if t[1] < 23:
+            return True
+        if t[1] == 23:
+            return t < (7, 23, 4)
+        if t[1] == 24:
+            return t < (7, 24, 2)
+        if t[1] == 25:
+            m = re.match(r'^7\.25(?:\.0)?beta(\d+)', (version or '').strip())
+            return bool(m) and int(m.group(1)) < 3
+        return False
+    return None
 
 
 def _mikrotik_chimay_red_affected(version):
@@ -21417,6 +21475,16 @@ def _mikrotik_parse_mndp(payload):
         val = payload[off:off + tlen]
         off += tlen
         name = _MIKROTIK_MNDP_TLV.get(ttype)
+        if name == 'ipv4' and tlen == 4:
+            out['ipv4'] = '.'.join(str(b) for b in val)
+            continue
+        if name == 'ipv6' and tlen == 16:
+            try:
+                import ipaddress as _ipa
+                out['ipv6'] = str(_ipa.IPv6Address(bytes(val)))
+            except Exception:
+                pass
+            continue
         if name in ('identity', 'version', 'platform', 'board', 'software_id',
                     'interface'):
             try:
@@ -21593,6 +21661,8 @@ def _mikrotik_analyze(records):
     seen_codes = set()
     cleartext_mgmt = set()      # server addrs seen serving cleartext mgmt (MTK-001)
     gated_hits = []             # (server, code) for the MTK-C01 correlation
+    dev_version = {}            # device addr -> (version, source)   (MTK-021)
+    ssh_seen = set()            # device addrs with SSH on the wire   (MTK-021)
 
     def add(code, name, sev, klass, src, cves, detail):
         key = (code, src)
@@ -21608,9 +21678,29 @@ def _mikrotik_analyze(records):
         src, dst = r.get('src'), r.get('dst')
         sport, dport = r.get('sport'), r.get('dport')
 
+        # --- SSH (TCP/22): MTK-021 substrate. The capture admits only SYNs and the
+        # cleartext identification string; RouterOS puts its version in it
+        # (SSH-2.0-ROSSSH-7.23.3). Nothing after the banner is readable.
+        if proto == 'TCP' and _MIKROTIK_SSH_PORT in (sport, dport):
+            if dport == _MIKROTIK_SSH_PORT and re.search(r'Flags \[S\]', r.get('dissect') or ''):
+                ssh_seen.add(dst)
+            if sport == _MIKROTIK_SSH_PORT and pl.startswith(b'SSH-'):
+                ssh_seen.add(src)
+                m = _MIKROTIK_ROSSSH_RE.match(pl)
+                if m and src not in dev_version:
+                    dev_version[src] = (m.group(1).decode('latin-1'), 'ssh-banner')
+            continue
+
         # --- MNDP (UDP/5678): device/version substrate -> MTK-011 Chimay-Red posture
         if proto == 'UDP' and (dport == _MIKROTIK_MNDP_PORT or sport == _MIKROTIK_MNDP_PORT):
-            ver = _mikrotik_parse_mndp(pl).get('version', '')
+            mndp = _mikrotik_parse_mndp(pl)
+            ver = mndp.get('version', '')
+            if ver:
+                # MNDP is authoritative for version; key it on the sender and on
+                # every address the device announces, so SSH seen on either
+                # family attributes to the same box.
+                for a in {src, mndp.get('ipv4'), mndp.get('ipv6')} - {None, ''}:
+                    dev_version[a] = (ver, 'mndp')
             if ver and _mikrotik_chimay_red_affected(ver) is True:
                 name, cve = _MIKROTIK_REGISTRY['MTK-011']
                 add('MTK-011', name, 'HIGH', 'POSTURE', src, [cve],
@@ -21827,6 +21917,30 @@ def _mikrotik_analyze(records):
                                   'firmware image.' % host)})
             continue
 
+    # --- MTK-021: MikroTrick EXPOSURE — affected RouterOS version AND SSH on the wire.
+    # Both halves (CVE-2026-67276 forged-exponent key, CVE-2026-86060 crafted
+    # username) sit inside SSH_MSG_USERAUTH_REQUEST, which is encrypted, so the
+    # attack itself can never be seen passively; silence is NOT evidence of safety.
+    for addr in sorted(ssh_seen):
+        ver, vsrc = dev_version.get(addr, (None, None))
+        if not ver or _mikrotik_sept2026_affected(ver) is not True:
+            continue
+        name, _cve = _MIKROTIK_REGISTRY['MTK-021']
+        add('MTK-021', name, 'HIGH', 'EXPOSURE', addr, list(_MIKROTIK_MTK021_CVES),
+            {'version': ver, 'version_source': vsrc, 'posture_only': True,
+             'exploitation_observable': False, 'actively_exploited': True,
+             'note': ('RouterOS %s with SSH observed on the wire: the MikroTrick '
+                      'exposure. CVE-2026-67276 lets an attacker who knows a username '
+                      'and the public MODULUS of that user\'s key forge a working key '
+                      'without the private half; CVE-2026-86060 turns the session into '
+                      'a full administrative one via a crafted username. Exploited in '
+                      'the wild since 2026-09-02; fixed in 7.25beta3 / 7.24.2 / 7.23.4 '
+                      '/ 6.49.21. THE ATTACK ITSELF IS NOT PASSIVELY OBSERVABLE — both '
+                      'halves sit in the encrypted SSH userauth exchange — so no further '
+                      'finding is NOT evidence of safety. Check the device: logs for '
+                      '"user -2", an unexpected "ops" account, and the Flagged marker in '
+                      '/system/device-mode/print.' % ver)})
+
     # --- MTK-C01: a gated exploit code fired on a device already serving cleartext mgmt
     for (dev, code) in gated_hits:
         if dev in cleartext_mgmt:
@@ -21986,6 +22100,55 @@ def _mikrotik_selftest():
            _guard_rec(proto='TCP', dport=80, dst='10.0.0.7',
                       payload=b'POST /rest/x HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{}')],
           'attack', ['MTK-001', 'MTK-005', 'MTK-C01'])
+
+    # --- MTK-021 MikroTrick exposure (CVE-2026-67276 + CVE-2026-86060) ---------------
+    def ssh_banner(src_ip, ver_str, ipver=4):
+        return _guard_rec(proto='TCP', src=src_ip, sport=22, dst='10.0.0.9', dport=51000,
+                          ipver=ipver, payload=('SSH-2.0-%s\r\n' % ver_str).encode())
+
+    def ssh_syn(dst_ip, ipver=4):
+        return _guard_rec(proto='TCP', src='10.0.0.9', sport=51000, dst=dst_ip, dport=22,
+                          ipver=ipver, dissect='Flags [S], seq 1, win 64240, length 0')
+
+    def mndp_addr(ver, ipv4=None):
+        body = b'\x00\x07' + len(ver.encode()).to_bytes(2, 'big') + ver.encode()
+        if ipv4:
+            body += b'\x00\x11\x00\x04' + bytes(int(x) for x in ipv4.split('.'))
+        return b'\x00\x00\x00\x00' + body
+
+    # Version from the cleartext SSH banner alone (the banner proves SSH on the wire).
+    r = check('mikrotik-mtk021-banner', [ssh_banner('10.0.0.30', 'ROSSSH-7.23.3')],
+              'exposure', ['MTK-021'])
+    f21 = [f for f in r['findings'] if f['code'] == 'MTK-021']
+    scenarios.append({'name': 'mikrotik-mtk021-names-both-cves-and-unobservability',
+                      'expect': 'both CVEs, exploitation_observable False',
+                      'got': str(f21[0]['cves'] if f21 else None),
+                      'pass': bool(f21) and f21[0]['cves'] == _MIKROTIK_MTK021_CVES
+                      and (f21[0]['detail'] or {}).get('exploitation_observable') is False})
+    # Fixed train stays silent (7.23.4, 7.24.2, 7.25beta3, 6.49.21).
+    check('mikrotik-mtk021-patched',
+          [ssh_banner('10.0.0.31', 'ROSSSH-7.23.4'), ssh_banner('10.0.0.32', 'ROSSSH-7.24.2'),
+           ssh_banner('10.0.0.33', 'ROSSSH-7.25beta3'), ssh_banner('10.0.0.34', 'ROSSSH-6.49.21')],
+          'clean')
+    # Stricter than upstream: 7.25beta2 predates the fix and is still affected.
+    check('mikrotik-mtk021-beta-before-fix', [ssh_banner('10.0.0.35', 'ROSSSH-7.25beta2')],
+          'exposure', ['MTK-021'])
+    # MNDP version + an SSH SYN to the device's announced address (not the MNDP source).
+    check('mikrotik-mtk021-mndp-plus-syn',
+          [_guard_rec(proto='UDP', src='10.0.0.40', sport=5678, dport=5678,
+                      payload=mndp_addr('7.22.1', ipv4='10.0.0.41')),
+           ssh_syn('10.0.0.41')],
+          'exposure', ['MTK-021'])
+    # Affected version but NO SSH seen: nothing (the exposure needs SSH on the wire).
+    r = check('mikrotik-mtk021-needs-ssh',
+              [_guard_rec(proto='UDP', src='10.0.0.50', sport=5678, dport=5678,
+                          payload=mndp('7.22.1'))], 'clean')
+    # A non-MikroTik SSH server contributes nothing, even on an affected-looking network.
+    check('mikrotik-mtk021-openssh-ignored',
+          [ssh_banner('10.0.0.60', 'OpenSSH_9.6p1 Debian-4'), ssh_syn('10.0.0.60')], 'clean')
+    # IPv6 parity: the banner over IPv6 raises the same finding.
+    check('mikrotik-mtk021-ipv6', [ssh_banner('2001:db8::30', 'ROSSSH-7.20.8', ipver=6)],
+          'exposure', ['MTK-021'])
 
     failed = sum(1 for s in scenarios if not s['pass'])
     return {'success': failed == 0, 'passed': len(scenarios) - failed,
@@ -22503,6 +22666,327 @@ def _aruba_selftest():
     check('aruba-ignores-non-papi',
           [_guard_rec(proto='UDP', dport=53, payload=b'\x12\x34\x01\x00' + b'\x00' * 60)],
           'clean')
+
+    failed = sum(1 for s in scenarios if not s['pass'])
+    return {'success': failed == 0, 'passed': len(scenarios) - failed,
+            'total': len(scenarios), 'scenarios': scenarios}
+
+
+# ==========================================================================
+# APC Guard — passive APC / Schneider Network Management Card (NMC) monitor
+# ==========================================================================
+# Ripple20 (Treck TCP/IP stack) exposure + attack attempts against NMC-managed
+# rack PDUs, rack ATS and UPS. The detection engine is the vendored standalone
+# apcguard (python/apcguard.py, pure Python over raw frames). In-app we capture a
+# bounded window with tcpdump using the module's own BPF, then replay the pcap
+# through apcguard.Engine with packet timestamps as the clock (its 10 s
+# request/reply windows need capture time, not replay time). Never transmits.
+#
+# The engine analyses tunnel / DNS attempts only against cards it knows, and a
+# short window rarely contains an SNMP poll, so cards learned from sysDescr are
+# remembered across scans (and operators can declare cards, ADDR or ADDR=MAC).
+_APC_GUARD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'apc_guard.json')
+_apc_guard_lock = threading.Lock()
+_APC_PY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'python')
+_APC_MAX_LEARNED = 256
+_APC_MAX_DECLARED = 64
+_APC_SEVERITY = {'info': 'INFO', 'notice': 'LOW', 'warn': 'HIGH', 'critical': 'CRITICAL'}
+# Version gates are posture; card-state observations too. Tunnel/DNS attempts and the
+# heap-disclosure reply are attacks. Tunnel traffic with no CVE condition and a
+# declared-MAC contradiction are exposure (something is talking to / answering as a card).
+_APC_KLASS = {
+    'APC-001': 'POSTURE', 'APC-002': 'POSTURE', 'APC-003': 'POSTURE',
+    'APC-010': 'POSTURE', 'APC-011': 'POSTURE', 'APC-012': 'POSTURE',
+    'APC-101': 'ATTACK', 'APC-102': 'ATTACK', 'APC-103': 'ATTACK',
+    'APC-104': 'EXPOSURE', 'APC-105': 'ATTACK', 'APC-106': 'ATTACK',
+    'APC-107': 'POSTURE', 'APC-108': 'POSTURE', 'APC-109': 'POSTURE',
+    'APC-110': 'EXPOSURE', 'APC-111': 'ATTACK', 'APC-112': 'ATTACK',
+}
+_APC_CVES = ('CVE-2020-11896', 'CVE-2020-11898', 'CVE-2020-11899',
+             'CVE-2020-11901', 'CVE-2020-11902')
+
+
+def _apc_module():
+    if _APC_PY_DIR not in sys.path:
+        sys.path.insert(0, _APC_PY_DIR)
+    import apcguard
+    return apcguard
+
+
+def _apc_pcap_frames(path):
+    """Read a classic libpcap file into [(ts, frame)]. Ethernet link type only
+    (what tcpdump -w writes on a wired NIC). Raises ValueError otherwise."""
+    with open(path, 'rb') as fh:
+        data = fh.read()
+    if len(data) < 24:
+        return []
+    magic = data[:4]
+    if magic in (b'\xd4\xc3\xb2\xa1', b'\x4d\x3c\xb2\xa1'):
+        end = '<'
+    elif magic in (b'\xa1\xb2\xc3\xd4', b'\xa1\xb2\x3c\x4d'):
+        end = '>'
+    else:
+        raise ValueError('not a libpcap file')
+    nano = magic in (b'\x4d\x3c\xb2\xa1', b'\xa1\xb2\x3c\x4d')
+    linktype = struct.unpack(end + 'I', data[20:24])[0] & 0x0FFFFFFF
+    if linktype != 1:
+        raise ValueError('unsupported link type %d (Ethernet only)' % linktype)
+    out, off, n = [], 24, len(data)
+    while off + 16 <= n:
+        sec, frac, incl, _orig = struct.unpack(end + 'IIII', data[off:off + 16])
+        off += 16
+        if incl > 262144 or off + incl > n:
+            break
+        out.append((sec + frac / (1e9 if nano else 1e6), data[off:off + incl]))
+        off += incl
+    return out
+
+
+def _apc_parse_cards(spec):
+    """'ADDR[=MAC], ADDR, ...' (commas, spaces or newlines) → [addr | (addr, mac)].
+    Raises ValueError on a bad address/MAC or a card declared with two MACs."""
+    ag = _apc_module()
+    cards, macs = [], {}
+    for tok in re.split(r'[\s,;]+', (spec or '').strip()):
+        if not tok:
+            continue
+        spec_ = ag.parse_nmc_spec(tok)
+        addr, mac = spec_ if isinstance(spec_, tuple) else (spec_, None)
+        if mac:
+            if macs.get(addr, mac) != mac:
+                raise ValueError('%s is declared with two different MACs' % addr)
+            macs[addr] = mac
+        cards.append((addr, mac) if mac else addr)
+    if len(cards) > _APC_MAX_DECLARED:
+        raise ValueError('at most %d declared cards' % _APC_MAX_DECLARED)
+    return cards
+
+
+def _apc_card_spec(cards):
+    return ', '.join('%s=%s' % c if isinstance(c, (tuple, list)) else c for c in cards)
+
+
+def _apc_map_finding(f):
+    code = f.get('code', '')
+    detail = dict(f.get('detail') or {})
+    for k in ('dst', 'af', 'confidence'):
+        if f.get(k):
+            detail[k] = f[k]
+    detail['module_severity'] = f.get('severity')
+    if f.get('severity_lowered_from'):
+        detail['severity_lowered_from'] = f['severity_lowered_from']
+    return {'code': code, 'name': f.get('title', code),
+            'severity': _APC_SEVERITY.get(f.get('severity'), 'MEDIUM'),
+            'klass': _APC_KLASS.get(code, 'POSTURE'),
+            'cves': list(f.get('cves') or []),
+            'src': f.get('src'), 'detail': detail}
+
+
+def _apc_analyze_frames(frames, cards=()):
+    """Replay [(ts, frame)] through apcguard.Engine seeded with `cards`.
+    Returns (findings, learned_addrs, stats)."""
+    ag = _apc_module()
+    raw = []
+    now = [frames[0][0] if frames else time.time()]
+    eng = ag.Engine(nmcs=list(cards), emit=raw.append, clock=lambda: now[0])
+    for ts, fr in frames:
+        now[0] = ts
+        try:
+            eng.handle_frame(fr)
+        except Exception:
+            eng.stats['parse_errors'] += 1
+    learned = sorted(a for a, r in eng.nmcs.items() if 'observed' in r.get('source', ''))
+    return [_apc_map_finding(f) for f in raw], learned, dict(eng.stats)
+
+
+def _apc_state_load():
+    d = _guard_events_load(_APC_GUARD_PATH)
+    return (d.get('declared') or []), (d.get('learned') or [])
+
+
+def _apc_learn(addrs):
+    with _apc_guard_lock:
+        d = _guard_events_load(_APC_GUARD_PATH)
+        cur = [a for a in (d.get('learned') or []) if a not in addrs]
+        d['learned'] = (cur + list(addrs))[-_APC_MAX_LEARNED:]
+        _guard_events_save(_APC_GUARD_PATH, d)
+
+
+def do_apc_guard(interface=None, seconds=20, cards=None, learn=True, quick=False,
+                 forget=False):
+    """Passive APC / Schneider NMC guard (detection-only). Captures SNMP, DNS,
+    ICMP, IP-in-IP / IPv6-in-IPv4 tunnels and IPv4 fragments for a few seconds
+    and replays them through the vendored apcguard engine: Ripple20 version gates
+    from SNMP sysDescr (NMC1/NMC2/NMC3 AOS) and the CVE-2020-11896 / 11898 / 11901
+    / 11902 attack shapes. `cards` (str) replaces the declared-card list; `forget`
+    clears the learned cards. Never transmits."""
+    if cards is not None or forget:
+        try:
+            declared_new = _apc_parse_cards(cards) if cards is not None else None
+        except (ValueError, ImportError) as e:
+            return {'success': False, 'error': 'declared cards: %s' % e}
+        with _apc_guard_lock:
+            d = _guard_events_load(_APC_GUARD_PATH)
+            if declared_new is not None:
+                d['declared'] = [list(c) if isinstance(c, tuple) else c for c in declared_new]
+            if forget:
+                d['learned'] = []
+            _guard_events_save(_APC_GUARD_PATH, d)
+    iface, iface_error = _lan_guard_iface(interface, 'APC Guard')
+    if iface_error:
+        return iface_error
+    seconds = _clamp_int(seconds, 20, 5, 60)
+    if not _have('tcpdump'):
+        return {'success': False, 'interface': iface,
+                'error': 'tcpdump is not installed. Click Install to add it.',
+                'missing_tool': 'tcpdump'}
+    try:
+        ag = _apc_module()
+    except Exception as e:
+        return {'success': False, 'interface': iface, 'error': 'apcguard module: %s' % e}
+    declared, learned = _apc_state_load()
+    seed = [tuple(c) if isinstance(c, list) else c for c in declared]
+    seen = {c[0] if isinstance(c, tuple) else c for c in seed}
+    seed += [a for a in learned if a not in seen]
+    tmpdir = tempfile.mkdtemp(prefix='apcguard-')
+    pcap = os.path.join(tmpdir, 'cap.pcap')
+    try:
+        res = _run(['timeout', str(seconds), 'tcpdump', '-i', iface, '-nn', '-s', '0',
+                    '-c', '20000', '-w', pcap, ag.BPF_FILTER], timeout=seconds + 8)
+        if not os.path.exists(pcap):
+            err = (res.get('err') or 'capture failed').strip()
+            return {'success': False, 'interface': iface, 'error': err[:200]}
+        try:
+            frames = _apc_pcap_frames(pcap)
+        except ValueError as e:
+            return {'success': False, 'interface': iface, 'error': str(e)}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    try:
+        findings, learned_now, stats = _apc_analyze_frames(frames, seed)
+    except ValueError as e:
+        return {'success': False, 'interface': iface, 'error': 'declared cards: %s' % e}
+    new_cards = [a for a in learned_now if a not in seen and a not in learned]
+    if learn and new_cards:
+        _apc_learn(new_cards)
+        learned = (learned + new_cards)[-_APC_MAX_LEARNED:]
+    result = _guard_finish('apc_guard', iface, seconds, findings, frames)
+    result['cards'] = {'declared': _apc_card_spec(seed[:len(declared)]),
+                       'learned': learned, 'new': new_cards}
+    result['stats'] = stats
+    if not quick:
+        _guard_record_event(_APC_GUARD_PATH, _apc_guard_lock, result)
+    _guard_emit_jsonl('apc_guard', result)
+    return result
+
+
+def _apc_selftest():
+    """APC Guard: the vendored apcguard self-test tier (516 checks, reshaped like
+    Dell's) plus the in-app adapter — pcap reader, severity/klass mapping, card
+    memory across scans, declared-card parsing, and a tcpdump BPF replay."""
+    scenarios = []
+
+    def sc(name, ok, expect='', got=''):
+        scenarios.append({'name': name, 'pass': bool(ok), 'expect': expect, 'got': str(got)})
+
+    try:
+        ag = _apc_module()
+        import apcguard_selftest as T
+    except Exception as e:
+        return {'success': False, 'scenarios': [
+            {'name': 'apcguard import failed: %s' % e, 'pass': False,
+             'expect': 'import', 'got': 'error'}]}
+
+    # 1. The module's own tier, in its own interpreter: one check installs signal
+    # handlers (main thread only — the web self-test runs in a request thread), and
+    # the tier monkeypatches the module, which must not touch a scan in progress.
+    # It prints 'N checks, F failures' + a line per FAIL.
+    res = _run([sys.executable or 'python3', os.path.join(_APC_PY_DIR, 'apcguard.py'),
+                '--self-test'], timeout=240)
+    out = (res.get('out') or '') + (res.get('err') or '')
+    rc = res.get('rc', 1)
+    m = re.search(r'(\d+)\s+checks,\s+(\d+)\s+failures', out)
+    total, failed = (int(m.group(1)), int(m.group(2))) if m else (0, 1)
+    for i in range(max(0, total - failed)):
+        scenarios.append({'name': 'apcguard check %d' % (i + 1), 'pass': True,
+                          'expect': 'pass', 'got': 'pass'})
+    for ln in out.splitlines():
+        if ln.strip().startswith('FAIL:'):
+            sc(ln.strip()[5:].strip(), False, 'pass', 'FAIL')
+    if not m or rc != 0 and not failed:
+        sc('apcguard module self-test', False, 'rc 0',
+           'rc %s %s' % (rc, (res.get('err') or out or '').strip()[-160:]))
+
+    # 2. In-app adapter.
+    card, nms = T.N4, '10.0.0.5'
+    snmp = T.v4f(card, nms, 17, T.udp(161, 40000, T.snmp_response(sysdescr=T.DESCR)))
+    inner = T.ipv4('9.9.9.9', card, 17, b'P' * 200, total=28)
+    frags = T._tunnel_frags_v4(inner, 7)
+    tmpdir = tempfile.mkdtemp(prefix='apcguard-st-')
+    try:
+        pin = os.path.join(tmpdir, 'in.pcap')
+        frames = [(1000.0, snmp), (1001.5, frags[0]), (1001.6, frags[1])]
+        with open(pin, 'wb') as fh:
+            fh.write(struct.pack('<IHHiIII', 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1))
+            for ts, fr in frames:
+                fh.write(struct.pack('<IIII', int(ts), int(round((ts % 1) * 1e6)),
+                                     len(fr), len(fr)) + fr)
+        back = _apc_pcap_frames(pin)
+        sc('apc-pcap-roundtrip', [f for _, f in back] == [f for _, f in frames]
+           and abs(back[1][0] - 1001.5) < 1e-6, 'frames+ts identical', len(back))
+
+        f0, _, _ = _apc_analyze_frames([])
+        sc('apc-clean', _guard_verdict(f0) == 'clean', 'clean', _guard_verdict(f0))
+
+        f1, learned, _ = _apc_analyze_frames(frames[:1])
+        by = {f['code']: f for f in f1}
+        sc('apc-version-gate-nmc2', 'APC-001' in by and by['APC-001']['klass'] == 'POSTURE'
+           and by['APC-001']['severity'] == 'HIGH' and 'CVE-2020-11901' in by['APC-001']['cves'],
+           'APC-001 POSTURE HIGH', sorted(by))
+        sc('apc-verdict-posture', _guard_verdict(f1) == 'posture', 'posture', _guard_verdict(f1))
+        sc('apc-learns-card', learned == [card], [card], learned)
+
+        f2, _, _ = _apc_analyze_frames(frames[1:])
+        sc('apc-unknown-card-ignored', not f2, 'no findings without the card', len(f2))
+        f3, _, _ = _apc_analyze_frames(frames[1:], [card])
+        c3 = {f['code']: f for f in f3}
+        sc('apc-remembered-card-attack', 'APC-101' in c3 and 'APC-102' in c3
+           and c3['APC-101']['severity'] == 'CRITICAL' and _guard_verdict(f3) == 'attack',
+           'APC-101+102 CRITICAL → attack', sorted(c3))
+        sc('apc-src-is-attacker', c3.get('APC-101', {}).get('src') == '8.8.8.8',
+           '8.8.8.8', c3.get('APC-101', {}).get('src'))
+
+        cards = _apc_parse_cards('192.0.2.10=02:AA:bb:cc:dd:10, 2001:db8::10\n192.0.2.11')
+        sc('apc-parse-cards', cards == [('192.0.2.10', '02:aa:bb:cc:dd:10'),
+                                        '2001:db8::10', '192.0.2.11'], '3 cards', cards)
+        for bad in ('999.1.1.1', '192.0.2.10=zz', '192.0.2.10=02:aa:bb:cc:dd:10 192.0.2.10=02:aa:bb:cc:dd:11'):
+            try:
+                _apc_parse_cards(bad)
+                sc('apc-parse-rejects %s' % bad, False, 'ValueError', 'accepted')
+            except ValueError:
+                sc('apc-parse-rejects %s' % bad, True, 'ValueError', 'ValueError')
+
+        sc('apc-klass-covers-codes', set(_APC_KLASS) == set(ag.CODES)
+           and set(_APC_SEVERITY) == set(ag.SEV_ORDER), 'every code mapped',
+           sorted(set(ag.CODES) ^ set(_APC_KLASS)))
+        sc('apc-cves-match-module', set(_APC_CVES) == {c for v in ag.CODES.values() for c in v[2]},
+           '5 Ripple20 CVEs', len(_APC_CVES))
+
+        # 3. The module's BPF, compiled and applied by the real tcpdump.
+        if _have('tcpdump'):
+            pout = os.path.join(tmpdir, 'out.pcap')
+            r = _run(['tcpdump', '-nn', '-r', pin, '-w', pout, ag.BPF_FILTER], timeout=20)
+            try:
+                rep = _apc_pcap_frames(pout)
+            except (OSError, ValueError):
+                rep = []
+            f4, _, _ = _apc_analyze_frames(rep, [card])
+            sc('apc-tcpdump-bpf-replay', len(rep) == 3 and _guard_verdict(f4) == 'attack',
+               '3 frames admitted → attack', '%d frames %s %s' % (
+                   len(rep), _guard_verdict(f4), (r.get('err') or '')[:80]))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
     failed = sum(1 for s in scenarios if not s['pass'])
     return {'success': failed == 0, 'passed': len(scenarios) - failed,
@@ -23860,6 +24344,7 @@ def do_routing_selftest():
               'arista_guard': _arista_selftest(), 'comware_guard': _comware_selftest(),
               'mikrotik_guard': _mikrotik_selftest(),
               'aruba_guard': _aruba_selftest(),
+              'apc_guard': _apc_selftest(),
               'dell_guard': _dell_selftest(),
               'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
     return {
@@ -25910,6 +26395,20 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/aruba-guard iface={iface or 'default-route'} secs={secs}")
         return jsonify(do_aruba_guard(interface=iface, seconds=secs))
 
+    @app.route('/api/net/apc-guard', methods=['GET'])
+    def net_apc_guard():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 20, 5, 60)
+        cards = request.args.get('cards')
+        if cards is not None and len(cards) > 4096:
+            return _bad('Declared card list too long')
+        forget = request.args.get('forget') in ('1', 'true', 'yes')
+        _log(f"net/apc-guard iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_apc_guard(interface=iface, seconds=secs, cards=cards,
+                                    forget=forget))
+
     @app.route('/api/net/dell-guard', methods=['GET', 'POST'])
     def net_dell_guard():
         # GET = status; POST {action, interface} = baseline / enforce / disable. Dell
@@ -26554,7 +27053,8 @@ def register_network_diagnostics(app, logger=None):
                                               window=data.get('window'), bins=data.get('bins'),
                                               bias_t=data.get('bias_t'), direct=data.get('direct'),
                                               conv_hz=data.get('conv_hz'),
-                                              detector=data.get('detector')))
+                                              detector=data.get('detector'),
+                                              hide_dc=data.get('hide_dc')))
         return jsonify(rtl_sdr.get_tuning())
 
     # Prove a peak is a transmitter and not a mixer image or the DC spike: the
@@ -26577,8 +27077,38 @@ def register_network_diagnostics(app, logger=None):
     # USB, which is what replugging does.
     @app.route('/api/net/rtl/reset', methods=['POST'])
     def net_rtl_reset():
+        # Present but silent -> a USB reset. Missing or stuck -> the self-heal
+        # ladder (power-cycles the port it is stuck on).
         _log("net/rtl/reset")
-        return jsonify(rtl_sdr.usb_reset())
+        if rtl_sdr._usb_rtl_devname():
+            return jsonify(rtl_sdr.usb_reset())
+        h = rtl_sdr.heal_now()
+        return jsonify({"ok": bool(h.get("present")), "healed": True, "heal": h,
+                        "error": None if h.get("present") else h.get("message")})
+
+    # Self-healing: the background watcher that recovers a wedged, stuck or
+    # vanished dongle. GET = what it is doing; POST {enabled} switches it;
+    # POST /heal runs the recovery ladder now.
+    @app.route('/api/net/rtl/health', methods=['GET', 'POST'])
+    def net_rtl_health():
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            if 'enabled' in data:
+                on = bool(data.get('enabled'))
+                try:
+                    from init_shared import shared_data as _sd
+                    _sd.config['rtl_self_heal'] = on
+                    if hasattr(_sd, 'save_config'):
+                        _sd.save_config()
+                except Exception:
+                    pass
+                return jsonify(rtl_sdr.set_heal_enabled(on))
+        return jsonify(rtl_sdr.heal_status())
+
+    @app.route('/api/net/rtl/heal', methods=['POST'])
+    def net_rtl_heal():
+        _log("net/rtl/heal")
+        return jsonify(rtl_sdr.heal_now())
 
     # Harmonic check: measures 2x..nx the carrier, one tune at a time.
     @app.route('/api/net/rtl/harmonics', methods=['POST'])
@@ -26774,12 +27304,32 @@ def register_network_diagnostics(app, logger=None):
         except (TypeError, ValueError): return None
 
     def _analyze(fn, **kw):
+        # Anything that loads a capture is serialised: two multi-hundred-MB
+        # analyses at once (a second click, or one still running after the page
+        # was left) is what runs a small Ragnar out of memory. Bit-string tools
+        # (frames / crc / fingerprint) touch no capture and never wait.
+        heavy = bool(kw.get('name'))
+        lock = getattr(sigmf_analyzer, '_HEAVY_LOCK', None) if heavy else None
+        if lock is not None and not lock.acquire(timeout=60):
+            return jsonify({"ok": False, "busy": True,
+                            "error": "another analysis is still running — try again when it finishes"}), 429
         try:
-            return jsonify(fn(**kw))
+            if hasattr(sigmf_analyzer, 'window_reset'):
+                sigmf_analyzer.window_reset()
+            r = fn(**kw)
+            w = sigmf_analyzer.window_note() if hasattr(sigmf_analyzer, 'window_note') else None
+            if w and isinstance(r, dict):
+                r.setdefault("analysed_window", w)
+            return jsonify(r)
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 404
+        except MemoryError:
+            return jsonify({"ok": False, "error": "not enough free memory for this analysis — zoom to a shorter selection"}), 507
         except Exception as exc:   # pragma: no cover - defensive
             return jsonify({"ok": False, "error": str(exc)}), 500
+        finally:
+            if lock is not None:
+                lock.release()
 
     @app.route('/api/net/rtl/analyze/list', methods=['GET'])
     def net_rtl_analyze_list():
@@ -27420,6 +27970,18 @@ def register_network_diagnostics(app, logger=None):
     # detection depends on (USB bus, tools, DVB driver, power, rtl_test) and
     # returns a one-line verdict + concrete fix steps. Reachable even when no
     # dongle is detected, so a user can find out *why*.
+    try:
+        _heal_on = True
+        try:
+            from init_shared import shared_data as _sd
+            _heal_on = bool(_sd.config.get('rtl_self_heal', True))
+        except Exception:
+            pass
+        rtl_sdr.start_healer(enabled=_heal_on)
+        _log("rtl self-heal watcher started (enabled=%s)" % _heal_on)
+    except Exception as _exc:
+        _log("rtl self-heal watcher not started: %s" % _exc)
+
     @app.route('/api/net/rtl/diagnose', methods=['GET'])
     def net_rtl_diagnose():
         _log("net/rtl/diagnose")
@@ -28354,11 +28916,17 @@ def _cli(argv=None):
                            ('arista', 'Arista EOS switch/router'),
                            ('comware', 'HPE Comware / Huawei VRF-hopping (MPLS)'),
                            ('mikrotik', 'MikroTik RouterOS (CCR/CRS)'),
-                           ('aruba', 'HPE Aruba ArubaOS (PAPI)')):
+                           ('aruba', 'HPE Aruba ArubaOS (PAPI)'),
+                           ('apc', 'APC / Schneider NMC (Ripple20)')):
         gp = sub.add_parser('%s-guard' % _gname,
                             help='passive %s CVE guard (posture/exposure/attack)' % _ghelp)
         gp.add_argument('--iface', '-i', default=None, help='interface (default: route)')
-        gp.add_argument('--seconds', '-s', type=int, default=20, help='capture window (5-40)')
+        gp.add_argument('--seconds', '-s', type=int, default=20, help='capture window (5-40; APC 5-60)')
+        if _gname == 'apc':
+            gp.add_argument('--cards', default=None,
+                            help="declared NMCs: 'ADDR[=MAC],...' (replaces the saved list)")
+            gp.add_argument('--forget', action='store_true',
+                            help='clear the cards learned from SNMP sysDescr')
         if _gname == 'comware':
             gp.add_argument('--role', default='unknown', choices=('ce', 'core', 'unknown'),
                             help='segment role (ce/core/unknown; unknown=>ce)')
@@ -29324,12 +29892,16 @@ def _cli(argv=None):
         'comware-guard': (do_comware_guard, 'Comware'),
         'mikrotik-guard': (do_mikrotik_guard, 'MikroTik'),
         'aruba-guard': (do_aruba_guard, 'Aruba'),
+        'apc-guard': (do_apc_guard, 'APC'),
     }
     if args.cmd in _GUARD_CLI:
         fn, label = _GUARD_CLI[args.cmd]
         kw = {'interface': args.iface, 'seconds': args.seconds}
         if args.cmd == 'comware-guard':
             kw['role'] = getattr(args, 'role', 'unknown')
+        if args.cmd == 'apc-guard':
+            kw['cards'] = args.cards
+            kw['forget'] = args.forget
         r = fn(**kw)
         if args.json:
             print(json.dumps(r, indent=2))
@@ -29354,6 +29926,7 @@ def _cli(argv=None):
         'comware-guard-selftest': (_comware_selftest, 'Comware'),
         'mikrotik-guard-selftest': (_mikrotik_selftest, 'MikroTik'),
         'aruba-guard-selftest': (_aruba_selftest, 'Aruba'),
+        'apc-guard-selftest': (_apc_selftest, 'APC'),
     }
     if args.cmd in _GUARD_SELFTEST_CLI:
         fn, label = _GUARD_SELFTEST_CLI[args.cmd]
@@ -29361,14 +29934,20 @@ def _cli(argv=None):
         if args.json:
             print(json.dumps(r, indent=2))
         else:
+            bulk = 0
             for s in r['scenarios']:
+                if s['pass'] and re.match(r'^\w+guard check \d+$', s['name']):
+                    bulk += 1
+                    continue
                 print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
                       f"expect={s['expect']} got={s['got']}")
-            sc = r['scapy']
-            if sc.get('ran'):
+            if bulk:
+                print(f"  [PASS] {bulk} vendored module self-test checks")
+            sc = r.get('scapy')
+            if sc and sc.get('ran'):
                 print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
                       f"verdict={sc.get('verdict')} codes={sc.get('codes')}")
-            else:
+            elif sc:
                 print(f"  [skip] scapy-e2e: {sc.get('reason')}")
             print(f"{label} Guard self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1

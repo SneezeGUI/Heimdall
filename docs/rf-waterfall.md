@@ -73,10 +73,13 @@ Each panel has a row of **band-scope presets** and a **Manual tune** box:
     frame's `band_mhz` reports the widened `[lo, hi]` so the page's ruler
     matches what's drawn. The panel's zoom/manual-tune floor (`minSpan:2`) is
     aligned to this, so HackRF's effective resolution floor is uniform.
-- **📡 Mesh / LoRa overlay** (the dropdown, on *both* panels) sweeps a chosen
-  mesh/LPWAN band and overlays its exact channel centres — Z-Wave (FSK) regions
-  plus the LoRa meshes Meshtastic / MeshCore / LoRaWAN. It's an
-  **energy/occupancy view only** (LoRa CSS can't be demodulated by
+- **📡 Mesh / IoT bands overlay** (the dropdown, on *both* panels) sweeps a chosen
+  mesh/LPWAN band and overlays its channel centres — Z-Wave (FSK) regions,
+  the LoRa meshes Meshtastic / MeshCore / LoRaWAN, **Wi-Fi HaLow (802.11ah)**
+  for the US, EU, AU/NZ, Japan, Korea, China, India and Singapore, and **Zigbee
+  Suzi** (Zigbee 4.0's sub-GHz feature) at 868 / 915 MHz (see
+  [sdr-subghz.md](sdr-subghz.md#mesh-overlays-z-wave--meshtastic--meshcore--lorawan--wi-fi-halow--zigbee-suzi)). It's an
+  **energy/occupancy view only** (LoRa CSS, HaLow OFDM and Suzi 802.15.4 can't be demodulated by
   `rtl_power`/`hackrf_sweep`, and the payloads are encrypted): you see bursts
   land on the channels, not IDs or messages. Options come from
   `rtl_sdr.zwave_plan()` / `lora_plan()` via `/api/net/rtl/{zwave,lora}`. Some
@@ -185,6 +188,36 @@ bandwidth (the width of one FFT bin).
   rectangle default).
 - *HackRF:* **RBW** (hackrf_sweep bin width: Auto, or 2.5 kHz–1 MHz).
 
+**SDR centre spike.** Every RTL-SDR shows a steady line of its own at the
+frequency it is tuned to — DC offset, LO leakage and low-frequency noise. On
+this Pi's dongle it measured ~14 dB above the floor and about ±25 kHz wide, and
+with the tuner in the middle of the 433 MHz band it sat exactly on 433.92 MHz,
+where it looks like a transmitter that never stops. **⚙ Settings → Resolution →
+Hide the SDR centre spike** (on by default) deals with it:
+- *Narrow bands* (up to ~1 MHz): the dongle is tuned 60 kHz past the band's top
+  edge, so the spike is not in the band at all and nothing is hidden.
+- *Wide bands*: the tuner moves off the band centre (up to 300 kHz, at up to
+  2.4 MS/s — 433.05–434.79 MHz tunes to 434.093 MHz) and the ±35 kHz around it
+  is filled in from the noise either side. A real signal inside that ~70 kHz
+  window is hidden too, which is why it is kept away from the band centre.
+  Untick it to see exactly what the dongle delivers.
+
+The filled strip is never passed off as a measurement:
+- It is **hatched** (amber) on the spectrum trace below the waterfall, labelled *SDR spike
+  filled*, and the **SDR spike** tile in the readout says *filled ±35 kHz* (or
+  *hidden* when the tuner sits outside the band and nothing was touched).
+- **Peak search, Next peak, spur search, the signal list and the Peak/SNR/Busy
+  readouts** leave the strip out.
+- A **marker, band power, noise marker or ACPR** result that overlaps it gets
+  *⚠ includes filled bins (SDR spike)*; a marker in it shows *⚠ filled* in the
+  marker table.
+- **Channels** inside it show *⚠ SDR spike* and are not logged.
+- **Limit lines** don't check it; the PASS/FAIL tag gets a `*` whose tooltip
+  names the unchecked strip.
+
+The **Image check** button tells the spike apart from a real transmitter either
+way (verdict *DC spike* or *image*).
+
 **Detector.** An FFT produces far more bins than the display has columns, so
 several bins have to be combined into each column — and the rule used decides
 every level on the page. The **Det** tile shows the active rule and
@@ -256,7 +289,7 @@ per-row dB history). Add one by dropping an entry into `PALETTES` +
 
 ## 2D / 3D waterfall view
 
-**The 3D view is rotatable** — drag to turn and tilt it, wheel or pinch to zoom; the angle is remembered per browser. Power is height, older sweeps recede along the time axis.
+**The 3D view is rotatable** — drag to turn and tilt it, wheel or pinch to zoom; the angle is remembered per browser. The 3D panel is 30% taller than the flat waterfall (546 px, or up to 60% of the screen height on phones). Power is height, older sweeps recede along the time axis.
 
 
 Each panel has a **View: 2D | 3D** toggle in the toolbar (default **2D**, the
@@ -339,25 +372,50 @@ live spectrum client-side from the incoming frames:
   bursty remote reads ~5% and a continuous carrier ~100%). This is the "what's
   actually on the band" answer.
 
-## When the dongle stops responding
+## When the dongle stops responding — self-healing
 
 
-An RTL2832U can end up in a state where it still enumerates, still opens and
-still passes `rtl_test` — but never delivers a single sample. The panel then
-sits there: engine running, no rows. Repeated open/close cycles are what put it
-there, which is why captures are serialised and the USB device is given time to
-settle between them.
+RTL-SDR dongles fail in three ways, and Ragnar recovers the two it can by itself.
+A background watcher checks the dongle every few seconds:
 
-The panel now detects it — running, but nothing arriving for several seconds —
-and offers **⭮ Reset dongle**, which is also in **⚙ Settings → Hardware**. It
-re-enumerates the device over USB (`USBDEVFS_RESET`), exactly what the kernel
-does when you unplug and replug it: whatever is using the radio is stopped
-first, the device is reset, and the sweep you were running is restarted. No walk
-to the box, no `sudo`, no power cycle.
+| What it sees | What it does |
+| --- | --- |
+| **Open but silent** — the sweep is running but no rows arrive for 20 s | a USB reset (`USBDEVFS_RESET`); if that does not help, a port power-cycle |
+| **Stuck** — the port reports a device *connected* but it never finishes enumerating (kernel: `error -71`, `device not accepting address`, `Cannot enable. Maybe the USB cable is bad?`) | cuts that port's 5 V for 3 s and turns it back on — the software equivalent of unplugging and replugging it |
+| **Gone** — nothing connected on any port | nothing: it looks unplugged, and a port with nothing on it is never power-cycled |
 
-It needs root (the web UI normally runs as root); if it cannot, it says so
-rather than pretending to have fixed anything.
-API: `POST /api/net/rtl/reset`.
+Attempts back off (15 s, 45 s, 2 min, 5 min between tries) so a failing dongle is
+never hammered, and after 8 attempts it stops and asks for a person. Once the
+dongle is back, the sweep you were running is started again. Every recovery is
+logged to Watchtower as `RF_SDR_SELFHEAL`.
+
+The port power-cycle uses **uhubctl** — the Pi's root USB ports support per-port
+power switching — which the installer and updater install. Without it the
+fallback is resetting the whole USB controller, which also briefly drops anything
+else on it.
+
+**When the dongle keeps dropping out**, recovering it is not a fix: repeated
+disconnects on a Pi whose own supply is healthy point at the cable, the port or
+the dongle. The watcher reads the kernel log for the dongle's port, and the SDR
+check and the waterfall then say so plainly — for example *"dropped off USB 6
+times in 10 minutes (the kernel suspects the USB cable; USB protocol errors
+-71)"* — with what to try: a different short, data-rated cable, plugging straight
+into the Pi rather than through a hub, another port, and finally another dongle.
+
+**By hand:** the no-radio screen and the dashboard's **🩺 SDR check** show what
+the watcher is doing and offer **⭮ Recover now**, which runs the same steps
+immediately (a stuck dongle can take ~30 s to power-cycle and re-enumerate).
+The waterfall's own "radio is open but sending nothing" screen does the same.
+To switch self-healing off, set `rtl_self_heal` to `false` in the config or
+`POST /api/net/rtl/health {"enabled": false}`.
+
+API: `GET /api/net/rtl/health` (state, port, recent drops, kernel evidence,
+history), `POST /api/net/rtl/heal` (recover now), `POST /api/net/rtl/reset`
+(USB reset if present, otherwise the recovery ladder).
+
+The IQ capture and rtl\_power subprocesses are terminated and their pipes closed
+in the sweep thread's `finally` block, so a stopped or restarted sweep never
+leaves an orphaned `rtl_sdr` process holding the USB device.
 
 ## Front-end health and proving a signal is real
 
@@ -859,7 +917,30 @@ etc. Both open **`/rf-analyzer`** (`demos/rf_analyzer.html`) — a dedicated pag
 that analyses the recording *on the device* so it works from a phone, no desktop
 DSP tools needed.
 All the maths runs in numpy/scipy in `sigmf_analyzer.py`; the page is a viewer
-that requests windows:
+that requests windows.
+
+**Not sure what a control does?** Open **ⓘ What every control does** under the
+top bar: every button, selector and field on the page, grouped by panel, in plain
+language (the same text appears as a tooltip when you hover a control).
+
+**Built to run on small boards.** Analysis happens on the Ragnar itself, so it is
+kept inside what a 1–2 GB board can afford:
+
+- **The busiest 2 seconds.** Classify, demodulate, pulse decode, constellation,
+  FM/AM and squelch-tag analysis, de-chirp, cyclostationary and filtering never
+  need more than a couple of seconds of samples. When the selection is longer —
+  the whole capture, for instance — they analyse its busiest 2 s (at 2 MS/s),
+  and the page says which part it used. Zoom in to choose a different part.
+- **One heavy analysis at a time.** A second request waits for the first to
+  finish instead of running alongside it; the page says so if it has to wait.
+- **A memory budget for open captures.** A recording takes 8 bytes per sample in
+  memory (a 60 MB file is 240 MB), so the analyzer keeps recently opened
+  captures only within a budget of a fifth of free RAM (at most 768 MB), and
+  always keeps the one you are working on.
+
+Measured on a 60 MB capture: Ragnar's memory peaked at 1.1 GB instead of 2.8 GB,
+cyclostationary detection over the whole capture takes 5 s instead of several
+minutes, and whole-capture classify / demodulate take about half a second.
 
 - **Summary** — center/rate/duration, measured noise floor, peak frequency, SNR,
   occupied bandwidth, burst count.

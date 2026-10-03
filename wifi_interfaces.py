@@ -384,6 +384,15 @@ def gather_ethernet_interfaces(default_interface: str = 'eth0') -> List[Dict]:
         if iface['ip_address'] and iface.get('has_carrier') and not iface.get('is_link_local'):
             iface['connected'] = True
 
+    # A USB-tethered hotspot/phone (enx<mac>) is a cellular fallback uplink,
+    # not a LAN to scan — keep it out of the Ethernet list entirely.
+    try:
+        from cellular_uplink import is_cellular
+    except Exception:  # pragma: no cover - module always ships alongside
+        is_cellular = None
+    if is_cellular:
+        interfaces = {k: v for k, v in interfaces.items() if not is_cellular(k)}
+
     return sorted(interfaces.values(), key=lambda entry: entry['name'])
 
 

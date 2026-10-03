@@ -155,3 +155,5 @@ such.
   group (same `vcgencmd` source, plus per-radio detail) lives there.
 - The **Mesh** tab rolls the same under-voltage flag up across the fleet and
   names the offending units in its health chips.
+
+See also: [Cooling fan](fan.md): fan status, manual speed and fan curve on the same System tab.

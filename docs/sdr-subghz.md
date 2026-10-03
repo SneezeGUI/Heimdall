@@ -91,6 +91,12 @@ walks every layer detection depends on and prints a one-line verdict plus the
 exact fix — "no dongle on the USB bus (power/cable)", "tools not installed", or
 "DVB-T driver holding it".
 
+**Ragnar recovers a stuck or silent dongle by itself** — it power-cycles the USB
+port the dongle is stuck on and restarts the sweep — and the check reports what
+that watcher is doing, with the kernel's own evidence when the dongle keeps
+dropping out (see [self-healing](rf-waterfall.md#when-the-dongle-stops-responding--self-healing)).
+It also shows **⭮ Recover now**.
+
 When the fix is server-side (tools missing, or the DVB-T driver holding the
 device), the check shows a one-click button — **⬇ Install RTL-SDR tools** /
 **🔓 Free the dongle** — that POSTs to `/api/net/rtl/install`, which apt-installs
@@ -114,9 +120,9 @@ driver is holding it. That lets `/status` tell three cases apart:
   DVB-T driver still holds it (blacklist `dvb_usb_rtl28xxu`, replug).
 - **`available: true`** — good; the SDR tab and RF Waterfall button light up.
 
-## Mesh overlays (Z-Wave / Meshtastic / MeshCore / LoRaWAN)
+## Mesh overlays (Z-Wave / Meshtastic / MeshCore / LoRaWAN / Wi-Fi HaLow / Zigbee Suzi)
 
-The RF Waterfall page's sub-GHz panel has a **📡 Mesh / LoRa** dropdown that
+Both RF Waterfall panels (RTL-SDR and HackRF) have a **📡 Mesh / IoT bands** dropdown that
 sweeps a chosen mesh's band and overlays its exact channel centres on the
 spectrum, so you can watch the mesh's bursts/chirps land on its channels — device
 chatter, retries, or a **jammer** parked on a channel.
@@ -126,9 +132,51 @@ chatter, retries, or a **jammer** parked on a channel.
 - **Meshtastic / MeshCore / LoRaWAN** (LoRa/CSS) — per protocol+region band +
   channels: Meshtastic US/EU868/EU433/ANZ, MeshCore EU/US, LoRaWAN
   EU868/US915/IN865/AS923. `GET /api/net/rtl/lora`.
+- **Wi-Fi HaLow** (IEEE 802.11ah, OFDM) — sub-GHz Wi-Fi with 1–16 MHz
+  channels: a higher-bandwidth alternative to LoRaWAN for IoT and long-range
+  links. Presets per region, with the channel centres marked:
+
+  | Preset | Band | Markers |
+  | --- | --- | --- |
+  | US | 902–928 MHz | 13 × 2 MHz channels, 802.11ah numbering (centre = 902 + 0.5·n MHz, ch2…ch50) |
+  | EU | 863–868 MHz | 1 MHz ch1/3/5/7/9 and 2 MHz ch2/6 (centre = 863 + 0.5·n MHz) |
+  | AU/NZ | 915–928 MHz | the US 2 MHz channels inside the band (ch30…ch50) |
+  | Japan | 916.5–927.5 MHz | 1 MHz raster |
+  | Korea | 917.5–923.5 MHz | 1 MHz raster |
+  | China | 779–787 MHz | 2 MHz raster (755–779 MHz is low-power only) |
+  | India | 865–868 MHz | 1 MHz channels |
+  | Singapore | 920–925 MHz | 1 MHz raster (866–869 MHz is also allowed) |
+
+  1, 2, 4, 8 and 16 MHz channels share each band, so the markers are a reference
+  grid, not a claim about which width a given network uses — the energy on the
+  waterfall shows that.
+- **Zigbee Suzi** — the sub-GHz feature of Zigbee 4.0 / Zigbee PRO 2023 from the
+  Connectivity Standards Alliance (certification from 2026), running on IEEE
+  802.15.4 sub-GHz radios for longer range than 2.4 GHz Zigbee:
+
+  | Preset | Band | Markers |
+  | --- | --- | --- |
+  | EU 868 | 863–870 MHz | IEEE 802.15.4 channel 0 at 868.3 MHz |
+  | NA 915 | 902–928 MHz | IEEE 802.15.4 channels 1–10, 906–924 MHz, 2 MHz apart |
+
+  The bands are the ones the Alliance names (868 MHz Europe, 915 MHz North
+  America). **Suzi's own channel plan is in the Alliance's specification, which
+  is not public**, so the markers are IEEE 802.15.4's published sub-GHz channels
+  as a reference grid — not a claim that Suzi uses them. Read the real channels
+  from where the energy lands.
+
+**Naming what you click.** Click a burst in these bands and the measurement
+labels it by width. LoRa never exceeds 500 kHz, so a signal 700 kHz or wider in
+863–869, 902–928 or 779–787 MHz is *likely Wi-Fi HaLow or 802.15.4 / Zigbee
+Suzi* — width alone cannot separate those two (HaLow is 1–16 MHz of OFDM; 802.15.4
+at 915 MHz is 1–2 MHz). A burst between 90 and 700 kHz is *likely LoRa, or an FSK
+mesh such as Zigbee Suzi*.
 
 **This is an energy / occupancy view, not a decoder — and deliberately so:**
 
+- **Wi-Fi HaLow and Zigbee Suzi are not demodulated either** — HaLow is 802.11
+  OFDM and WPA3-encrypted; Suzi is 802.15.4 with Zigbee's AES-128 network
+  encryption. Presence, channel and width are what you get.
 - **LoRa cannot be demodulated with `rtl_power`/`rtl_433`.** LoRa is chirp
   spread-spectrum; demodulating it needs `gr-lora_sdr` (GNU Radio — heavy) or a
   real LoRa radio (SX127x/SX126x). This view never claims to read LoRa frames.
@@ -141,7 +189,7 @@ chatter, retries, or a **jammer** parked on a channel.
   Meshtastic public channel), use the **Mesh Nodes** page below — a companion
   Meshtastic node over USB does the LoRa demod the RTL-SDR can't.
 
-Frequencies: LoRaWAN entries follow the published regional band plans; Meshtastic
+Frequencies: LoRaWAN and Wi-Fi HaLow entries follow the published regional band plans; Meshtastic
 default channels are preset/hash-derived and MeshCore's are user-configurable, so
 those are marked "~" / "default" — scan the band for the actual chirps.
 

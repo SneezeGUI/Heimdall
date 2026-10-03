@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Pushover Notification Service for Ragnar
-Sends push notifications via the Pushover API for security events.
+Push Notification Service for Ragnar
+Sends push notifications for security events via every configured channel:
+Pushover (phone push) and/or Slack (incoming webhook).
 """
 
 import json
@@ -13,15 +14,14 @@ import time
 logger = logging.getLogger(__name__)
 
 PUSHOVER_API_URL = "https://api.pushover.net/1/messages.json"
-
-try:
-    from notify_sinks import deliver as _sinks_deliver
-except Exception:
-    _sinks_deliver = None
+SLACK_WEBHOOK_PREFIX = "https://hooks.slack.com/"
 
 
 class PushoverService:
-    """Lightweight wrapper around the Pushover HTTP API."""
+    """Push-notification dispatcher (historical name kept for its many callers).
+
+    send() fans each message out to every configured channel — Pushover and/or
+    a Slack incoming webhook — so all alert sources reach both."""
 
     def __init__(self, shared_data):
         self.shared_data = shared_data
@@ -99,51 +99,104 @@ class PushoverService:
             logger.debug(f"Pushover key lookup failed: {e}")
             return None, None
 
-    def is_configured(self):
+    def _get_slack_webhook(self):
+        """Return the Slack incoming-webhook URL, or None if not configured."""
+        try:
+            from env_manager import EnvManager
+            url = EnvManager().get_env_key("RAGNAR_SLACK_WEBHOOK_URL")
+            return url or None
+        except Exception as e:
+            logger.debug(f"Slack webhook lookup failed: {e}")
+            return None
+
+    def pushover_configured(self):
         """Return True when both Pushover keys are present."""
         user_key, api_token = self._get_keys()
         return bool(user_key and api_token)
 
+    def slack_configured(self):
+        """Return True when a Slack webhook URL is present."""
+        return bool(self._get_slack_webhook())
+
+    def is_configured(self):
+        """Return True when at least one delivery channel is configured."""
+        return self.pushover_configured() or self.slack_configured()
+
     def is_enabled(self):
-        """Return True when Pushover is both configured and enabled in config."""
+        """Return True when push notifications are configured and enabled in config."""
         return self.shared_data.config.get("pushover_enabled", False) and self.is_configured()
 
     def sinks_enabled(self):
-        """True when any ntfy / webhook sink is configured."""
-        cfg = self.shared_data.config
-        ntfy = bool(cfg.get("ntfy_enabled")) and bool((cfg.get("ntfy_topic") or "").strip())
-        hook = bool(cfg.get("webhook_enabled")) and bool((cfg.get("webhook_url") or "").strip())
-        return ntfy or hook
+        """True when any non-Pushover channel (Slack) is configured."""
+        return self.slack_configured()
 
     def delivery_enabled(self):
-        """Pushover *or* any sink is live."""
-        return self.is_enabled() or self.sinks_enabled()
+        """Pushover *or* Slack is live."""
+        return self.is_enabled() or self.slack_configured()
 
     def _dispatch(self, message, title="Ragnar", priority=0, sound="pushover"):
-        """Fan out to Pushover and to every configured sink.
+        """Deliver through the stock channel set.
 
-        Every notify_* method routes through here so adding a sink never means
-        editing the callers.
+        `send()` already fans out to every configured channel (Pushover and/or
+        Slack). All notify_* methods route through here so the exploit-finding
+        alert uses exactly the same delivery path as the rest of the system -
+        no parallel notification stack to keep in sync with upstream.
         """
-        if self.is_enabled():
-            self.send(message, title=title, priority=priority, sound=sound)
-        if _sinks_deliver is not None and self.sinks_enabled():
-            try:
-                from notify_sinks import get_sinks
-                get_sinks(self.shared_data).reload()
-            except Exception:
-                pass
-            try:
-                _sinks_deliver(title, message, priority, shared_data=self.shared_data)
-            except Exception as exc:
-                logger.debug("sink deliver failed: %s", exc)
+        self.send(message, title=title, priority=priority, sound=sound)
 
     # ------------------------------------------------------------------
     # Core send
     # ------------------------------------------------------------------
 
     def send(self, message, title="Ragnar", priority=0, sound="pushover"):
-        """Send a Pushover notification. Returns dict with success/message."""
+        """Send a notification to every configured channel (Pushover, Slack).
+
+        Returns dict with success/message; success is True when at least one
+        channel delivered."""
+        results = {}
+        if self.pushover_configured():
+            results["Pushover"] = self._send_pushover(message, title, priority, sound)
+        webhook = self._get_slack_webhook()
+        if webhook:
+            results["Slack"] = self._send_slack(webhook, message, title, priority)
+        if not results:
+            return {"success": False, "message": "No notification channel configured"}
+        ok = [name for name, r in results.items() if r.get("success")]
+        failed = [f"{name}: {r.get('message')}" for name, r in results.items() if not r.get("success")]
+        if ok:
+            msg = f"Notification sent via {', '.join(ok)}"
+            if failed:
+                msg += f" (failed — {'; '.join(failed)})"
+            return {"success": True, "message": msg, "channels": results}
+        return {"success": False, "message": "; ".join(failed), "channels": results}
+
+    def _send_slack(self, webhook, message, title="Ragnar", priority=0):
+        """POST a message to a Slack incoming webhook."""
+        if not webhook.startswith(SLACK_WEBHOOK_PREFIX):
+            return {"success": False, "message": "Slack webhook URL must start with " + SLACK_WEBHOOK_PREFIX}
+        try:
+            import urllib.request
+            import json
+
+            prefix = ":rotating_light: " if priority and int(priority) >= 1 else ""
+            payload = json.dumps({"text": f"{prefix}*{title}*\n{message}"}).encode("utf-8")
+            req = urllib.request.Request(
+                webhook, data=payload, method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = resp.read().decode("utf-8", "replace").strip()
+                if resp.status == 200:
+                    logger.info(f"Slack notification sent: {title}")
+                    return {"success": True, "message": "Notification sent"}
+                logger.warning(f"Slack webhook error: {resp.status} {body}")
+                return {"success": False, "message": f"Slack error: {body or resp.status}"}
+        except Exception as e:
+            logger.error(f"Slack send failed: {e}")
+            return {"success": False, "message": str(e)}
+
+    def _send_pushover(self, message, title="Ragnar", priority=0, sound="pushover"):
+        """POST a message to the Pushover API."""
         user_key, api_token = self._get_keys()
         if not user_key or not api_token:
             return {"success": False, "message": "Pushover keys not configured"}
@@ -296,6 +349,17 @@ class PushoverService:
         if not self.shared_data.config.get("pushover_notify_wardrive_upload", True):
             return False
         threading.Thread(target=self._dispatch, args=(message[:1024], title, priority), daemon=True).start()
+        return True
+
+    def notify_cellular_uplink(self, message, title="Ragnar — Cellular uplink", priority=0):
+        """Uplink failover to / restore from a USB-tethered cellular hotspot
+        (cellular_uplink.py). Gated by pushover_enabled +
+        pushover_notify_cellular."""
+        if not self.is_enabled():
+            return False
+        if not self.shared_data.config.get("pushover_notify_cellular", True):
+            return False
+        threading.Thread(target=self.send, args=(message[:1024], title, priority), daemon=True).start()
         return True
 
     # ------------------------------------------------------------------

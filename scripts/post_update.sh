@@ -123,6 +123,12 @@ if [ -f "$REPO/scripts/provision_network_tools.sh" ]; then
     bash "$REPO/scripts/provision_network_tools.sh" || fail "network tool provisioning reported errors"
 fi
 
+# --- cellular uplink fallback hooks ----------------------------------------
+if [ -f "$REPO/cellular_uplink.py" ]; then
+    step "cellular fallback hooks"
+    python3 "$REPO/cellular_uplink.py" install || fail "cellular_uplink.py install reported errors"
+fi
+
 # --- permissions ------------------------------------------------------------
 step "permissions"
 chmod +x "$REPO"/*.sh "$REPO"/*.py 2>/dev/null || true

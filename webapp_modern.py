@@ -181,7 +181,7 @@ try:
 except Exception:  # pragma: no cover - defensive; never block startup
     pass
 
-# Register Network > Diagnostics / Switch & L2 / Interfaces API routes.
+# Register Network > Diagnostics / Interfaces API routes.
 # Kept in a separate module (network_diagnostics.py) to keep this file lean;
 # wrapped in try/except so a problem there can never take down the web app.
 try:
@@ -6557,6 +6557,14 @@ def _get_wifi_iface():
     return detect_wifi_interface(shared_data.config.get('wifi_default_interface', 'auto'))
 
 
+def _is_cellular_iface(iface):
+    try:
+        import cellular_uplink
+        return cellular_uplink.is_cellular(iface)
+    except Exception:                                           # noqa: BLE001
+        return False
+
+
 def _get_lan_iface():
     """Return the interface that actually carries the LAN, wired or wireless.
 
@@ -6575,8 +6583,10 @@ def _get_lan_iface():
                 parts = line.split()
                 if 'dev' in parts:
                     iface = parts[parts.index('dev') + 1]
-                    # Ignore virtual/container bridges — they carry no LAN hosts.
-                    if iface and not iface.startswith(('lo', 'docker', 'br-', 'veth', 'tailscale')):
+                    # Ignore virtual/container bridges — they carry no LAN hosts —
+                    # and a tethered cellular hotspot (fallback uplink, not a LAN).
+                    if iface and not iface.startswith(('lo', 'docker', 'br-', 'veth', 'tailscale')) \
+                            and not _is_cellular_iface(iface):
                         return iface
     except Exception as exc:                                    # noqa: BLE001
         logger.debug(f"_get_lan_iface: default-route lookup failed: {exc}")
@@ -14203,11 +14213,172 @@ def api_power_usb_current():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/api/fan')
+def api_fan():
+    """Cooling fan: presence, RPM, duty, mode, trip curve (see fan_tools.py)."""
+    try:
+        import fan_tools
+        return jsonify(fan_tools.status())
+    except Exception as e:
+        logger.error(f"Fan status error: {e}")
+        return jsonify({'supported': False, 'error': str(e)}), 500
+
+
+@app.route('/api/fan/mode', methods=['POST'])
+def api_fan_mode():
+    """{"mode": "auto"} or {"mode": "manual", "percent": 0-100}.
+
+    Manual is runtime-only and hands back to automatic at the failsafe temp.
+    """
+    try:
+        import fan_tools
+        body = request.get_json(silent=True) or {}
+        if body.get('mode') == 'manual':
+            try:
+                percent = int(body.get('percent', 100))
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'percent must be 0-100'}), 400
+            result = fan_tools.set_manual(percent)
+        else:
+            result = fan_tools.set_auto()
+        return jsonify(result), (200 if result.get('success') else 400)
+    except Exception as e:
+        logger.error(f"Fan mode error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/fan/test', methods=['POST'])
+def api_fan_test():
+    """Spin the fan at 100 % for a few seconds and read the tachometer."""
+    try:
+        import fan_tools
+        result = fan_tools.spin_test()
+        return jsonify(result), (200 if result.get('success') else 400)
+    except Exception as e:
+        logger.error(f"Fan spin test error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 # ---------------------------------------------------------------------------
-# Serial Console — READ-ONLY viewer for a switch/router/firewall console port
-# reached through a USB console cable (see serial_console.py). Nothing is ever
-# sent to the device: the tty is opened O_RDONLY and the port stays reserved in
-# serial_claims so GPS/CYD/RoomScan auto-detection never touches it.
+# Cellular uplink fallback (USB-tethered hotspot / phone / LTE modem)
+# ---------------------------------------------------------------------------
+_cellular_monitor = None
+
+
+def cellular_uplink_monitor_loop():
+    """Pin tethered-cellular default routes to the fallback metric and push a
+    notification when the uplink fails over to / back from cellular."""
+    global _cellular_monitor
+    try:
+        import cellular_uplink
+    except Exception as exc:                                    # noqa: BLE001
+        logger.warning(f"[cellular] module unavailable: {exc}")
+        return
+    _cellular_monitor = cellular_uplink.Monitor(log=logger)
+    try:
+        # Self-provision the NM/dhcpcd hooks so web-updated boxes get them too.
+        for change in cellular_uplink.install(shared_data.config):
+            logger.info(f"[cellular] {change}")
+    except Exception as exc:                                    # noqa: BLE001
+        logger.warning(f"[cellular] hook install failed: {exc}")
+    while not getattr(shared_data, 'webapp_should_exit', False):
+        try:
+            for t in _cellular_monitor.tick(shared_data.config):
+                po = _rusense_pushover()
+                if po:
+                    po.notify_cellular_uplink(t['msg'], priority=t.get('priority', 0))
+        except Exception as exc:                                # noqa: BLE001
+            logger.debug(f"[cellular] tick failed: {exc}")
+        time.sleep(10)
+
+
+@app.route('/api/cellular/status', methods=['GET'])
+def api_cellular_status():
+    try:
+        import cellular_uplink
+        data = cellular_uplink.status(shared_data.config)
+        data['events'] = list(_cellular_monitor.events[-20:]) if _cellular_monitor else []
+        data['heartbeat'] = _cellular_monitor.snapshot() if _cellular_monitor else None
+        return jsonify(data)
+    except Exception as e:
+        logger.error(f"Cellular status error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/cellular/settings', methods=['POST'])
+def api_cellular_settings():
+    try:
+        import cellular_uplink
+        body = request.get_json(silent=True) or {}
+        cfg = shared_data.config
+        if 'enabled' in body:
+            cfg['cellular_fallback_enabled'] = bool(body['enabled'])
+        if 'allow_scan' in body:
+            cfg['cellular_allow_scan'] = bool(body['allow_scan'])
+        if 'metric' in body:
+            try:
+                metric = int(body['metric'])
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'metric must be a number'}), 400
+            if not 1000 <= metric <= 65535:
+                return jsonify({'success': False, 'error': 'metric must be 1000-65535'}), 400
+            cfg['cellular_route_metric'] = metric
+        for key in ('force_ifaces', 'exclude_ifaces'):
+            if key in body:
+                names = cellular_uplink._split_list(body[key])
+                cfg[f'cellular_{key}'] = ' '.join(sorted(names))
+        if 'heartbeat_enabled' in body:
+            cfg['cellular_heartbeat_enabled'] = bool(body['heartbeat_enabled'])
+        if 'heartbeat_targets' in body:
+            targets = cellular_uplink.parse_targets(body['heartbeat_targets'])
+            if not targets:
+                return jsonify({'success': False, 'error': 'give at least one public IPv4 '
+                                'target, e.g. 1.1.1.1:443'}), 400
+            cfg['cellular_heartbeat_targets'] = ' '.join(f'{ip}:{port}' for ip, port in targets)
+        for key, cfg_key, lo, hi in (('heartbeat_min_ok', 'cellular_heartbeat_min_ok', 1, 8),
+                                     ('failover_after', 'cellular_failover_after', 1, 60),
+                                     ('failback_after', 'cellular_failback_after', 1, 360)):
+            if key in body:
+                try:
+                    val = int(body[key])
+                except (TypeError, ValueError):
+                    return jsonify({'success': False, 'error': f'{key} must be a number'}), 400
+                if not lo <= val <= hi:
+                    return jsonify({'success': False, 'error': f'{key} must be {lo}-{hi}'}), 400
+                cfg[cfg_key] = val
+        shared_data.save_config()
+        changes = cellular_uplink.install(cfg)
+        actions = cellular_uplink.enforce(cfg)
+        data = cellular_uplink.status(cfg)
+        data['heartbeat'] = _cellular_monitor.snapshot() if _cellular_monitor else None
+        data['applied'] = changes + actions
+        return jsonify(data)
+    except Exception as e:
+        logger.error(f"Cellular settings error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/fan/curve', methods=['POST'])
+def api_fan_curve():
+    """{"temps": [50, 60, 67.5, 75], "persist": bool} or {"reset": true}."""
+    try:
+        import fan_tools
+        body = request.get_json(silent=True) or {}
+        if body.get('reset'):
+            result = fan_tools.reset_curve()
+        else:
+            result = fan_tools.set_curve(body.get('temps') or [],
+                                         persist=bool(body.get('persist')))
+        return jsonify(result), (200 if result.get('success') else 400)
+    except Exception as e:
+        logger.error(f"Fan curve error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Serial Console — viewer for a switch/router/firewall console port reached
+# through a USB console cable (see serial_console.py). Read-only by default;
+# an explicit allow_write gate enables sending commands to the device.
 # ---------------------------------------------------------------------------
 @app.route('/api/serial-console/ports')
 def api_serial_console_ports():
@@ -14265,7 +14436,10 @@ def _serial_console_summary():
     return {'has_console': bool(port), 'running': bool(st.get('running')),
             'state': st.get('state'), 'baud': st.get('baud'),
             'port_label': label or (os.path.basename(port) if port else None),
-            'read_only': True}
+            'shared': bool(st.get('share_mesh')),
+            'read_only': not st.get('allow_write'),
+            'allow_write': bool(st.get('allow_write')),
+            'share_mesh_write': bool(st.get('share_mesh_write'))}
 
 
 @app.route('/api/mesh/serial-console/status', methods=['GET'])
@@ -14279,6 +14453,108 @@ def api_mesh_serial_console_status():
         return jsonify({'success': False, 'error': str(e)}), 500
     out.update({'success': True, 'name': _mesh_viking_name() or socket.gethostname()})
     return jsonify(out)
+
+
+@app.route('/api/mesh/serial-console/output/<int:since>', methods=['GET'])
+def api_mesh_serial_console_output(since):
+    """Peer-readable console OUTPUT — only when this unit's operator has opted in
+    ("Share this console with the mesh"). Read-only lines; no control. The cursor
+    is a path segment, not a query string, because the mesh proof is computed
+    over the path alone."""
+    import serial_console
+    if not serial_console.shared_with_mesh():
+        return jsonify({'success': True, 'shared': False, 'lines': [], 'last': 0,
+                        'error': 'this unit has not shared its console with the mesh'})
+    out = serial_console.output(since=max(0, since))
+    st = out.get('status') or {}
+    out['status'] = {k: st.get(k) for k in ('running', 'state', 'port', 'baud', 'baud_setting',
+                                            'auto_settled', 'bytes', 'last_rx', 'read_only',
+                                            'allow_write')}
+    out.update({'success': True, 'shared': True,
+                'share_mesh_write': serial_console.shared_write_with_mesh()})
+    return jsonify(out)
+
+
+@app.route('/api/serial-console/share', methods=['POST'])
+def api_serial_console_share():
+    import serial_console
+    data = request.get_json(silent=True) or {}
+    return jsonify(serial_console.set_share(bool(data.get('share'))))
+
+
+@app.route('/api/serial-console/allow-write', methods=['POST'])
+def api_serial_console_allow_write():
+    import serial_console
+    data = request.get_json(silent=True) or {}
+    return jsonify(serial_console.set_allow_write(bool(data.get('allow_write'))))
+
+
+@app.route('/api/serial-console/write', methods=['POST'])
+def api_serial_console_write():
+    import serial_console
+    data = request.get_json(silent=True) or {}
+    cmd = data.get('data', '')
+    if not cmd:
+        return jsonify({'success': False, 'error': 'empty payload'})
+    return jsonify(serial_console.write(cmd))
+
+
+@app.route('/api/mesh/serial-console/write', methods=['POST'])
+def api_mesh_serial_console_write():
+    """Peer-writable: send a command to this unit's console. Only when the
+    operator has enabled both share_mesh and allow_write."""
+    import serial_console
+    if not serial_console.shared_write_with_mesh():
+        return jsonify({'success': False,
+                        'error': 'this unit has not enabled mesh write'}), 403
+    data = request.get_json(silent=True) or {}
+    cmd = data.get('data', '')
+    if not cmd:
+        return jsonify({'success': False, 'error': 'empty payload'})
+    return jsonify(serial_console.write(cmd))
+
+
+@app.route('/api/serial-console/peer-write', methods=['POST'])
+def api_serial_console_peer_write():
+    """Hub side: relay a write command to a peer's shared-write console."""
+    data = request.get_json(silent=True) or {}
+    unit = (data.get('unit') or '').strip()
+    cmd = data.get('data', '')
+    if not cmd:
+        return jsonify({'success': False, 'error': 'empty payload'})
+    if not (mesh_available and _mesh_enabled()):
+        return jsonify({'success': False, 'error': 'mesh is not enabled'}), 400
+    node = _resolve_delegate_node(unit)
+    if not node:
+        return jsonify({'success': False, 'error': 'unknown mesh unit'}), 404
+    rep = mesh_manager.post_peer(node, path='/api/mesh/serial-console/write',
+                                  payload={'data': cmd},
+                                  port=_mesh_node_port(), timeout=6)
+    if not rep.get('reachable'):
+        return jsonify({'success': False, 'error': rep.get('error') or 'unit unreachable'}), 504
+    return jsonify(rep)
+
+
+@app.route('/api/serial-console/peer-output')
+def api_serial_console_peer_output():
+    """Hub side of shared (view-only) remote consoles: fetch a peer's shared
+    console output over the mesh on tag trust. Works without the mesh secret, but
+    only for a peer whose operator switched sharing on."""
+    unit = (request.args.get('unit') or '').strip()
+    try:
+        since = max(0, int(request.args.get('since', 0)))
+    except (TypeError, ValueError):
+        since = 0
+    if not (mesh_available and _mesh_enabled()):
+        return jsonify({'success': False, 'error': 'mesh is not enabled'}), 400
+    node = _resolve_delegate_node(unit)        # roster-bound: no arbitrary targets
+    if not node:
+        return jsonify({'success': False, 'error': 'unknown mesh unit'}), 404
+    rep = mesh_manager.poll_peer(node, port=_mesh_node_port(), timeout=6,
+                                 path='/api/mesh/serial-console/output/%d' % since)
+    if not rep.get('reachable'):
+        return jsonify({'success': False, 'error': rep.get('error') or 'unit unreachable'}), 504
+    return jsonify(rep)
 
 
 @app.route('/api/serial-console/units')
@@ -14319,6 +14595,8 @@ def api_serial_console_units():
                           'reachable': bool(r.get('reachable')) and bool(r.get('success')),
                           'has_console': bool(r.get('has_console')),
                           'running': bool(r.get('running')), 'state': r.get('state'),
+                          'shared': bool(r.get('shared')),
+                          'share_mesh_write': bool(r.get('share_mesh_write')),
                           'baud': r.get('baud'), 'port_label': r.get('port_label'),
                           'error': r.get('error') if not r.get('reachable') else None})
     return jsonify({'units': units, 'gateway_ready': gateway_ready,
@@ -14329,6 +14607,63 @@ def api_serial_console_units():
 def api_serial_console_clear():
     import serial_console
     return jsonify(serial_console.clear())
+
+
+@app.route('/api/serial-console/scripts')
+def api_serial_console_scripts():
+    import serial_console
+    return jsonify({'scripts': serial_console.list_scripts()})
+
+
+@app.route('/api/serial-console/run-script', methods=['POST'])
+def api_serial_console_run_script():
+    import serial_console
+    body = request.get_json(silent=True) or {}
+    sid = (body.get('script_id') or '').strip()
+    if not sid:
+        return jsonify({'success': False, 'error': 'missing script_id'}), 400
+    return jsonify(serial_console.run_script(sid))
+
+
+@app.route('/api/serial-console/script-status')
+def api_serial_console_script_status():
+    import serial_console
+    return jsonify(serial_console.script_status())
+
+
+@app.route('/api/ragnar-scripts/sync', methods=['POST'])
+def api_ragnar_scripts_sync():
+    """Clone or git-pull the external RagnarScripts library (throttled).
+
+    Called when the Dashboard / Pentest tabs open so freshly-pushed shared
+    scripts appear without a manual pull. Best-effort — a failure (offline, no
+    git) is reported but never an error the UI must handle."""
+    try:
+        import ragnar_scripts
+        force = bool((request.get_json(silent=True) or {}).get('force'))
+        return jsonify(ragnar_scripts.sync(force=force))
+    except Exception as e:
+        logger.warning(f"RagnarScripts sync error: {e}")
+        return jsonify({'ok': False, 'error': str(e)})
+
+
+@app.route('/api/serial-console/library')
+def api_serial_console_library():
+    """List console scripts available in the cloned RagnarScripts repo."""
+    import serial_console
+    return jsonify(serial_console.list_library())
+
+
+@app.route('/api/serial-console/library/install', methods=['POST'])
+def api_serial_console_library_install():
+    """Install a console script from the RagnarScripts repo into data/console_scripts/."""
+    import serial_console
+    body = request.get_json(silent=True) or {}
+    sid = (body.get('script_id') or body.get('id') or '').strip()
+    if not sid:
+        return jsonify({'success': False, 'error': 'missing script_id'}), 400
+    result = serial_console.install_library_script(sid)
+    return jsonify(result), (200 if result.get('success') else 400)
 
 
 @app.route('/api/power/test', methods=['GET', 'POST'])
@@ -14884,7 +15219,10 @@ def _upload_outcome(target, res):
             and resp.get('status') in ('pending', 'processing'):
         return {'state': 'processing', 'upload_id': resp['upload_id'], 'message': 'Wardrift is processing'}
     if target == 'wardrift' and res.get('duplicate'):
-        return {'state': 'ok', 'message': 'Already on Wardrift'}
+        # Wardrift also answers duplicate_route while an identical earlier
+        # upload is still pending - and that one can still be rejected.
+        return {'state': 'unknown', 'message': 'Wardrift already has this file (an earlier upload may '
+                                               'still be processing) - check your routes on wardrift.net'}
     return {'state': 'ok', 'message': _upload_resp_summary(target, resp)}
 
 
@@ -15183,7 +15521,7 @@ def _auto_upload_start_worker():
 
 
 def _pushover_ready():
-    """'ok' | 'off' (keys set, Pushover disabled) | 'missing' (no keys)."""
+    """'ok' | 'off' (channel set, push disabled) | 'missing' (no Pushover/Slack)."""
     po = _rusense_pushover()
     if po is None or not po.is_configured():
         return 'missing'
@@ -15718,7 +16056,9 @@ def _start_gps_manager(engine):
         port=gps_port,
         baudrate=shared_data.config.get('wardriving_gps_baudrate', 9600),
         exclude_ports=esp_exclude,
-        state_file=os.path.join(engine.data_dir, 'last_gps.json'))
+        state_file=os.path.join(engine.data_dir, 'last_gps.json'),
+        assist=shared_data.config.get('wardriving_gps_assist', True),
+        set_clock=shared_data.config.get('wardriving_gps_set_clock', True))
     return engine._gps.start()
 
 
@@ -20334,13 +20674,474 @@ def pentest_get_report():
     try:
         if not BLUETOOTH_PENTEST_AVAILABLE or bluetooth_pentest is None:
             return jsonify({'error': 'Bluetooth pentest module not available'}), 503
-        
+
         report = bluetooth_pentest.generate_report()
-        
+
         return jsonify(report)
-        
+
     except Exception as e:
         logger.error(f"Error generating report: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Rubber Ducky — mesh HID control
+# ---------------------------------------------------------------------------
+# A Ragnar plugged into a host PC via USB-OTG can't use its wired port at the
+# same time, so it rides Wi-Fi — and another Ragnar on the mesh can drive its
+# HID keyboard over the tailnet, exactly the way the Device Console is driven
+# across the mesh. Transport is the existing secret-gated web gateway
+# (X-Ragnar-Target relayed to the peer); on top of that each unit must opt in
+# with "Allow mesh units to run payloads" (rubber_ducky.mesh_allowed()), which
+# _ducky_mesh_write_guard() enforces on every state-changing, relayed request.
+
+def _rubber_ducky_summary():
+    """This unit's HID/ducky posture, for the unit picker and peer discovery."""
+    from python.rubber_ducky import (list_hid_devices, hid_gadget_ready,
+                                     list_scripts, mesh_allowed)
+    devices = list_hid_devices()
+    ready = hid_gadget_ready()
+    return {'has_gadget': bool(devices) or bool(ready),
+            'gadget_ready': bool(ready),
+            'script_count': len(list_scripts()),
+            'mesh_allow': mesh_allowed()}
+
+
+def _ducky_mesh_write_guard():
+    """For a ducky request relayed from a mesh peer (``g.mesh_gateway``), refuse
+    a state-changing op unless this unit ticked "Allow mesh units to run
+    payloads". Returns a Flask response to short-circuit, or None to proceed."""
+    if not getattr(g, 'mesh_gateway', False):
+        return None
+    try:
+        from python.rubber_ducky import mesh_allowed
+        if mesh_allowed():
+            return None
+    except Exception as e:
+        logger.error(f"ducky mesh guard error: {e}")
+    return jsonify({'success': False, 'error': (
+        'This unit has not enabled mesh HID control. Tick "Allow mesh units to '
+        'run payloads" on its Rubber Ducky card.')}), 403
+
+
+@app.route('/api/mesh/rubber-ducky/status', methods=['GET'])
+def api_mesh_rubber_ducky_status():
+    """Peer-readable (GET under /api/mesh/): lets a hub discover which mesh units
+    have a USB HID gadget and whether they've opted into mesh control. No control
+    here — running a payload goes through the secret-gated gateway + the guard."""
+    try:
+        out = _rubber_ducky_summary()
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    out.update({'success': True, 'name': _mesh_viking_name() or socket.gethostname()})
+    return jsonify(out)
+
+
+@app.route('/api/rubber-ducky/units', methods=['GET'])
+def api_rubber_ducky_units():
+    """This unit plus every mesh peer with its HID summary, so the Rubber Ducky
+    card can run a payload on any Ragnar wired to a host. Driving a peer relays
+    through the mesh gateway, which needs the mesh secret."""
+    units = []
+    try:
+        local = _rubber_ducky_summary()
+    except Exception as e:
+        local = {'has_gadget': False, 'error': str(e)}
+    local.update({'id': 'local', 'name': (_mesh_viking_name() if mesh_available else None)
+                  or socket.gethostname(), 'local': True, 'reachable': True})
+    units.append(local)
+    gateway_ready = False
+    if mesh_available and _mesh_enabled():
+        gateway_ready = bool(_mesh_secret())
+        peers = _mesh_tagged_peers()
+        results = {}
+
+        def _poll(node):
+            results[node.get('id')] = mesh_manager.poll_peer(
+                node, port=_mesh_node_port(), timeout=4,
+                path='/api/mesh/rubber-ducky/status')
+
+        threads = [threading.Thread(target=_poll, args=(p,), daemon=True)
+                   for p in peers if p.get('online') and p.get('id')]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=6)
+        for p in peers:
+            r = results.get(p.get('id')) or {}
+            units.append({'id': p.get('id'), 'local': False,
+                          'name': r.get('name') or p.get('hostname') or p.get('dns_name'),
+                          'online': bool(p.get('online')),
+                          'reachable': bool(r.get('reachable')) and bool(r.get('success')),
+                          'has_gadget': bool(r.get('has_gadget')),
+                          'gadget_ready': bool(r.get('gadget_ready')),
+                          'mesh_allow': bool(r.get('mesh_allow')),
+                          'script_count': r.get('script_count'),
+                          'error': r.get('error') if not r.get('reachable') else None})
+    return jsonify({'units': units, 'gateway_ready': gateway_ready,
+                    'mesh_enabled': bool(mesh_available and _mesh_enabled())})
+
+
+@app.route('/api/rubber-ducky/mesh-allow', methods=['GET', 'POST'])
+def api_rubber_ducky_mesh_allow():
+    """Get or set THIS unit's opt-in to mesh-driven HID control (the checkbox).
+    Always local — never relayed — so each unit governs its own HID."""
+    from python.rubber_ducky import mesh_allowed, set_mesh_allowed
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+        return jsonify(set_mesh_allowed(bool(data.get('allow'))))
+    return jsonify({'success': True, 'mesh_allow': mesh_allowed()})
+
+
+# Rubber Ducky Routes
+@app.route('/api/rubber-ducky/scripts', methods=['GET'])
+def rubber_ducky_list_scripts():
+    """List available rubber ducky scripts"""
+    try:
+        from python.rubber_ducky import list_scripts
+        scripts = list_scripts()
+        return jsonify({
+            'success': True,
+            'scripts': scripts,
+            'count': len(scripts)
+        })
+    except Exception as e:
+        logger.error(f"Error listing scripts: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/rubber-ducky/devices', methods=['GET'])
+def rubber_ducky_list_devices():
+    """List available HID keyboard gadget devices"""
+    try:
+        from python.rubber_ducky import list_hid_devices, hid_gadget_ready
+        devices = list_hid_devices()
+        return jsonify({
+            'success': True,
+            'devices': devices,
+            'count': len(devices),
+            'gadget_ready': hid_gadget_ready(),
+            'hint': ('No USB HID keyboard gadget found. Configure the HID gadget '
+                     '(reinstall or update Ragnar) and plug the device into the '
+                     'target host via USB.') if not devices else ''
+        })
+    except Exception as e:
+        logger.error(f"Error listing HID devices: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/rubber-ducky/preview', methods=['POST'])
+def rubber_ducky_preview():
+    """Preview a rubber ducky script"""
+    try:
+        data = request.get_json() or {}
+        script_name = data.get('script')
+
+        if not script_name:
+            return jsonify({'error': 'Script name required'}), 400
+
+        from python.rubber_ducky import RubberDuckyScript, list_scripts
+
+        # Find script
+        scripts = list_scripts()
+        script_path = None
+        for script in scripts:
+            if script['name'] == script_name:
+                script_path = script['path']
+                break
+
+        if not script_path:
+            return jsonify({'error': f'Script not found: {script_name}'}), 404
+
+        # Read script content
+        with open(script_path, 'r') as f:
+            content = f.read()
+
+        # Parse based on file extension
+        duck = RubberDuckyScript()
+        if script_path.endswith('.ducky'):
+            success = duck.parse_ducky_format(content)
+        else:
+            success = duck.parse_text_format(content)
+
+        return jsonify({
+            'success': success,
+            'preview': duck.get_preview(),
+            'command_count': len(duck.commands),
+            'errors': duck.errors
+        })
+
+    except Exception as e:
+        logger.error(f"Error previewing script: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/rubber-ducky/execute', methods=['POST'])
+def rubber_ducky_execute():
+    """Execute a rubber ducky script on a device.
+
+    Gated only by Pentest Mode (the tab is hidden otherwise), exactly like the
+    other manual Pentest-tab tools — it deliberately does NOT depend on the
+    global ``enable_attacks`` flag.
+    """
+    try:
+        guard = _ducky_mesh_write_guard()
+        if guard:
+            return guard
+        data = request.get_json() or {}
+        script_name = data.get('script')
+        device_path = data.get('device')
+
+        if not script_name or not device_path:
+            return jsonify({'error': 'Script and device required'}), 400
+
+        from python.rubber_ducky import RubberDuckyScript, list_scripts
+
+        # Validate device path (security check): only the HID keyboard gadget
+        # node may be written to, never an arbitrary file.
+        if not device_path.startswith('/dev/hidg') or '..' in device_path:
+            return jsonify({'error': 'Invalid device path'}), 400
+
+        # Find script
+        scripts = list_scripts()
+        script_path = None
+        for script in scripts:
+            if script['name'] == script_name:
+                script_path = script['path']
+                break
+
+        if not script_path:
+            return jsonify({'error': f'Script not found: {script_name}'}), 404
+
+        # Read script content
+        with open(script_path, 'r') as f:
+            content = f.read()
+
+        # Parse based on file extension
+        duck = RubberDuckyScript()
+        if script_path.endswith('.ducky'):
+            success = duck.parse_ducky_format(content)
+        else:
+            success = duck.parse_text_format(content)
+
+        if not success:
+            return jsonify({
+                'success': False,
+                'error': 'Script parsing failed',
+                'errors': duck.errors
+            }), 400
+
+        # Execute (sync for now, could be async later)
+        result = duck.execute_on_device(device_path, timeout=30)
+
+        logger.info(f"Rubber Ducky execution on {device_path}: {result}")
+
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"Error executing script: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+def _rubber_ducky_gadget(cmd):
+    """Run scripts/hid_gadget.sh <cmd> and return (parsed_json, http_status).
+
+    On-demand control of the HID keyboard gadget (status/up/down). The webapp
+    runs as root in production; fall back to sudo -n otherwise.
+    """
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scripts', 'hid_gadget.sh')
+    if not os.path.exists(script):
+        return {'ok': False, 'error': 'scripts/hid_gadget.sh missing — update Ragnar'}, 500
+    argv = ['bash', script, cmd]
+    if os.geteuid() != 0:
+        argv = ['sudo', '-n'] + argv
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+        out = (proc.stdout or '').strip()
+        try:
+            payload = json.loads(out.splitlines()[-1]) if out else {}
+        except (ValueError, IndexError):
+            payload = {'ok': False, 'error': (proc.stderr or out or 'no output').strip()[:300]}
+        return payload, (200 if payload.get('ok') else 500)
+    except Exception as e:
+        logger.error(f"HID gadget {cmd} failed: {e}")
+        return {'ok': False, 'error': str(e)}, 500
+
+
+@app.route('/api/rubber-ducky/gadget/status', methods=['GET'])
+def rubber_ducky_gadget_status():
+    """Report HID keyboard gadget state (UDC / bound / hidg0 / attached)."""
+    payload, status = _rubber_ducky_gadget('status')
+    return jsonify(payload), status
+
+
+@app.route('/api/rubber-ducky/gadget/enable', methods=['POST'])
+def rubber_ducky_gadget_enable():
+    """Bring the HID keyboard gadget up on demand (adds hid.usb0, binds)."""
+    guard = _ducky_mesh_write_guard()
+    if guard:
+        return guard
+    payload, status = _rubber_ducky_gadget('up')
+    logger.info(f"Rubber Ducky gadget enable: {payload}")
+    return jsonify(payload), status
+
+
+@app.route('/api/rubber-ducky/gadget/disable', methods=['POST'])
+def rubber_ducky_gadget_disable():
+    """Tear the HID keyboard gadget down on demand (removes hid.usb0)."""
+    guard = _ducky_mesh_write_guard()
+    if guard:
+        return guard
+    payload, status = _rubber_ducky_gadget('down')
+    logger.info(f"Rubber Ducky gadget disable: {payload}")
+    return jsonify(payload), status
+
+
+@app.route('/api/rubber-ducky/library', methods=['GET'])
+def rubber_ducky_library():
+    """List the bundled payload library."""
+    try:
+        from python.rubber_ducky import list_library
+        payloads = list_library()
+        return jsonify({'success': True, 'payloads': payloads, 'count': len(payloads)})
+    except Exception as e:
+        logger.error(f"Error listing payload library: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/rubber-ducky/library/install', methods=['POST'])
+def rubber_ducky_library_install():
+    """Copy a library payload into the editable scripts folder."""
+    try:
+        guard = _ducky_mesh_write_guard()
+        if guard:
+            return guard
+        from python.rubber_ducky import install_payload
+        name = (request.get_json() or {}).get('name')
+        result = install_payload(name)
+        return jsonify(result), (200 if result.get('success') else 400)
+    except Exception as e:
+        logger.error(f"Error installing payload: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/rubber-ducky/ragnar-scripts', methods=['GET'])
+def rubber_ducky_ragnar_scripts():
+    """List ducky payloads available in the cloned RagnarScripts repo."""
+    try:
+        from python.rubber_ducky import list_ragnar_scripts
+        return jsonify(list_ragnar_scripts())
+    except Exception as e:
+        logger.error(f"Error listing RagnarScripts payloads: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/rubber-ducky/ragnar-scripts/install', methods=['POST'])
+def rubber_ducky_ragnar_scripts_install():
+    """Install a ducky payload from the RagnarScripts repo into files/rubber-ducky/."""
+    try:
+        guard = _ducky_mesh_write_guard()
+        if guard:
+            return guard
+        from python.rubber_ducky import install_ragnar_script
+        name = (request.get_json(silent=True) or {}).get('name')
+        result = install_ragnar_script(name)
+        return jsonify(result), (200 if result.get('success') else 400)
+    except Exception as e:
+        logger.error(f"Error installing RagnarScripts payload: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/rubber-ducky/save', methods=['POST'])
+def rubber_ducky_save():
+    """Create or overwrite a script in the editable scripts folder."""
+    try:
+        guard = _ducky_mesh_write_guard()
+        if guard:
+            return guard
+        from python.rubber_ducky import save_script
+        data = request.get_json() or {}
+        result = save_script(data.get('name'), data.get('content', ''))
+        return jsonify(result), (200 if result.get('success') else 400)
+    except Exception as e:
+        logger.error(f"Error saving script: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# Reverse shell generator + catch listener (Pentest-tab tool)
+@app.route('/api/revshell/generate', methods=['POST'])
+def revshell_generate():
+    """Generate reverse-shell one-liners for an LHOST/LPORT."""
+    try:
+        from python.revshell import generate, get_lan_ip
+        data = request.get_json() or {}
+        ip = (data.get('ip') or '').strip() or get_lan_ip()
+        try:
+            port = int(data.get('port') or 4444)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Invalid port'}), 400
+        if not (1 <= port <= 65535):
+            return jsonify({'error': 'Port must be 1-65535'}), 400
+        shell = data.get('shell') or '/bin/bash'
+        return jsonify({'success': True, 'ip': ip, 'port': port,
+                        'payloads': generate(ip, port, shell)})
+    except Exception as e:
+        logger.error(f"Error generating reverse shell: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/revshell/lan-ip', methods=['GET'])
+def revshell_lan_ip():
+    """Return the box's primary LAN IP (default LHOST)."""
+    try:
+        from python.revshell import get_lan_ip
+        return jsonify({'success': True, 'ip': get_lan_ip()})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/revshell/listener/start', methods=['POST'])
+def revshell_listener_start():
+    """Start the catch listener on a port."""
+    try:
+        from python.revshell import LISTENER
+        port = (request.get_json() or {}).get('port', 4444)
+        result = LISTENER.start(port)
+        logger.info(f"Reverse shell listener start: {result}")
+        return jsonify(result), (200 if result.get('success') else 400)
+    except Exception as e:
+        logger.error(f"Error starting listener: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/revshell/listener/status', methods=['GET'])
+def revshell_listener_status():
+    """Listener state + captured output."""
+    try:
+        from python.revshell import LISTENER
+        return jsonify(LISTENER.status())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/revshell/listener/send', methods=['POST'])
+def revshell_listener_send():
+    """Send a command line to the connected session."""
+    try:
+        from python.revshell import LISTENER
+        result = LISTENER.send((request.get_json() or {}).get('data', ''))
+        return jsonify(result), (200 if result.get('success') else 400)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/revshell/listener/stop', methods=['POST'])
+def revshell_listener_stop():
+    """Stop the catch listener."""
+    try:
+        from python.revshell import LISTENER
+        return jsonify(LISTENER.stop())
+    except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 
@@ -23445,7 +24246,9 @@ def list_files_api():
                 {'name': 'vulnerabilities', 'is_directory': True, 'path': '/vulnerabilities'},
                 {'name': 'logs', 'is_directory': True, 'path': '/logs'},
                 {'name': 'backups', 'is_directory': True, 'path': '/backups'},
-                {'name': 'uploads', 'is_directory': True, 'path': '/uploads'}
+                {'name': 'uploads', 'is_directory': True, 'path': '/uploads'},
+                {'name': 'console_scripts', 'is_directory': True, 'path': '/console_scripts'},
+                {'name': 'rubber-ducky', 'is_directory': True, 'path': '/rubber-ducky'}
             ])
         
         # Map paths to actual directories
@@ -23479,6 +24282,18 @@ def list_files_api():
         elif path == '/uploads' or path.startswith('/uploads/'):
             try:
                 actual_path = _resolve_legacy_path('/uploads', shared_data.upload_dir, path)
+            except ValueError:
+                return jsonify({'error': 'Invalid path'}), 400
+        elif path == '/console_scripts' or path.startswith('/console_scripts/'):
+            try:
+                actual_path = _resolve_legacy_path('/console_scripts',
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'console_scripts'), path)
+            except ValueError:
+                return jsonify({'error': 'Invalid path'}), 400
+        elif path == '/rubber-ducky' or path.startswith('/rubber-ducky/'):
+            try:
+                actual_path = _resolve_legacy_path('/rubber-ducky',
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'files', 'rubber-ducky'), path)
             except ValueError:
                 return jsonify({'error': 'Invalid path'}), 400
         else:
@@ -23579,6 +24394,18 @@ def preview_file_api():
                 actual_path = _resolve_legacy_path('/uploads', shared_data.upload_dir, file_path)
             except ValueError:
                 return jsonify({'error': 'Invalid path'}), 400
+        elif file_path == '/console_scripts' or file_path.startswith('/console_scripts/'):
+            try:
+                actual_path = _resolve_legacy_path('/console_scripts',
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'console_scripts'), file_path)
+            except ValueError:
+                return jsonify({'error': 'Invalid path'}), 400
+        elif file_path == '/rubber-ducky' or file_path.startswith('/rubber-ducky/'):
+            try:
+                actual_path = _resolve_legacy_path('/rubber-ducky',
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'files', 'rubber-ducky'), file_path)
+            except ValueError:
+                return jsonify({'error': 'Invalid path'}), 400
         else:
             return jsonify({'error': 'Invalid path'}), 400
 
@@ -23593,7 +24420,8 @@ def preview_file_api():
         ext = os.path.splitext(actual_path)[1].lower()
 
         TEXT_EXTENSIONS = {'.txt', '.log', '.csv', '.json', '.xml', '.yaml', '.yml',
-                           '.md', '.conf', '.cfg', '.ini', '.nmap', '.gnmap', '.sh', '.py'}
+                           '.md', '.conf', '.cfg', '.ini', '.nmap', '.gnmap', '.sh', '.py',
+                           '.ducky'}
         IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg'}
 
         if ext == '.pdf' or mime_type == 'application/pdf':
@@ -23616,22 +24444,65 @@ def preview_file_api():
                             'size': file_size, 'name': os.path.basename(actual_path)})
 
         elif ext in TEXT_EXTENSIONS or (mime_type and mime_type.startswith('text/')):
+            can_edit = ext in EDITABLE_EXTENSIONS and file_size <= 512 * 1024
             if file_size > 512 * 1024:  # 512KB limit for text
-                # Return first 512KB with truncation notice
                 with open(actual_path, 'r', encoding='utf-8', errors='replace') as f:
                     content = f.read(512 * 1024)
                 return jsonify({'type': 'text', 'content': content, 'truncated': True,
-                                'size': file_size, 'name': os.path.basename(actual_path)})
+                                'size': file_size, 'name': os.path.basename(actual_path),
+                                'editable': False})
             with open(actual_path, 'r', encoding='utf-8', errors='replace') as f:
                 content = f.read()
             return jsonify({'type': 'text', 'content': content, 'truncated': False,
-                            'size': file_size, 'name': os.path.basename(actual_path)})
+                            'size': file_size, 'name': os.path.basename(actual_path),
+                            'editable': can_edit})
         else:
             return jsonify({'type': 'binary', 'mime': mime_type,
                             'size': file_size, 'name': os.path.basename(actual_path)})
 
     except Exception as e:
         logger.error(f"Error previewing file: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+EDITABLE_EXTENSIONS = {'.txt', '.log', '.json', '.xml', '.yaml', '.yml',
+                       '.md', '.conf', '.cfg', '.ini', '.sh', '.py',
+                       '.csv', '.env', '.toml', '.html', '.css', '.js',
+                       '.bat', '.ps1', '.rb', '.pl', '.lua', '.sql',
+                       '.nmap', '.gnmap', '.rules', '.ducky'}
+
+@app.route('/api/files/save', methods=['POST'])
+def save_file_api():
+    """Save edited text file content back to disk."""
+    try:
+        body = request.get_json(silent=True) or {}
+        file_path = (body.get('path') or '').strip()
+        content = body.get('content')
+        if not file_path:
+            return jsonify({'error': 'File path required'}), 400
+        if content is None:
+            return jsonify({'error': 'Content required'}), 400
+
+        try:
+            actual_path = _resolve_readable_path(file_path)
+        except ValueError:
+            return jsonify({'error': 'Invalid path'}), 400
+
+        if not os.path.isfile(actual_path):
+            return jsonify({'error': 'File not found'}), 404
+
+        ext = os.path.splitext(actual_path)[1].lower()
+        if ext not in EDITABLE_EXTENSIONS:
+            return jsonify({'error': 'This file type cannot be edited'}), 400
+
+        with open(actual_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+
+        logger.info(f"File saved: {actual_path} ({len(content)} bytes)")
+        return jsonify({'success': True, 'size': len(content)})
+
+    except Exception as e:
+        logger.error(f"Error saving file: {e}")
         return jsonify({'error': str(e)}), 500
 
 
@@ -23678,6 +24549,18 @@ def download_file_api():
         elif file_path == '/uploads' or file_path.startswith('/uploads/'):
             try:
                 actual_path = _resolve_legacy_path('/uploads', shared_data.upload_dir, file_path)
+            except ValueError:
+                return jsonify({'error': 'Invalid file path'}), 400
+        elif file_path == '/console_scripts' or file_path.startswith('/console_scripts/'):
+            try:
+                actual_path = _resolve_legacy_path('/console_scripts',
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'console_scripts'), file_path)
+            except ValueError:
+                return jsonify({'error': 'Invalid file path'}), 400
+        elif file_path == '/rubber-ducky' or file_path.startswith('/rubber-ducky/'):
+            try:
+                actual_path = _resolve_legacy_path('/rubber-ducky',
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'files', 'rubber-ducky'), file_path)
             except ValueError:
                 return jsonify({'error': 'Invalid file path'}), 400
         else:
@@ -23755,6 +24638,18 @@ def delete_file_api():
                 actual_path = _resolve_legacy_path('/uploads', shared_data.upload_dir, file_path)
             except ValueError:
                 return jsonify({'error': 'Invalid file path'}), 400
+        elif file_path == '/console_scripts' or file_path.startswith('/console_scripts/'):
+            try:
+                actual_path = _resolve_legacy_path('/console_scripts',
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'console_scripts'), file_path)
+            except ValueError:
+                return jsonify({'error': 'Invalid file path'}), 400
+        elif file_path == '/rubber-ducky' or file_path.startswith('/rubber-ducky/'):
+            try:
+                actual_path = _resolve_legacy_path('/rubber-ducky',
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'files', 'rubber-ducky'), file_path)
+            except ValueError:
+                return jsonify({'error': 'Invalid file path'}), 400
         else:
             return jsonify({'error': 'Invalid file path'}), 400
 
@@ -23781,12 +24676,20 @@ def _resolve_upload_target(target_path):
     """Map an /uploads or /backups virtual dir (possibly nested) to a real dir.
 
     Returns the actual directory path, or raises ValueError on a bad/escaping
-    path. Only the writable uploads and backups trees are allowed as targets.
+    path. The writable trees allowed as upload targets are Uploads, Backups and
+    the two script libraries (rubber-ducky payloads and console scripts) — so a
+    script can be added straight from the Files tab.
     """
     if target_path == '/uploads' or target_path.startswith('/uploads/'):
         return _resolve_legacy_path('/uploads', shared_data.upload_dir, target_path)
     if target_path == '/backups' or target_path.startswith('/backups/'):
         return _resolve_legacy_path('/backups', shared_data.backupdir, target_path)
+    if target_path == '/rubber-ducky' or target_path.startswith('/rubber-ducky/'):
+        return _resolve_legacy_path('/rubber-ducky',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'files', 'rubber-ducky'), target_path)
+    if target_path == '/console_scripts' or target_path.startswith('/console_scripts/'):
+        return _resolve_legacy_path('/console_scripts',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'console_scripts'), target_path)
     raise ValueError('Invalid upload path')
 
 
@@ -23815,12 +24718,19 @@ def _resolve_readable_path(file_path):
         return _resolve_legacy_path('/backups', shared_data.backupdir, file_path)
     if file_path == '/uploads' or file_path.startswith('/uploads/'):
         return _resolve_legacy_path('/uploads', shared_data.upload_dir, file_path)
+    if file_path == '/console_scripts' or file_path.startswith('/console_scripts/'):
+        return _resolve_legacy_path('/console_scripts',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'console_scripts'), file_path)
+    if file_path == '/rubber-ducky' or file_path.startswith('/rubber-ducky/'):
+        return _resolve_legacy_path('/rubber-ducky',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'files', 'rubber-ducky'), file_path)
     raise ValueError('Invalid path')
 
 
 @app.route('/api/files/upload', methods=['POST'])
 def upload_file_api():
-    """Upload one or more files into an /uploads or /backups folder."""
+    """Upload one or more files into a writable folder (Uploads, Backups, the
+    rubber-ducky payload library or the console_scripts library)."""
     try:
         if 'file' not in request.files:
             return jsonify({'error': 'No file provided'}), 400
@@ -24795,7 +25705,8 @@ def safe_preview_api():
         ext = os.path.splitext(name)[1].lower()
 
         TEXT_EXTENSIONS = {'.txt', '.log', '.csv', '.json', '.xml', '.yaml', '.yml',
-                           '.md', '.conf', '.cfg', '.ini', '.nmap', '.gnmap', '.sh', '.py'}
+                           '.md', '.conf', '.cfg', '.ini', '.nmap', '.gnmap', '.sh', '.py',
+                           '.ducky'}
         IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg'}
 
         if ext == '.pdf' or mime == 'application/pdf':
@@ -28661,7 +29572,7 @@ def remove_ai_token():
 
 
 # ============================================================================
-# PUSHOVER NOTIFICATION ENDPOINTS
+# PUSH NOTIFICATION ENDPOINTS (Pushover + Slack)
 # ============================================================================
 
 @app.route('/api/pushover/keys', methods=['GET'])
@@ -28754,7 +29665,7 @@ def test_pushover():
             shared_data._pushover_service = pushover
 
         if not pushover.is_configured():
-            return jsonify({'success': False, 'message': 'Pushover keys not configured. Please save your User Key and API Token first.'}), 400
+            return jsonify({'success': False, 'message': 'No notification channel configured. Save your Pushover keys or a Slack webhook URL first.'}), 400
 
         result = pushover.send(
             message="Hello there Viking, are you ready for adventures?",
@@ -28765,6 +29676,57 @@ def test_pushover():
     except Exception as e:
         logger.error(f"Error testing Pushover: {e}")
         return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/slack/webhook', methods=['GET'])
+def get_slack_webhook():
+    """Get Slack webhook status (without revealing the full URL)."""
+    try:
+        from env_manager import EnvManager
+        url = EnvManager().get_env_key("RAGNAR_SLACK_WEBHOOK_URL")
+        return jsonify({
+            'configured': bool(url),
+            'preview': f"{url[:30]}...{url[-4:]}" if url and len(url) > 40 else None,
+        })
+    except Exception as e:
+        logger.error(f"Error getting Slack webhook status: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/slack/webhook', methods=['POST'])
+def save_slack_webhook():
+    """Save the Slack incoming-webhook URL to the .env file."""
+    try:
+        from env_manager import EnvManager
+        from pushover_service import SLACK_WEBHOOK_PREFIX
+        data = request.get_json() or {}
+        url = (data.get('webhook_url') or '').strip()
+        if not url:
+            return jsonify({'error': 'No webhook URL provided'}), 400
+        if not url.startswith(SLACK_WEBHOOK_PREFIX) or any(c.isspace() for c in url):
+            return jsonify({'error': f'Slack webhook URL must start with {SLACK_WEBHOOK_PREFIX}'}), 400
+        EnvManager().set_env_key("RAGNAR_SLACK_WEBHOOK_URL", url)
+        auto_enabled = False
+        if not shared_data.config.get('pushover_enabled', False):
+            shared_data.config['pushover_enabled'] = True
+            shared_data.save_config()
+            auto_enabled = True
+        return jsonify({'success': True, 'message': '✓ Slack webhook saved', 'auto_enabled': auto_enabled})
+    except Exception as e:
+        logger.error(f"Error saving Slack webhook: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/slack/webhook', methods=['DELETE'])
+def remove_slack_webhook():
+    """Remove the Slack webhook URL from the .env file."""
+    try:
+        from env_manager import EnvManager
+        EnvManager().delete_env_key("RAGNAR_SLACK_WEBHOOK_URL")
+        return jsonify({'success': True, 'message': 'Slack webhook removed'})
+    except Exception as e:
+        logger.error(f"Error removing Slack webhook: {e}")
+        return jsonify({'error': str(e)}), 500
 
 
 # ============================================================================
@@ -29081,6 +30043,12 @@ def run_server(host='0.0.0.0', port=8000, ssl_cert=None, ssl_key=None, https_por
         https_port: HTTPS port (default: None, uses port+443-80 if SSL enabled)
     """
     try:
+        # A manual fan speed left behind by a crashed run must not stick.
+        import fan_tools
+        fan_tools.recover()
+    except Exception as e:
+        logger.debug(f"Fan recover skipped: {e}")
+    try:
         # Bind to a specific interface if configured
         bind_iface = shared_data.config.get('web_bind_interface', '')
         if bind_iface:
@@ -29137,6 +30105,21 @@ def run_server(host='0.0.0.0', port=8000, ssl_cert=None, ssl_key=None, https_por
         except Exception as e:
             logger.warning(f"Serial console init skipped: {e}")
 
+        # Clone/pull the external RagnarScripts library on boot so shared ducky
+        # and console scripts are available without a manual git pull. Runs in
+        # the background (never blocks the web server binding) and is never fatal.
+        def _boot_ragnar_scripts():
+            try:
+                import ragnar_scripts
+                st = ragnar_scripts.sync(force=True)
+                if st.get('ok'):
+                    logger.info(f"RagnarScripts {st.get('action')} ok: {st.get('dir')}")
+                else:
+                    logger.info(f"RagnarScripts sync skipped: {st.get('error')}")
+            except Exception as _rs_err:
+                logger.warning(f"RagnarScripts boot sync error: {_rs_err}")
+        socketio.start_background_task(_boot_ragnar_scripts)
+
         # Synchronize counts in the background so the web server binds
         # immediately instead of waiting for a full DB scan first.
         def _deferred_sync():
@@ -29157,6 +30140,7 @@ def run_server(host='0.0.0.0', port=8000, ssl_cert=None, ssl_key=None, https_por
         socketio.start_background_task(watchtower_monitor_loop)
         socketio.start_background_task(asset_inventory_monitor_loop)
         socketio.start_background_task(mesh_monitor_loop)
+        socketio.start_background_task(cellular_uplink_monitor_loop)
 
         # Bring up the BLE provisioning peripheral if the user has enabled it.
         # Deferred so a slow/absent Bluetooth stack never delays the web server

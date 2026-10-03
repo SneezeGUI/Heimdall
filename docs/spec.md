@@ -277,7 +277,22 @@
 - Runtime modules reference `shared_data.config` live; writes through the Web UI call `SharedData.save_config()` which flushes JSON, updates in-memory attributes, and triggers downstream watchers (e.g., Wi-Fi manager reloading known networks, display toggling `screen_reversed`).
 - Config headings (`__title_*`) are used purely for UI grouping; the parser strips these keys automatically when exporting to Python dicts.
 
-### 13.1 When a settings change restarts the service
+### 13.1 Settings sub-tabs (UI grouping)
+The Settings (Configuration) tab groups its many sections behind a sub-tab bar
+(`showConfigSubtab()` in `ragnar_modern.js`, mirroring `showNetworkSubtab()`):
+**System** (System Management), **Network** (Network Scanning), **Bluetooth**
+(handover + access point/PAN), **Wardriving**, **Security** (Security +
+Pwnagotchi Bridge), **Integrations** (AI + Push Notifications), and **Advanced**
+(Hardware Resource Configuration + the raw fine-tune form). Each group lives in a
+`#cfg-sub-*` wrapper (`.cfg-subview`) that is show/hidden with the `hidden`
+class; the last-viewed sub-tab is remembered in `localStorage` (`cfg-subtab`) and
+restored when the tab is reopened. The bar is `flex flex-wrap`, so it collapses
+to multiple rows on phone widths. Sub-tabs are **purely visual**: every input
+stays in the DOM regardless of which sub-tab is active, so `saveConfig()` still
+posts the whole form (see below) and no field is dropped when saving from any
+sub-tab.
+
+### 13.2 When a settings change restarts the service
 Saving settings must **not** bounce the service. The Settings tab is a single
 form and `saveConfig()` posts every field in it, so a save always carries keys
 the user did not touch — which is why the restart gate is "a restart-bound key

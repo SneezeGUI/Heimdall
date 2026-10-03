@@ -110,3 +110,29 @@ def test_stop_runs_session_finished_hooks():
     finally:
         wardriving.SESSION_FINISHED_HOOKS[:] = saved
     assert seen == ['S1']
+
+
+def test_sparse_track_rows_are_interpolated_not_snapped(tmp_path):
+    # Track logged every 10 s (~140 m apart at 50 km/h); APs peak in between.
+    # Snapping each row to the nearest fix gave rows 70 m apart the same
+    # second, which Wardrift rejects as GPS jumps.
+    s = wardriving.WardrivingSession(str(tmp_path), session_id='sparse')
+    c = sqlite3.connect(s.db_path)
+    for t in range(0, 200, 10):
+        la, lo = _pos(t)
+        c.execute("INSERT INTO gps_track (timestamp, latitude, longitude) VALUES (?,?,?)", (T0 + t, la, lo))
+    for i, t in enumerate(range(1, 190, 2)):
+        la, lo = _pos(t)
+        c.execute("INSERT INTO networks (bssid, ssid, first_seen, last_seen, best_lat, best_lon) "
+                  "VALUES (?,?,?,?,?,?)", (f'aa:00:00:00:01:{i:02x}', f'n{i}', _iso(0), _iso(199), la, lo))
+    la, lo = _pos(95)
+    c.execute("INSERT INTO networks (bssid, ssid, first_seen, last_seen, best_lat, best_lon) "
+              "VALUES ('aa:00:00:00:02:00','off track',?,?,?,?)", (_iso(90), _iso(100), la + 0.001, lo))
+    c.commit()
+    c.close()
+    rows = _rows(s)
+    assert 'off track' not in {r[1] for r in rows}       # ~110 m from the drive: not GPS-pinned
+    for a, b in zip(rows, rows[1:]):
+        dt = _epoch(b[3]) - _epoch(a[3])
+        d = abs(float(b[7]) - float(a[7])) * 111320 * math.cos(math.radians(59.3))
+        assert d <= 70 * max(dt, 1)                        # no impossible hop between rows

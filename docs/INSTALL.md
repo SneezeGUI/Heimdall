@@ -154,6 +154,32 @@ If the install log ends with `These display types will NOT work until fixed:`,
 that names the dependency that failed — a screen of that type will stay blank
 until it is installed.
 
+#### Adding a screen to a headless install (`installhead.sh`)
+
+The paragraph above applies to **display** installs only. A headless/server
+install ("No display") skips the display drivers, never writes `epd_type`, and
+runs `headlessRagnar.py` with `RAGNAR_HEADLESS=1` — so plugging in a screen
+later (e.g. the 1.44" LCD HAT) and picking it under **Config → Display** leaves
+it dark, and its keys/joystick do nothing. Run:
+
+```bash
+cd /home/ragnar/Ragnar
+sudo ./installhead.sh            # menu: pick your screen
+sudo ./installhead.sh st7735s    # or name it directly (any epd_type above)
+```
+
+It enables SPI (or I2C for `ssd1306`/`lcd1602`), installs that screen's
+dependencies (`spidev`/`smbus2`/`luma`, plus `gpiozero` + `lgpio` for the
+buttons and joystick), writes `epd_type` to `config/shared_config.json`, adds
+the `ragnar` user to `spi`/`gpio`/`i2c`, and repoints `ragnar.service` to
+`Ragnar.py` (dropping `RAGNAR_HEADLESS=1`, adding the `wipe_epd.py` pre-start).
+The unit is edited in place and backed up to `ragnar.service.bak`. If SPI/I2C
+had to be enabled it offers a reboot, otherwise it restarts Ragnar.
+
+`sudo ./installhead.sh headless` reverses it (back to web-only). Do **not** use
+it on boards with a built-in DPI/HDMI panel (see above) — those must stay
+headless.
+
 ### 📶 Connecting Ragnar to a network
 
 Ragnar looks for a saved network for about a minute at boot. If it cannot join

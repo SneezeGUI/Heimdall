@@ -769,6 +769,13 @@ EOF
             && log "SUCCESS" "Installed rtl-sdr + rtl-433 (RTL-SDR sub-GHz / ISM)" \
             || log "WARNING" "Could not install rtl-sdr/rtl-433 - RTL-SDR features stay disabled until they're present"
     fi
+    # uhubctl lets the SDR self-healer cut a USB port's 5 V for a few seconds —
+    # the software equivalent of replugging a dongle that is stuck on the bus.
+    if ! command -v uhubctl >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends uhubctl >/dev/null 2>&1 \
+            && log "SUCCESS" "Installed uhubctl (SDR self-healing: USB port power-cycle)" \
+            || log "WARNING" "Could not install uhubctl - SDR recovery falls back to a USB controller reset"
+    fi
     if command -v rtl_test >/dev/null 2>&1 || dpkg -s rtl-sdr >/dev/null 2>&1; then
         cat > /etc/modprobe.d/blacklist-rtl-sdr.conf << 'EOF'
 # Ragnar: keep the DVB-T kernel drivers off RTL-SDR dongles so rtl_power /
@@ -1718,8 +1725,26 @@ configure_usb_gadget() {
         return 0
     fi
 
-    # Modify cmdline.txt
-    sed -i 's/rootwait/rootwait modules-load=dwc2,g_ether/' /boot/firmware/cmdline.txt
+    # Modify cmdline.txt (idempotent — avoid appending duplicates on re-runs)
+    if ! grep -q 'modules-load=dwc2' /boot/firmware/cmdline.txt; then
+        sed -i 's/rootwait/rootwait modules-load=dwc2,g_ether/' /boot/firmware/cmdline.txt
+    fi
+
+    # Opt-in HID keyboard gadget (Rubber Ducky). OFF by default, so the plain
+    # ECM gadget — and boards such as the Cardputer — are left untouched. Enable
+    # with RAGNAR_HID_GADGET=1. This adds the dwc2 peripheral controller and
+    # drops the legacy g_ether module, which otherwise claims the UDC and blocks
+    # the composite gadget from binding (/dev/hidg0 never appears).
+    if [ "${RAGNAR_HID_GADGET:-0}" = "1" ]; then
+        log "INFO" "USB HID keyboard gadget (Rubber Ducky) enabled"
+        mkdir -p /etc/ragnar
+        touch /etc/ragnar/hid_gadget.enabled
+        if ! grep -qE '^[[:space:]]*dtoverlay=dwc2' /boot/firmware/config.txt; then
+            printf '\n[all]\n# Ragnar: dwc2 USB peripheral controller for HID gadget\ndtoverlay=dwc2,dr_mode=peripheral\n' >> /boot/firmware/config.txt
+        fi
+        sed -i 's/modules-load=dwc2,g_ether/modules-load=dwc2/g' /boot/firmware/cmdline.txt
+        echo "blacklist g_ether" > /etc/modprobe.d/ragnar-no-g_ether.conf
+    fi
 
     # Modify config.txt
     # echo "dtoverlay=dwc2" >> /boot/firmware/config.txt
@@ -1754,6 +1779,23 @@ if [ -L configs/c.1/ecm.usb0 ]; then
     rm configs/c.1/ecm.usb0
 fi
 ln -s functions/ecm.usb0 configs/c.1/
+
+# HID keyboard function (Rubber Ducky) — only when opted in. The marker file is
+# written by the installer/updater HID-gadget option (RAGNAR_HID_GADGET=1), so
+# default boxes (and the Cardputer) keep the plain ECM gadget untouched.
+if [ -f /etc/ragnar/hid_gadget.enabled ]; then
+    if [ ! -d functions/hid.usb0 ]; then
+        mkdir -p functions/hid.usb0
+        echo 1 > functions/hid.usb0/protocol
+        echo 1 > functions/hid.usb0/subclass
+        echo 8 > functions/hid.usb0/report_length
+        printf '\x05\x01\x09\x06\xa1\x01\x05\x07\x19\xe0\x29\xe7\x15\x00\x25\x01\x75\x01\x95\x08\x81\x02\x95\x01\x75\x08\x81\x03\x95\x05\x75\x01\x05\x08\x19\x01\x29\x05\x91\x02\x95\x01\x75\x03\x91\x03\x95\x06\x75\x08\x15\x00\x25\x65\x05\x07\x19\x00\x29\x65\x81\x00\xc0' > functions/hid.usb0/report_desc
+    fi
+    if [ -L configs/c.1/hid.usb0 ]; then
+        rm configs/c.1/hid.usb0
+    fi
+    ln -s functions/hid.usb0 configs/c.1/
+fi
 
 max_retries=10
 retry_count=0
@@ -2046,6 +2088,21 @@ BANNER
 }
 
 # Main installation process
+# Cellular uplink fallback: a USB-tethered hotspot / phone / LTE modem (rndis_host,
+# cdc_ether, cdc_ncm, ipheth, qmi_wwan, cdc_mbim — all in the stock Pi kernel)
+# must be a BACKUP path. dhcpcd/NetworkManager would otherwise give it a lower
+# route metric than Wi-Fi and silently make it the primary uplink. Installs a
+# NetworkManager conf.d drop-in + a dhcpcd hook (cellular_uplink.py install).
+setup_cellular_fallback() {
+    if [ -f "$ragnar_PATH/cellular_uplink.py" ]; then
+        if python3 "$ragnar_PATH/cellular_uplink.py" install >/dev/null 2>&1; then
+            log "INFO" "Cellular uplink fallback hooks installed"
+        else
+            log "WARNING" "Cellular uplink fallback hook install failed (the service retries at start)"
+        fi
+    fi
+}
+
 # Install Tailscale and optionally join this unit to the Ragnar mesh.
 # Three entry paths, all handled by scripts/setup_mesh.sh:
 #   * unattended  — RAGNAR_MESH_AUTHKEY set, or /boot/ragnar-mesh.conf present
@@ -2546,6 +2603,7 @@ except:
 
     CURRENT_STEP=8; show_progress "Configuring USB Gadget"
     configure_usb_gadget
+    setup_cellular_fallback
 
     CURRENT_STEP=9; show_progress "Setting up services"
     setup_services

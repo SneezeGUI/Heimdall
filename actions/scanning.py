@@ -152,6 +152,18 @@ class NetworkScanner:
         self.db = get_db(currentdir=self.currentdir)
 
     @staticmethod
+    def _is_cellular_uplink(iface):
+        """True when `iface` is a USB-tethered hotspot/phone/modem that must not
+        be scanned (metered data; its LAN is just the hotspot). Opt back in
+        with cellular_allow_scan."""
+        try:
+            import cellular_uplink
+            return (cellular_uplink.is_cellular(iface)
+                    and not cellular_uplink.settings()['allow_scan'])
+        except Exception:
+            return False
+
+    @staticmethod
     def _detect_default_interface():
         """Detect the active network interface using ip route."""
         try:
@@ -165,6 +177,8 @@ class NetworkScanner:
                 if 'dev' in parts:
                     idx = parts.index('dev')
                     if idx + 1 < len(parts):
+                        if NetworkScanner._is_cellular_uplink(parts[idx + 1]):
+                            continue
                         return parts[idx + 1]
         except Exception:
             pass
@@ -179,8 +193,14 @@ class NetworkScanner:
                 parts = line.split()
                 if len(parts) >= 4 and '127.0.0.1' not in line:
                     iface = parts[1].rstrip(':')
-                    if iface != 'lo':
-                        return iface
+                    if iface == 'lo' or iface.startswith(('docker', 'br-', 'veth', 'tailscale', 'pan')):
+                        continue
+                    # usb0 from g_ether is Ragnar's own gadget link to a laptop.
+                    if '/gadget' in os.path.realpath(f'/sys/class/net/{iface}'):
+                        continue
+                    if NetworkScanner._is_cellular_uplink(iface):
+                        continue
+                    return iface
         except Exception:
             pass
         from shared import detect_wifi_interface
@@ -1030,6 +1050,20 @@ class NetworkScanner:
                 
             gws = netifaces.gateways()
             default_gateway = gws['default'][netifaces.AF_INET][1]
+            if self._is_cellular_uplink(default_gateway):
+                # Wi-Fi/Ethernet are down and the box is online through a
+                # tethered hotspot: scan a non-cellular LAN leg if one still
+                # has an address, otherwise nothing.
+                lan = self._detect_default_interface()
+                if not lan or lan not in netifaces.interfaces() \
+                        or self._is_cellular_uplink(lan) \
+                        or netifaces.AF_INET not in netifaces.ifaddresses(lan):
+                    self.logger.warning(
+                        f"Only the cellular uplink ({default_gateway}) is online — "
+                        "skipping the LAN scan (set cellular_allow_scan to override)")
+                    return None
+                self.arp_scan_interface = lan
+                default_gateway = lan
             iface = netifaces.ifaddresses(default_gateway)[netifaces.AF_INET][0]
             ip_address = iface['addr']
             netmask = iface['netmask']
@@ -1725,7 +1759,13 @@ class NetworkScanner:
             if job and getattr(job, 'ssid', None):
                 job_descriptor = f" for {job.ssid} ({self.arp_scan_interface})"
             self.logger.info(f"Starting Network Scanner{job_descriptor}")
+            if self._is_cellular_uplink(self.arp_scan_interface):
+                self.arp_scan_interface = self._detect_default_interface()
             network = self.get_network()
+            if network is None:
+                self.logger.warning("No scannable LAN network — network scan skipped")
+                self.shared_data.bjornstatustext2 = "No LAN (cellular only)"
+                return
             self.get_gateway_info()
             self.shared_data.bjornstatustext2 = str(network)
             portstart = self.shared_data.portstart

@@ -11,6 +11,9 @@ import socket
 import struct
 import threading
 import logging
+from datetime import datetime, timezone
+
+import gps_assist
 
 logger = logging.getLogger("GPSManager")
 
@@ -94,6 +97,22 @@ def ubx_enable_nmea_frames(save=True):
 def ubx_enable_nmea_sequence(save=True):
     """The same frames as one byte string (drift check against the script)."""
     return b''.join(ubx_enable_nmea_frames(save))
+
+
+def _rmc_epoch(line):
+    """UTC epoch from an RMC sentence's time (field 1) and date (field 9),
+    or None. The RMC regex stops before the date, so split the fields."""
+    try:
+        f = line.split('*')[0].split(',')
+        hms, dmy = f[1], f[9]
+        if len(hms) < 6 or len(dmy) != 6:
+            return None
+        frac = float(hms[6:] or 0) if hms[6:] not in ('', '.') else 0.0
+        return datetime(2000 + int(dmy[4:6]), int(dmy[2:4]), int(dmy[0:2]),
+                        int(hms[0:2]), int(hms[2:4]), int(hms[4:6]),
+                        tzinfo=timezone.utc).timestamp() + frac
+    except (IndexError, ValueError):
+        return None
 
 
 def _nmea_to_decimal(raw, direction):
@@ -278,7 +297,7 @@ class GPSManager:
     """Manages a GPS source (gpsd socket or direct NMEA serial), providing real-time position data."""
 
     def __init__(self, port=None, baudrate=9600, exclude_ports=None,
-                 state_file=None):
+                 state_file=None, assist=True, set_clock=True):
         self.port = port
         self.baudrate = baudrate
         self._exclude_ports = set(exclude_ports or [])
@@ -332,6 +351,29 @@ class GPSManager:
         # Set by update_external_fix(); cleared once a local receiver
         # produces a real fix.
         self._external_source = None
+        # Self-aided start (gps_assist): pre-load last-known position, NTP time
+        # and the receiver's own saved almanac/ephemeris so a battery-less
+        # u-blox cold boot behaves like a warm/hot start. Orbit data lives next
+        # to the last-known position file.
+        self.assist_enabled = bool(assist)
+        self._aid_file = (os.path.join(os.path.dirname(state_file), 'gps_aid.json')
+                          if state_file else None)
+        self._gpsd_device = None
+        self._assist_done = False
+        self._assist_status = None       # {'at', 'items', 'via'} once sent
+        # Set the system clock from GPS time while NTP isn't synced. A Pi has
+        # no RTC: booted away from Wi-Fi it starts at the last saved time, and
+        # every sighting in the session was stamped hours off (seen in the
+        # field: 2 h 38 min). GPS time is exact once there is a fix.
+        self.set_clock = bool(set_clock)
+        self.clock_set = None            # {'at', 'delta'} once the clock was set
+        self._clock_samples = []
+        self._aid_saved = None           # {'at', 'alm', 'eph'} after a save
+        self._aid_next_save = 0.0
+        self._aid_saves = 0              # successful saves this reader run
+        self._aid_busy = False
+        self._ubx_capture = None         # serial path: bytes during a poll
+        self._ubx_capture_until = 0.0
 
     def start(self):
         """Start GPS reading thread."""
@@ -343,6 +385,9 @@ class GPSManager:
         # when a receiver is struggling.
         self.start_time = time.time()
         self.first_fix_time = 0
+        self._assist_done = False
+        self._aid_saves = 0
+        self._aid_next_save = 0.0
 
         if not self.port:
             self.port = detect_gps_device(exclude_ports=self._exclude_ports)
@@ -517,6 +562,165 @@ class GPSManager:
             except Exception as e:
                 logger.debug(f"last-known GPS persist failed: {e}")
 
+    # ── Self-aided start (gps_assist) ──────────────────────────────────────
+    # Wait this long after the reader starts before pre-loading, so a receiver
+    # that is still powered and tracking (service restart mid-drive) reports
+    # its fix first and is left alone.
+    _ASSIST_DELAY_S = 3
+    # Save orbit data soon after the first fix — the receiver already holds
+    # ephemeris for every satellite it fixed with, and people power off or
+    # restart right after seeing "fix". Save again 1 min later, then every
+    # 5 min so a power cut mid-drive leaves fresh ephemeris and a growing
+    # almanac on disk. Timed from the session's FIRST fix, not a continuous
+    # one: the receiver keeps what it decoded when a marginal fix flickers
+    # (a continuous-fix requirement meant repeat saves almost never ran), and
+    # a poll that yields nothing is retried a minute later.
+    _AID_SAVE_AFTER_FIX_S = 5
+    _AID_SAVE_FOLLOWUP_S = 60
+    _AID_SAVE_EVERY_S = 300
+    _AID_CAPTURE_S = 6
+
+    def _assist_tick(self):
+        """Called by both read loops after every message: fires the one-shot
+        pre-load at start and the periodic orbit-data save while fixed."""
+        if not self.assist_enabled or self._external_source:
+            return
+        now = time.time()
+        if self._ubx_capture is not None and now >= self._ubx_capture_until:
+            data, self._ubx_capture = bytes(self._ubx_capture), None
+            self._store_aid(gps_assist.parse_ubx_frames(data), now)
+        if (not self._assist_done and self.last_sentence
+                and now - self.start_time >= self._ASSIST_DELAY_S):
+            self._assist_done = True
+            if not self.has_fix():
+                self._run_bg(self._send_assist)
+        if not self._aid_file:
+            return
+        self.has_fix()                 # stamps first_fix_time on the first fix
+        if (self.first_fix_time
+                and now - self.first_fix_time >= self._AID_SAVE_AFTER_FIX_S
+                and now >= self._aid_next_save
+                and not self._aid_busy and self._ubx_capture is None):
+            self._aid_next_save = now + (self._AID_SAVE_EVERY_S
+                                         if self._aid_saves
+                                         else self._AID_SAVE_FOLLOWUP_S)
+            self._aid_busy = True
+            self._run_bg(self._capture_aid)
+
+    # GPS time must agree with itself over this many fixes before it is
+    # trusted (a receiver can briefly report a bogus epoch right after a
+    # cold start), and must differ from the clock by more than the minimum
+    # step to be worth a clock change.
+    _CLOCK_SAMPLES = 3
+    _CLOCK_MIN_STEP_S = 2.0
+
+    def _maybe_set_clock(self, gps_epoch):
+        """Set the system clock from GPS time, once per reader run, and only
+        while NTP has not synchronized it (NTP stays in charge when present)."""
+        if not self.set_clock or self.clock_set or gps_epoch is None:
+            return
+        if gps_epoch < 1704067200:              # before 2024: not a real time
+            self._clock_samples.clear()
+            return
+        delta = gps_epoch - time.time()
+        if abs(delta) < self._CLOCK_MIN_STEP_S:
+            self.clock_set = {'at': time.time(), 'delta': round(delta, 1), 'changed': False}
+            return
+        if gps_assist.clock_is_synced():
+            return
+        self._clock_samples = (self._clock_samples + [delta])[-self._CLOCK_SAMPLES:]
+        if (len(self._clock_samples) < self._CLOCK_SAMPLES
+                or max(self._clock_samples) - min(self._clock_samples) > 1.0):
+            return
+        step = sorted(self._clock_samples)[self._CLOCK_SAMPLES // 2]
+        try:
+            time.clock_settime(time.CLOCK_REALTIME, time.time() + step)
+        except (OSError, AttributeError) as e:
+            logger.warning(f"GPS clock set failed (needs root/CAP_SYS_TIME): {e}")
+            self.set_clock = False
+            return
+        self.clock_set = {'at': time.time(), 'delta': round(step, 1), 'changed': True}
+        logger.warning(f"System clock was {step:+.1f} s off and not NTP-synced — "
+                       f"set it from GPS time")
+
+    @staticmethod
+    def _run_bg(fn):
+        threading.Thread(target=fn, daemon=True, name="gps-assist").start()
+
+    def _send_assist(self):
+        """Pre-load position/time (+ fresh saved almanac/ephemeris)."""
+        try:
+            store = gps_assist.load_store(self._aid_file) if self._aid_file else {}
+            synced = gps_assist.clock_is_synced()
+            frames, summary = gps_assist.build_assist_frames(
+                self.last_known, time.time(), synced, store)
+            if not frames:
+                logger.info("GPS assist: nothing to pre-load (no last-known "
+                            "position and clock not NTP-synced)")
+                return
+            if self._use_gpsd:
+                if not self._gpsd_device:
+                    logger.info("GPS assist skipped: gpsd did not report a device path")
+                    return
+                via = 'gpsd'
+                ok = gps_assist.gpsd_write(self._gpsd_device, frames)
+            else:
+                via = 'serial'
+                ok = 0
+                for frame in frames:
+                    self._serial.write(frame)
+                    ok += 1
+                    time.sleep(0.05)
+                self._serial.flush()
+            if not synced:
+                summary.append("no time (clock not NTP-synced)")
+            logger.info(f"GPS assist: pre-loaded {', '.join(summary)} via {via} "
+                        f"({ok}/{len(frames)} frames accepted)")
+            self._assist_status = {'at': time.time(), 'items': summary,
+                                   'via': via, 'frames': ok}
+        except Exception as e:
+            logger.warning(f"GPS assist pre-load failed: {e}")
+
+    def _capture_aid(self):
+        """Poll the receiver's almanac/ephemeris/HUI and save it."""
+        try:
+            polls = gps_assist.poll_frames()
+            if self._use_gpsd:
+                if not self._gpsd_device:
+                    return
+                frames = gps_assist.gpsd_capture(self._gpsd_device, polls,
+                                                 seconds=self._AID_CAPTURE_S)
+                self._store_aid(frames, time.time())
+            else:
+                # The read loop owns the port: collect replies there and let
+                # _assist_tick() hand them to _store_aid() when time is up.
+                self._ubx_capture_until = time.time() + self._AID_CAPTURE_S
+                self._ubx_capture = bytearray()
+                for frame in polls:
+                    self._serial.write(frame)
+                    time.sleep(0.05)
+        except Exception as e:
+            logger.debug(f"GPS orbit-data capture failed: {e}")
+        finally:
+            self._aid_busy = False
+
+    def _store_aid(self, frames, now):
+        try:
+            store = gps_assist.load_store(self._aid_file)
+            n_alm, n_eph, hui = gps_assist.update_store(store, frames, now)
+            if not (n_alm or n_eph or hui):
+                logger.debug("GPS orbit-data poll returned nothing usable")
+                return
+            gps_assist.save_store(self._aid_file, store)
+            self._aid_saves += 1
+            # Report what is on disk now (merged), not just this poll.
+            self._aid_saved = {'at': now, 'alm': len(store.get('alm') or {}),
+                               'eph': len(store.get('eph') or {})}
+            logger.info(f"GPS assist: saved almanac {self._aid_saved['alm']} SV, "
+                        f"ephemeris {self._aid_saved['eph']} SV for the next cold start")
+        except Exception as e:
+            logger.debug(f"GPS orbit-data save failed: {e}")
+
     # Talker code -> human constellation name, for the sky view. Shared by the
     # gpsd (SKY) and serial (GSV) paths, both of which key by these codes.
     _TALKER_NAMES = {
@@ -579,6 +783,9 @@ class GPSManager:
                 'last_update': self.last_update,
                 'last_sentence': self.last_sentence,
                 'last_known': self.last_known,
+                'assist': self._assist_status,
+                'clock_set': self.clock_set,
+                'aid_saved': self._aid_saved,
                 'error': self.error
             }
 
@@ -671,8 +878,17 @@ class GPSManager:
                     cls = obj.get('class')
                     if cls == 'TPV':
                         self._parse_tpv(obj)
+                        if obj.get('device'):
+                            self._gpsd_device = obj['device']
                     elif cls == 'SKY':
                         self._parse_sky(obj)
+                    elif cls == 'DEVICES':
+                        devs = obj.get('devices') or []
+                        if devs and devs[0].get('path'):
+                            self._gpsd_device = devs[0]['path']
+                    elif cls == 'DEVICE' and obj.get('path'):
+                        self._gpsd_device = obj['path']
+                    self._assist_tick()
             except Exception as e:
                 if self._running:
                     logger.debug(f"gpsd read error: {e}")
@@ -724,6 +940,12 @@ class GPSManager:
             else:
                 self.fix_quality = 0
             self.last_sentence = now
+        if mode >= 2 and obj.get('time'):
+            try:
+                self._maybe_set_clock(datetime.fromisoformat(
+                    obj['time'].replace('Z', '+00:00')).timestamp())
+            except ValueError:
+                pass
 
     # gpsd gnssid -> NMEA talker code, so the gpsd path keys its per-constellation
     # bookkeeping the same way the direct-NMEA GSV path does (see _parse_nmea).
@@ -798,6 +1020,9 @@ class GPSManager:
                     continue
 
                 raw = self._serial.readline()
+                if self._ubx_capture is not None:
+                    self._ubx_capture += raw
+                self._assist_tick()
                 if not raw:
                     continue
 
@@ -996,6 +1221,7 @@ class GPSManager:
                     self._record_position(now)
                     self.last_sentence = now
                     self._external_source = None
+                self._maybe_set_clock(_rmc_epoch(line))
             else:
                 with self._lock:
                     self.last_sentence = now
