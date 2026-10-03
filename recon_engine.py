@@ -30,7 +30,6 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -266,27 +265,52 @@ class ReconEngine:
         }
 
         try:
-            with ThreadPoolExecutor(max_workers=len(recon_types)) as pool:
-                futures = {
-                    pool.submit(runner_map[rt], target): rt for rt in recon_types if rt in runner_map
-                }
-                for future in as_completed(futures, timeout=timeout):
-                    rt = futures[future]
-                    try:
-                        result = future.result()
-                    except Exception as exc:
-                        import traceback
-                        logger.error(f"Recon runner {rt.value} raised in {scan_id}: {exc}\n{traceback.format_exc()}")
-                        result = ReconResult(
-                            recon_type=rt,
-                            target=target,
-                            status="error",
-                            error_message=str(exc),
-                        )
-                    state.results[rt] = result
-        except TimeoutError:
-            state.error_message = f"engine timeout after {timeout}s"
-            logger.warning(f"Recon scan {scan_id} hit engine timeout")
+            # Direct threads, NOT ThreadPoolExecutor. A recon scan runs on a
+            # background thread and can start after the interpreter begins
+            # shutting down (a service reload, a web worker restart). From that
+            # point on, concurrent.futures permanently refuses new work with
+            # "cannot schedule new futures after interpreter shutdown" - and
+            # the scan silently produces nothing. Plain threads have no such
+            # global gate; this is the same fix orchestrator.py already adopted
+            # for the same reason.
+            results: dict = {}
+            errors: dict = {}
+            lock = threading.Lock()
+            done = threading.Event()
+
+            def _worker(rt):
+                try:
+                    res = runner_map[rt](target)
+                except Exception as exc:
+                    import traceback
+                    logger.error(f"Recon runner {rt.value} raised in {scan_id}: {exc}\n{traceback.format_exc()}")
+                    res = ReconResult(recon_type=rt, target=target,
+                                      status="error", error_message=str(exc))
+                with lock:
+                    results[rt] = res
+                    if len(results) + len(errors) >= len(jobs):
+                        done.set()
+
+            jobs = [rt for rt in recon_types if rt in runner_map]
+            threads = []
+            for rt in jobs:
+                t = threading.Thread(target=_worker, args=(rt,),
+                                     name=f"recon-{scan_id}-{rt.value}",
+                                     daemon=True)
+                t.start()
+                threads.append(t)
+
+            if not done.wait(timeout):
+                state.error_message = f"engine timeout after {timeout}s"
+                logger.warning(f"Recon scan {scan_id} hit engine timeout")
+
+            for rt, res in results.items():
+                state.results[rt] = res
+            for rt, err in errors.items():
+                state.results[rt] = ReconResult(
+                    recon_type=rt, target=target,
+                    status="error", error_message=str(err))
+
         except Exception as exc:
             import traceback
             state.error_message = str(exc)
