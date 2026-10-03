@@ -69,10 +69,25 @@ def _service(shared_data):
     are logged at WARNING: a silent DEBUG here is what makes "AI is
     configured but does nothing" so hard to diagnose.
     """
+    # Memoise the outcome, including failure. Without this every AI panel
+    # request re-runs the whole resolution path - we logged 44
+    # "Failed to initialize AI service" lines in 20 minutes from a single
+    # page's worth of calls.
+    memo = getattr(shared_data, "_ai_insights_memo", None)
+    if memo is not None:
+        return memo.get("svc")
+
+    def _remember(svc):
+        try:
+            shared_data._ai_insights_memo = {"svc": svc}
+        except Exception:
+            pass
+        return svc
+
     try:
         svc = getattr(shared_data, "ai_service", None)
         if svc is not None and _svc_usable(svc):
-            return svc
+            return _remember(svc)
 
         # Retry the app's own initialiser first - it knows the config shape.
         init = getattr(shared_data, "initialize_ai_service", None)
@@ -81,20 +96,20 @@ def _service(shared_data):
                 init()
                 svc = getattr(shared_data, "ai_service", None)
                 if svc is not None and _svc_usable(svc):
-                    return svc
+                    return _remember(svc)
             except Exception as exc:
                 logger.warning("ai_insights: shared init failed: %s", exc)
 
         from ai_service import AIService
         svc = AIService(shared_data)
         if _svc_usable(svc):
-            return svc
+            return _remember(svc)
         logger.warning("ai_insights: AI service present but not enabled "
                        "(check ai_enabled / ai_model / the API token)")
-        return None
+        return _remember(None)
     except Exception as exc:
         logger.warning("ai_insights: no AI service available: %s", exc)
-        return None
+        return _remember(None)
 
 
 def _svc_usable(svc) -> bool:

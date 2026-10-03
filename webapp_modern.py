@@ -86,6 +86,18 @@ auth_mgr = AuthManager(shared_data)
 app = Flask(__name__,
             static_folder='web',
             template_folder='web')
+# Import the AI stack EAGERLY. `openai` lazily pulls in concurrent.futures ->
+# threading, which registers an atexit hook. Imported late (first AI panel
+# request, often while a background scan is mid-cycle) that registration is
+# refused with "can't register atexit after shutdown" and the whole import
+# dies - so a box with a valid token and a working endpoint reports
+# "AI unavailable" everywhere. Importing at startup, while threading is
+# healthy, avoids it entirely.
+try:
+    import ai_service as _ai_service_eager  # noqa: F401
+except Exception as _eager_exc:
+    logger.warning("AI service did not import at startup: %s", _eager_exc)
+
 app.config['SECRET_KEY'] = auth_mgr.get_or_create_secret_key()
 # Cookie name must be unique per device: two Ragnar instances reached through
 # the same hostname (e.g. SSH tunnels on localhost:3000/3001) share one cookie
