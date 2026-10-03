@@ -59,16 +59,50 @@ def _cache_save(data: Dict[str, Any]) -> None:
 
 
 def _service(shared_data):
-    """Return the shared AIService, or None. Never raises."""
+    """Return a working AIService, or None. Never raises.
+
+    Three things have to hold: the shared_data must carry a service (or be
+    able to build one), that service must import cleanly, and it must report
+    itself enabled. SharedData.initialise_ai_service() nulls `ai_service` when
+    the import fails at startup - notably when `openai` is broken - so a
+    None here is the common case and we retry rather than give up. Failures
+    are logged at WARNING: a silent DEBUG here is what makes "AI is
+    configured but does nothing" so hard to diagnose.
+    """
     try:
         svc = getattr(shared_data, "ai_service", None)
-        if svc is not None:
+        if svc is not None and _svc_usable(svc):
             return svc
+
+        # Retry the app's own initialiser first - it knows the config shape.
+        init = getattr(shared_data, "initialize_ai_service", None)
+        if callable(init):
+            try:
+                init()
+                svc = getattr(shared_data, "ai_service", None)
+                if svc is not None and _svc_usable(svc):
+                    return svc
+            except Exception as exc:
+                logger.warning("ai_insights: shared init failed: %s", exc)
+
         from ai_service import AIService
-        return AIService(shared_data)
-    except Exception as exc:
-        logger.debug("ai_insights: no AI service (%s)", exc)
+        svc = AIService(shared_data)
+        if _svc_usable(svc):
+            return svc
+        logger.warning("ai_insights: AI service present but not enabled "
+                       "(check ai_enabled / ai_model / the API token)")
         return None
+    except Exception as exc:
+        logger.warning("ai_insights: no AI service available: %s", exc)
+        return None
+
+
+def _svc_usable(svc) -> bool:
+    """True when the service can actually answer. Never raises."""
+    try:
+        return bool(svc.is_enabled())
+    except Exception:
+        return False
 
 
 def _enabled(shared_data, key: str, default: bool = True) -> bool:
