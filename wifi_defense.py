@@ -175,6 +175,52 @@ def _iface_exists(name):
     return bool(name) and os.path.exists("/sys/class/net/" + name)
 
 
+def _uplink_iface():
+    """Interface carrying the default route — never monitor on this one."""
+    try:
+        with open("/proc/net/route") as fh:
+            for line in fh:
+                parts = line.split()
+                # Destination 00000000 == default route
+                if len(parts) > 1 and parts[1] == "00000000":
+                    return parts[0]
+    except Exception:
+        pass
+    return None
+
+
+def _preferred_monitor_iface():
+    """Best base radio to host the monitor vif.
+
+    Preference order:
+      1. A monitor-capable radio that is NOT carrying the default route.
+         Taking the uplink down is what breaks management access, and it is
+         exactly what happened when ragmon0 was created on the onboard radio
+         while that same radio was the WiFi client.
+      2. Among those, prefer a non-`wlan0` device — a USB dongle is meant to be
+         the dedicated recon radio while the onboard stays a client.
+      3. Last resort: any monitor-capable interface.
+    """
+    devs = _iw_dev_list()
+    uplink = _uplink_iface()
+    mon_name = _mon_name(None)
+    candidates = []
+    for iface, info in devs.items():
+        if iface == mon_name or info.get("type") == "monitor":
+            continue
+        if not _phy_supports_monitor(info.get("phy")):
+            continue
+        candidates.append((iface, info))
+    if not candidates:
+        return None
+    # 1) exclude the uplink radio first
+    free = [c for c in candidates if c[0] != uplink] or candidates
+    # 2) prefer a dedicated (non-onboard) radio
+    dongle = [c for c in free if c[0] != "wlan0"]
+    pick = (dongle or free)[0][0]
+    return pick
+
+
 def _resolve_monitor(interface, auto_enable=True):
     """Return a live monitor interface name for `interface`, or {"error": ...}.
 
@@ -199,6 +245,12 @@ def _resolve_monitor(interface, auto_enable=True):
         _save_state({})
     if not auto_enable:
         return {"error": "monitor mode not enabled"}
+    # No usable interface named? Pick one ourselves, preferring a radio that is
+    # not carrying the uplink so enabling monitor never severs management.
+    if not interface or not _iface_exists(interface):
+        interface = _preferred_monitor_iface()
+        if not interface:
+            return {"error": "no monitor-capable wireless interface found"}
     res = enable_monitor(interface)
     if "error" in res:
         return res
@@ -232,6 +284,7 @@ def list_monitor_capable():
     if active and not _iface_exists(active):
         active = None
     return {"interfaces": out, "active_monitor": active,
+            "preferred_adapter": _preferred_monitor_iface(),
             "base_iface": state.get("base_iface"),
             "mode": state.get("mode") if active else None,
             "dedicated": state.get("mode") == "dedicated" and active is not None,
@@ -308,6 +361,19 @@ def enable_monitor(iface):
     phy = _phy_for_iface(iface)
     if not _phy_supports_monitor(phy):
         return {"error": f"{iface}'s radio ({phy}) does not support monitor mode"}
+    # Refuse to monitor on the radio carrying the default route unless there is
+    # no alternative: enable_monitor downs the base interface, so doing this to
+    # the uplink severs management access. Prefer a USB dongle instead.
+    uplink = _uplink_iface()
+    if uplink and iface == uplink:
+        alt = _preferred_monitor_iface()
+        if alt and alt != iface:
+            iface = alt
+            phy = _phy_for_iface(iface)
+        else:
+            return {"error": f"'{iface}' is the uplink radio (default route) - "
+                             f"monitoring on it will cut your network access. "
+                             f"Plug in a USB WiFi adapter or pick another interface."}
     _run(["/usr/bin/rfkill", "unblock", "all"], timeout=5)
     mon = _mon_name(iface)
 
