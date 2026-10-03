@@ -164,6 +164,65 @@ class _NullEPDHelper:
         return lambda *args, **kwargs: None
 
 
+
+# --------------------------------------------------------------------------
+# nl80211-aware WiFi state
+# --------------------------------------------------------------------------
+# `iwgetid`/`iwconfig` speak the old Wireless Extensions. Several modern
+# drivers - the Allwinner aicwf_sdio onboard radio among them - implement
+# only nl80211, so those tools exit 255 and every check reports "not
+# connected" against a live association. wpa_cli and iw use nl80211.
+
+def nl80211_ssids():
+    """Return {iface: ssid} for every associated station interface."""
+    out = {}
+    try:
+        import os as _os
+        ifaces = [n for n in sorted(_os.listdir("/sys/class/net"))
+                  if n.startswith(("wlan", "wlx", "wlp", "wls"))]
+    except Exception:
+        ifaces = []
+    for iface in ifaces:
+        ssid = ""
+        try:
+            r = subprocess.run(["wpa_cli", "-i", iface, "status"],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                state = ""
+                for line in (r.stdout or "").splitlines():
+                    if line.startswith("ssid="):
+                        ssid = line.split("=", 1)[1].strip()
+                    elif line.startswith("wpa_state="):
+                        state = line.split("=", 1)[1].strip()
+                if state and state != "COMPLETED":
+                    ssid = ""
+        except Exception:
+            pass
+        if not ssid:
+            try:
+                r = subprocess.run(["iw", "dev", iface, "link"],
+                                   capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    for line in (r.stdout or "").splitlines():
+                        if line.strip().startswith("SSID:"):
+                            ssid = line.split(":", 1)[1].strip()
+                            break
+            except Exception:
+                pass
+        if ssid:
+            out[iface] = ssid
+    return out
+
+
+def nl80211_any_connected():
+    return bool(nl80211_ssids())
+
+
+def nl80211_current_ssid():
+    for iface in sorted(nl80211_ssids()):
+        return nl80211_ssids()[iface]
+    return ""
+
 class Display:
     def __init__(self, shared_data):
         """Initialize the display and start the main image and shared data update threads."""
@@ -524,6 +583,12 @@ class Display:
     def is_wifi_connected(self):
         """Check if WiFi is connected by checking the current SSID and network connectivity."""
         try:
+            # Method 0: nl80211 (wpa_cli / iw) first. iwgetid is WEXT-only and
+            # exits 255 on drivers like the Allwinner aicwf_sdio onboard radio.
+            if nl80211_any_connected():
+                logger.debug(f"WiFi connected via nl80211: {nl80211_ssids()}")
+                return True
+
             # Method 1: Try iwgetid first
             result = subprocess.Popen(['iwgetid', '-r'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             ssid, error = result.communicate()

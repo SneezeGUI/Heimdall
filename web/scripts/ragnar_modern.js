@@ -18264,7 +18264,7 @@ async function setMultiInterfaceMode(mode, button) {
     }
     try {
         await postAPI('/api/wifi/scan-control/mode', { mode });
-        addConsoleMessage(mode === 'multi' ? 'Single focus mode enabled' : 'All adapters mode enabled', 'info');
+        addConsoleMessage(mode === 'multi' ? 'All adapters mode enabled' : 'Single focus mode enabled', 'info');
         await refreshWifiStatus();
     } catch (error) {
         console.error('Unable to update scan mode:', error);

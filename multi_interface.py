@@ -275,12 +275,14 @@ class MultiInterfaceState:
                 if not global_enabled:
                     entry['scan_enabled'] = False
                     entry['reason'] = 'global_disabled'
-                elif not entry['connected_ssid']:
-                    entry['scan_enabled'] = False
-                    entry['reason'] = 'no_ssid'
                 elif not entry['connected']:
                     entry['scan_enabled'] = False
                     entry['reason'] = 'disconnected'
+                # A missing SSID is NOT a reason to skip a radio. An
+                # unassociated (or monitor-mode) adapter is exactly what a
+                # recon sweep wants - it can listen without holding an AP.
+                elif not entry['connected_ssid']:
+                    entry['reason'] = 'unassociated'
 
                 new_state[name] = entry
 
@@ -295,10 +297,20 @@ class MultiInterfaceState:
         more reliable than WiFi for local-network scanning).  WiFi interfaces
         fill the remaining slots up to *max_interfaces*.
         """
-        max_interfaces = max(1, int(self.shared_data.config.get('wifi_multi_scan_max_interfaces', 2)))
         if not self.is_multi_mode_enabled():
             logger.info("[MULTI-SCAN] get_scan_jobs: multi mode not enabled, returning empty")
             return []
+
+        # In "all adapters" mode the cap must not silently throttle us to two
+        # radios - that is exactly what made "All adapters" behave like "one
+        # adapter". Honour the config when explicitly set; otherwise use every
+        # adapter we have.
+        configured = self.shared_data.config.get('wifi_multi_scan_max_interfaces')
+        try:
+            max_interfaces = int(configured) if configured else 10 ** 6
+        except (TypeError, ValueError):
+            max_interfaces = 10 ** 6
+        max_interfaces = max(1, max_interfaces)
 
         prefer_ethernet = self.shared_data.config.get('ethernet_prefer_over_wifi', True)
         ethernet_scan_enabled = self.shared_data.config.get('ethernet_scan_enabled', True)
@@ -335,13 +347,17 @@ class MultiInterfaceState:
                     break
                 if not entry.get('scan_enabled'):
                     continue
-                if not entry.get('connected') or not entry.get('connected_ssid'):
+                # A radio does NOT need to be associated to scan - refusing
+                # unassociated adapters is why the monitor dongle never got a
+                # job. Only require a live interface.
+                if not entry.get('connected'):
                     continue
-                logger.info(f"[MULTI-SCAN] Adding wifi job: {entry.get('name')} -> {entry.get('connected_ssid')}")
+                ssid = entry.get('connected_ssid') or '(unassociated)'
+                logger.info(f"[MULTI-SCAN] Adding wifi job: {entry.get('name')} -> {ssid}")
                 jobs.append(
                     ScanJob(
                         interface=entry['name'],
-                        ssid=entry['connected_ssid'],
+                        ssid=ssid,
                         role=entry['role'],
                         ip_address=entry.get('ip_address'),
                         cidr=entry.get('cidr'),

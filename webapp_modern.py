@@ -9141,19 +9141,47 @@ def get_current_wifi_ssid():
                 _wifi_ssid_cache['timestamp'] = current_timestamp
                 return sanitized
         
-        # Fallback to direct system command
-        result = subprocess.run(['nmcli', '-t', '-f', 'ACTIVE,SSID', 'dev', 'wifi'], 
-                              capture_output=True, text=True, timeout=10)
-        if result.returncode == 0:
-            for line in result.stdout.strip().split('\n'):
-                if line.startswith('yes:'):
-                    ssid = line.split(':', 1)[1]
-                    if ssid:
-                        # Sanitize SSID for filename
-                        sanitized = re.sub(r'[^\w\-_]', '_', ssid)
-                        _wifi_ssid_cache['ssid'] = sanitized
-                        _wifi_ssid_cache['timestamp'] = current_timestamp
-                        return sanitized
+        # Fallback to a system command. DietPi uses ifupdown + wpa_supplicant
+        # and has no NetworkManager, so try `iwgetid` first and only fall back
+        # to `nmcli` if that exists. Otherwise every cycle logs "nmcli: command
+        # not found" on DietPi.
+        # nl80211-aware lookup first: iwgetid is WEXT-only and returns nothing
+        # on drivers such as the Allwinner aicwf_sdio onboard radio.
+        try:
+            from wifi_manager import nl80211_current_ssid
+            _nl = nl80211_current_ssid()
+            if _nl:
+                sanitized = re.sub(r'[^\w\-_]', '_', _nl)
+                _wifi_ssid_cache['ssid'] = sanitized
+                _wifi_ssid_cache['timestamp'] = current_timestamp
+                return sanitized
+        except Exception:
+            pass
+
+        for cmd in (['iwgetid', '-r'],
+                    ['nmcli', '-t', '-f', 'ACTIVE,SSID', 'dev', 'wifi']):
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            except FileNotFoundError:
+                continue                       # tool not installed - try next
+            except Exception:
+                continue
+            if result.returncode != 0:
+                continue
+            ssid = ""
+            out = result.stdout.strip()
+            if cmd[0] == "iwgetid":
+                ssid = out.splitlines()[0].strip() if out else ""
+            else:
+                for line in out.split('\n'):
+                    if line.startswith('yes:'):
+                        ssid = line.split(':', 1)[1]
+                        break
+            if ssid:
+                sanitized = re.sub(r'[^\w\-_]', '_', ssid)
+                _wifi_ssid_cache['ssid'] = sanitized
+                _wifi_ssid_cache['timestamp'] = current_timestamp
+                return sanitized
         
         # Cache the default value too
         _wifi_ssid_cache['ssid'] = "unknown_network"
