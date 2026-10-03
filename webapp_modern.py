@@ -28085,21 +28085,37 @@ def zap_detect_auth():
             detail = f'redirects to an identity provider ({idp_hits[0]})'
             evidence.append(f'final URL: {final_url[:100]}')
 
-        # 3) Login form -> form-based.
+        # 3) Login form -> form-based. A redirect to a login URL is just as
+        #    strong a signal as a literal <form> and is the common case for
+        #    SPAs that render the form client-side (302 -> /login.html).
         if auth_type == 'none':
             low = body.lower()
-            has_form = '<form' in low and ('type="password"' in low or "type='password'" in low)
-            has_login_action = any(k in low for k in
-                                   ('action="/login', 'action="/signin', 'action="/auth',
-                                    'action="/account/login', 'action="/session', 'id="password"'))
-            if has_form:
+            path_hint = final_url.lower().split('?')[0].rstrip('/')
+            login_paths = ('/login', '/signin', '/sign-in', '/log-in',
+                           '/auth', '/account/login', '/session', '/users/sign_in',
+                           '/wp-login', '/administrator')
+            if any(path_hint.endswith(k) or (k + '.') in path_hint for k in login_paths):
                 auth_type = 'form'
-                detail = 'HTML login form with a password field'
-                evidence.append('found <form> + password input')
-            elif has_login_action:
-                auth_type = 'form'
-                detail = 'login form action detected'
-                evidence.append('login-form action attribute')
+                detail = f'redirected to a login URL ({path_hint[-40:]})'
+                evidence.append(f'login URL: {path_hint[-60:]}')
+            else:
+                has_form = '<form' in low and ('type="password"' in low or "type='password'" in low)
+                has_login_action = any(k in low for k in
+                                       ('action="/login', 'action="/signin', 'action="/auth',
+                                        'action="/account/login', 'action="/session', 'id="password"'))
+                if has_form:
+                    auth_type = 'form'
+                    detail = 'HTML login form with a password field'
+                    evidence.append('found <form> + password input')
+                elif has_login_action:
+                    auth_type = 'form'
+                    detail = 'login form action detected'
+                    evidence.append('login-form action attribute')
+                elif any(k in low for k in ('sign in', 'signin', 'log in', 'username',
+                                             'password', 'authenticate')):
+                    auth_type = 'form'
+                    detail = 'login page copy present (likely form or JS-rendered login)'
+                    evidence.append('login page wording in body')
 
         # 4) Token endpoint / API-style -> client credentials.
         if auth_type == 'none':
