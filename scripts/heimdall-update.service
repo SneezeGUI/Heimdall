@@ -1,0 +1,14 @@
+[Unit]
+Description=Heimdall self-update - pull SneezeGUI/Heimdall and restart on change
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/ragnar/heimdall-tools/heimdall-update.sh
+Nice=10
+IOSchedulingClass=idle
+# Never take the box down over an update.
+OOMScoreAdjust=500
+MemoryMax=120M
+TimeoutStartSec=10min

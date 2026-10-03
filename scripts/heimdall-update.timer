@@ -1,0 +1,12 @@
+[Unit]
+Description=Run heimdall-update periodically
+
+[Timer]
+# Off-minute on purpose - avoids the :00/:30 stampede on a shared network.
+OnBootSec=5min
+OnUnitActiveSec=6h
+RandomizedDelaySec=3min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
