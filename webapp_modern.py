@@ -28224,11 +28224,23 @@ def _tool_status(name: str) -> Dict:
             path = found
             break
     if meta["kind"] == "zap" and not path:
+        # ZAP extracts to a versioned directory (/opt/ZAP_2.17.0/zap.sh), so a
+        # fixed path list misses it every time they tag a release. Glob the
+        # usual roots instead.
         for cand in ("/opt/zaproxy/zap.sh", "/usr/share/zaproxy/zap.sh",
                      "/opt/zap/zap.sh"):
             if os.path.exists(cand):
                 path = cand
                 break
+        if not path:
+            for root in ("/opt", "/usr/share", "/usr/local"):
+                try:
+                    hits = sorted(Path(root).glob("ZAP*/zap.sh"))
+                    if hits:
+                        path = str(hits[0])
+                        break
+                except Exception:
+                    pass
     return {"name": name, "label": meta["label"], "kind": meta["kind"],
             "installed": bool(path), "path": path}
 
