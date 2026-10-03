@@ -36,10 +36,15 @@ class EPDHelper:
             epd_module = importlib.import_module(epd_module_name)
             return epd_module.EPD()
         except ImportError as e:
-            logger.error(f"EPD module {self.epd_type} not found: {e}")
+            # Probe, not error - see note on the generic handler below.
+            logger.debug(f"EPD module {self.epd_type} not found: {e}")
             raise
         except Exception as e:
-            logger.error(f"Error loading EPD module {self.epd_type}: {e}")
+            # A failed driver load is a *probe*, not an error: auto-detect walks
+            # every known EPD type and would otherwise spam ERROR for each one.
+            # Callers that care (shared.py) log a warning when a configured
+            # driver fails and they fall back to auto-detect.
+            logger.debug(f"EPD module {self.epd_type} unavailable: {e}")
             raise
 
     def init_full_update(self):
