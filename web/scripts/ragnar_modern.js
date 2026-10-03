@@ -553,6 +553,19 @@ const configMetadata = {
         label: "OpenAI API Token",
         description: "Your OpenAI API key for AI-powered features. Keep this confidential."
     },
+    ai_creds_enabled: {
+        label: "AI-Assisted Credentials",
+        description: "Ask the AI for ranked (user, password) pairs before the wordlist spray. Uses the AI settings above — no second endpoint needed. Fail-open to the wordlist if AI is off."
+    },
+    ai_creds_max_pairs: {
+        label: "AI Credential Pairs (max)",
+        description: "Maximum ranked pairs per host/service (1-50). Default: 25."
+    },
+    ai_creds_model: {
+        label: "AI Creds — model override",
+        description: "Optional. Blank = use the main AI model. Set a cheaper model (e.g. mimo-v2.6-flash) to save tokens."
+    },
+
     exploit_enabled: {
         label: "Enable Exploit Engine",
         description: "Turn CVE findings into scoped exploit attempts. OFF by default — exploitation can crash services and is only legal against systems you own or are authorized to test. USE AT YOUR OWN RISK."
@@ -23983,10 +23996,11 @@ function displayConfigForm(config) {
         'Network': ['network_max_failed_pings'],
         'Timing': ['startup_delay', 'web_delay', 'screen_delay', 'scan_interval'],
         'Display': ['epd_type', 'screen_reversed', 'spi_clock_mhz', 'gc9a01_mascot_color', 'ssd1306_i2c_address', 'lcd1602_i2c_address', 'max7219_spi_port', 'max7219_spi_device', 'max7219_block_orientation', 'display_brightness'],
-        'Exploits': ['notify_on_exploit', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'exploit_allowlist', 'exploit_min_cvss', 'exploit_max_per_host', 'exploit_ai_triage', 'exploit_ai_model', 'exploit_nuclei_concurrency', 'exploit_nuclei_broad', 'exploit_nuclei_severity', 'exploit_nuclei_timeout']
+        'Exploits': ['notify_on_exploit', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'exploit_allowlist', 'exploit_min_cvss', 'exploit_max_per_host', 'exploit_ai_triage', 'exploit_ai_model', 'exploit_nuclei_concurrency', 'exploit_nuclei_broad', 'exploit_nuclei_severity', 'exploit_nuclei_timeout'],
+        'AI Credentials': ['ai_creds_enabled', 'ai_creds_max_pairs', 'ai_creds_model']
     };
-    
-    const knownBooleans = ['notify_on_exploit', 'exploit_nuclei_broad', 'exploit_ai_triage', 'manual_mode', 'debug_mode', 'scan_vuln_running', 'scan_vuln_no_ports', 'enable_attacks', 'blacklistcheck', 'wardriving_enabled', 'wardriving_display', 'wardriving_auto_export', 'wardriving_wigle_include_zigbee', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'exploit_ai_triage'];
+
+    const knownBooleans = ['notify_on_exploit', 'exploit_nuclei_broad', 'exploit_ai_triage', 'manual_mode', 'debug_mode', 'scan_vuln_running', 'scan_vuln_no_ports', 'enable_attacks', 'blacklistcheck', 'wardriving_enabled', 'wardriving_display', 'wardriving_auto_export', 'wardriving_wigle_include_zigbee', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'ai_creds_enabled'];
     const alwaysShowKeys = new Set(['network_max_failed_pings', 'gc9a01_mascot_color', 'ssd1306_i2c_address', 'lcd1602_i2c_address', 'spi_clock_mhz', 'max7219_spi_port', 'max7219_spi_device', 'max7219_block_orientation', 'display_brightness', 'wardriving_scan_interval', 'wardriving_gps_port', 'wardriving_gps_baudrate']);
     const fallbackValues = {
         network_max_failed_pings: 15,
