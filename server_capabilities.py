@@ -137,6 +137,13 @@ class ServerCapabilities:
         'sqlmap': {'package': 'sqlmap', 'critical': False},
         'hydra': {'package': 'hydra', 'critical': False},
         'whatweb': {'package': 'whatweb', 'critical': False},
+        # zap and ffuf were absent from this registry entirely, so
+        # _check_tool_availability never probed for them and
+        # available_tools['zap'] stayed None. zap_enabled then evaluated its
+        # RAM floor against a missing key and came out False - which the UI
+        # surfaces as "needs 8 GB of RAM" on a 12 GB board with ZAP installed.
+        'zap': {'package': 'zaproxy', 'critical': False},
+        'ffuf': {'package': 'ffuf', 'critical': False},
     }
     
     def __init__(self, shared_data=None):
