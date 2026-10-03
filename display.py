@@ -525,7 +525,7 @@ class Display:
                 # Check WiFi connectivity with detailed logging
                 wifi_connected = self.is_wifi_connected()
                 self.shared_data.wifi_connected = wifi_connected
-                logger.info(f"[DISPLAY] WiFi status check: connected={wifi_connected}")
+                logger.debug(f"[DISPLAY] WiFi status check: connected={wifi_connected}")
 
                 signal_dbm, signal_quality = self.get_wifi_signal_strength() if wifi_connected else (None, None)
                 self.shared_data.wifi_signal_dbm = signal_dbm
@@ -540,7 +540,14 @@ class Display:
                 # Update Wi-Fi/AP status text for display
                 wifi_status_text = self.get_wifi_status_text()
                 self.shared_data.ragnarstatustext2 = wifi_status_text
-                logger.info(f"[DISPLAY] WiFi status text: '{wifi_status_text}'")
+                # Per-tick: the display loop re-renders every few seconds.
+                # Only surface a change at INFO.
+                prev = getattr(self, "_last_wifi_status_text", None)
+                if wifi_status_text != prev:
+                    self._last_wifi_status_text = wifi_status_text
+                    logger.info(f"[DISPLAY] WiFi status text: '{wifi_status_text}'")
+                else:
+                    logger.debug(f"[DISPLAY] WiFi status text: '{wifi_status_text}'")
                 
                 self.get_open_files()
 
@@ -586,21 +593,21 @@ class Display:
             # Method 0: nl80211 (wpa_cli / iw) first. iwgetid is WEXT-only and
             # exits 255 on drivers like the Allwinner aicwf_sdio onboard radio.
             if nl80211_any_connected():
-                logger.debug(f"WiFi connected via nl80211: {nl80211_ssids()}")
+                self._log_wifi_state(True, "nl80211", nl80211_ssids())
                 return True
 
             # Method 1: Try iwgetid first
             result = subprocess.Popen(['iwgetid', '-r'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             ssid, error = result.communicate()
             if result.returncode == 0 and ssid.strip():
-                logger.debug(f"WiFi connected via iwgetid: SSID={ssid.strip()}")
+                self._log_wifi_state(True, "iwgetid", ssid.strip())
                 return True
-            
+
             # Method 2: Check if we have an active network interface with IP
             result = subprocess.Popen(['ip', 'route', 'get', '8.8.8.8'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             route_output, error = result.communicate()
             if result.returncode == 0 and 'via' in route_output:
-                logger.debug(f"WiFi connected via ip route check")
+                self._log_wifi_state(True, "ip route", "")
                 return True
             
             # Method 3: Check for wlan interface with IP
@@ -613,12 +620,30 @@ class Display:
                         logger.debug(f"WiFi connected via interface check")
                         return True
             
-            logger.debug(f"WiFi not detected by any method")
+            self._log_wifi_state(False, "none", "")
             return False
-            
+
         except Exception as e:
             logger.error(f"Error checking WiFi status: {e}")
             return False
+
+    _wifi_state_cache = {"last": None}
+
+    def _log_wifi_state(self, connected, method, detail):
+        """Log the WiFi state only when it CHANGES.
+
+        The display refresh loop calls is_wifi_connected() every few seconds.
+        Logging each pass produced four identical lines every 5s - hundreds of
+        lines an hour of pure noise. Now it logs on transitions only.
+        """
+        state = (connected, method, str(detail))
+        if state == Display._wifi_state_cache["last"]:
+            return
+        Display._wifi_state_cache["last"] = state
+        if connected:
+            logger.info(f"[DISPLAY] WiFi connected via {method}: {detail}")
+        else:
+            logger.info("[DISPLAY] WiFi not connected")
 
     def _dbm_to_quality(self, signal_dbm):
         """Convert RSSI (dBm) to an approximate 0-100 quality percentage."""
