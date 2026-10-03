@@ -26,13 +26,15 @@ if [ ! -d .git ]; then
 fi
 
 # Refuse to touch a tree with *tracked* local edits - someone is working here.
-# Untracked runtime data (data/exploits/, data/networks/, .nuclei-config/) and
-# files marked skip-worktree (config/actions.json, web/screen.png) are the app's
-# own output and must never block an update.
-if [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null | grep -v '^ M$' )" ] \
-   && [ -n "$(git diff --name-only 2>/dev/null)" ]; then
+# Untracked runtime data and skip-worktree files are the app's own output and
+# must never block an update. `git diff --name-only` is the only reliable
+# signal: upstream ships a file literally named "-" (PR #812), and a
+# porcelain-status grep choked on it, leaving a bare "-" and silently blocking
+# every subsequent update.
+DIRTY=$(git diff --name-only 2>/dev/null)
+if [ -n "$DIRTY" ]; then
     log "tracked files modified - not pulling. Resolve or stash first:"
-    git diff --name-only 2>/dev/null | sed 's/^/    /' >> "$LOG"
+    printf '%s\n' "$DIRTY" | sed 's/^/    /' >> "$LOG"
     exit 0
 fi
 
