@@ -10,7 +10,6 @@ import csv  # Only used for optional display functionality
 import traceback
 import tempfile
 import shutil
-from concurrent.futures import ThreadPoolExecutor
 try:
     import pandas as pd
 except ImportError:
@@ -1287,18 +1286,36 @@ class NetworkScanner:
             
             initial_open_count = len(self.open_ports[self.target])
             
-            with ThreadPoolExecutor(max_workers=min(4, self.outer_instance.port_scan_workers)) as executor:
-                futures = [executor.submit(self._scan_port_socket, port) for port in ports_to_scan]
-                completed_scans = 0
-                failed_scans = 0
-                
-                for future in futures:
-                    try:
-                        future.result(timeout=5)  # 5 second timeout per port
+            # Direct threads, not ThreadPoolExecutor. concurrent.futures sets a
+            # global "no more work" flag when the interpreter begins shutting down,
+            # after which every submit() raises "cannot schedule new futures after
+            # interpreter shutdown" - a background scan then silently produces
+            # nothing. Plain threads have no such gate.
+            completed_scans = 0
+            failed_scans = 0
+            _scan_lock = threading.Lock()
+            max_workers = min(4, self.outer_instance.port_scan_workers)
+
+            def _one(port):
+                nonlocal completed_scans, failed_scans
+                try:
+                    self._scan_port_socket(port)
+                    with _scan_lock:
                         completed_scans += 1
-                    except Exception as e:
+                except Exception as e:
+                    with _scan_lock:
                         failed_scans += 1
-                        self.logger.debug(f"Socket scan future failed: {e}")
+                    self.logger.debug(f"Socket scan worker failed: {e}")
+
+            threads = []
+            for port in ports_to_scan:
+                while sum(1 for t in threads if t.is_alive()) >= max_workers:
+                    time.sleep(0.01)
+                t = threading.Thread(target=_one, args=(port,), daemon=True)
+                t.start()
+                threads.append(t)
+            for t in threads:
+                t.join(timeout=5)   # 5 second timeout per port
             
             fallback_duration = time.time() - fallback_start_time
             final_open_count = len(self.open_ports[self.target])

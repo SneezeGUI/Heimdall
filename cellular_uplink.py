@@ -57,8 +57,8 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(REPO_DIR, 'config', 'shared_config.json')
@@ -433,11 +433,40 @@ def probe(ifaces, targets, gateways=None):
             jobs.append((iface, ip, port))
         out[iface] = entry
     if jobs:
-        with ThreadPoolExecutor(max_workers=min(12, len(jobs))) as ex:
-            for (iface, _, _), res in zip(jobs, ex.map(lambda j: _probe_one(*j), jobs)):
-                out[iface]['results'].append(res)
-                out[iface]['total'] += 1
-                out[iface]['ok'] += int(res['ok'])
+        # Direct threads, not ThreadPoolExecutor. concurrent.futures sets a
+        # global "no more work" flag when the interpreter begins shutting down,
+        # after which every submit() raises "cannot schedule new futures after
+        # interpreter shutdown" - a background scan then silently produces
+        # nothing. Plain threads have no such gate.
+        # Preserve input order like ex.map did, but on plain threads.
+        results = [None] * len(jobs)
+        lock = threading.Lock()
+        max_workers = min(12, len(jobs))
+
+        def _one(idx, job):
+            try:
+                results[idx] = _probe_one(*job)
+            except Exception:
+                results[idx] = {'ok': 0, 'error': 'probe failed'}
+            with lock:
+                pass
+
+        threads = []
+        for i, job in enumerate(jobs):
+            while sum(1 for t in threads if t.is_alive()) >= max_workers:
+                time.sleep(0.01)
+            t = threading.Thread(target=_one, args=(i, job), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+
+        for (iface, _, _), res in zip(jobs, results):
+            if res is None:
+                continue
+            out[iface]['results'].append(res)
+            out[iface]['total'] += 1
+            out[iface]['ok'] += int(res['ok'])
     return out
 
 

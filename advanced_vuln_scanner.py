@@ -33,7 +33,6 @@ from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
-from concurrent.futures import ThreadPoolExecutor, as_completed  # kept for _run_full_scan only
 from queue import Queue, Empty
 
 from logger import Logger
@@ -2770,19 +2769,32 @@ class AdvancedVulnScanner:
         if not host:
             return target
 
-        import concurrent.futures
+        # Direct threads, not ThreadPoolExecutor - see the note in recon_engine.
+        import threading as _thr
+        import time as _t
         found = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(self._WEB_PROBE_PORTS)) as ex:
-            futs = {ex.submit(self._probe_web_port, host, p): p
-                    for p in self._WEB_PROBE_PORTS}
-            for fut in concurrent.futures.as_completed(futs, timeout=6):
-                p = futs[fut]
-                try:
-                    ok, scheme = fut.result()
-                except Exception:
-                    ok, scheme = False, ""
+        _found_lock = _thr.Lock()
+        _done = _thr.Event()
+
+        def _one(p):
+            try:
+                ok, scheme = self._probe_web_port(host, p)
+            except Exception:
+                ok, scheme = False, ""
+            with _found_lock:
                 if ok:
                     found[p] = scheme
+            _pending.discard(p)
+            if not _pending:
+                _done.set()
+
+        _pending = set(self._WEB_PROBE_PORTS)
+        _probe_threads = []
+        for p in self._WEB_PROBE_PORTS:
+            t = _thr.Thread(target=_one, args=(p,), daemon=True)
+            t.start()
+            _probe_threads.append(t)
+        _done.wait(6)
         if not found:
             return target  # nothing listening — let validation explain
 

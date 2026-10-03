@@ -10824,13 +10824,32 @@ def do_cert_watch(targets='', interface=None, seconds=8, discover=False, learn=T
                 'discovered': discovered_n, 'discover_error': disc_err,
                 'advisories': [], 'interface': interface}
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    # Direct threads, not ThreadPoolExecutor. concurrent.futures refuses all
+    # new work once the interpreter starts shutting down ("cannot schedule new
+    # futures after interpreter shutdown"), which silently zeroes this sweep
+    # when it runs on a background thread during a reload.
+    import threading as _thr
     results = []
-    with ThreadPoolExecutor(max_workers=min(_TLS_POOL, len(order))) as ex:
-        futs = [ex.submit(_tls_check_target, h, p, sni_of[(h, p)], now)
-                for (h, p) in order]
-        for fut in as_completed(futs):
-            results.append(fut.result())
+    _res_lock = _thr.Lock()
+
+    def _one(h, p):
+        try:
+            r = _tls_check_target(h, p, sni_of[(h, p)], now)
+        except Exception as exc:
+            r = {'target': f'{h}:{p}', 'ok': False, 'error': str(exc),
+                 'reasons': [str(exc)]}
+        with _res_lock:
+            results.append(r)
+
+    _tls_threads = []
+    for h, p in order:
+        while sum(1 for t in _tls_threads if t.is_alive()) >= min(_TLS_POOL, len(order)):
+            __import__('time').sleep(0.01)
+        t = _thr.Thread(target=_one, args=(h, p), daemon=True)
+        t.start()
+        _tls_threads.append(t)
+    for t in _tls_threads:
+        t.join(timeout=20)
 
     # Fingerprint baseline: flag changed certs, then learn.
     with _cert_watch_lock:

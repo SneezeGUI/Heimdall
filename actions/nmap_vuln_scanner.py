@@ -37,10 +37,11 @@ if parent_dir not in sys.path:
 import re
 import json
 import subprocess
+import threading
+import time
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
 from rich.progress import Progress, BarColumn, TextColumn
 
@@ -1049,23 +1050,41 @@ if __name__ == "__main__":
             console=Console()
         ) as progress:
             task = progress.add_task("Scanning vulnerabilities...", total=len(alive_hosts))
-            futures = []
-            with ThreadPoolExecutor(max_workers=2) as executor:  # Adjust the number of workers for RPi Zero
-                for host in alive_hosts:
-                    # Convert database format to legacy row format
-                    row = {
-                        "IPs": host.get("ip", ""),
-                        "Hostnames": host.get("hostname", ""),
-                        "MAC Address": host.get("mac", ""),
-                        "Ports": host.get("ports", ""),
-                        "Alive": "1"
-                    }
-                    ip = row["IPs"]
-                    if ip:
-                        futures.append(executor.submit(nmap_vuln_scanner.execute, ip, row, b_status))
+            # Direct threads, not ThreadPoolExecutor. concurrent.futures sets a
+            # global "no more work" flag when the interpreter begins shutting down,
+            # after which every submit() raises "cannot schedule new futures after
+            # interpreter shutdown" - a background scan then silently produces
+            # nothing. Plain threads have no such gate.
+            # Two workers, tuned for a Pi Zero-class board.
+            _jobs = []
+            for host in alive_hosts:
+                # Convert database format to legacy row format
+                row = {
+                    "IPs": host.get("ip", ""),
+                    "Hostnames": host.get("hostname", ""),
+                    "MAC Address": host.get("mac", ""),
+                    "Ports": host.get("ports", ""),
+                    "Alive": "1"
+                }
+                ip = row["IPs"]
+                if ip:
+                    _jobs.append((ip, row))
 
-                for future in as_completed(futures):
+            def _one(ip, row):
+                try:
+                    nmap_vuln_scanner.execute(ip, row, b_status)
+                finally:
                     progress.update(task, advance=1)
+
+            threads = []
+            for ip, row in _jobs:
+                while sum(1 for t in threads if t.is_alive()) >= 2:
+                    time.sleep(0.05)
+                t = threading.Thread(target=_one, args=(ip, row), daemon=True)
+                t.start()
+                threads.append(t)
+            for t in threads:
+                t.join()
 
         # Log summary (data is in SQLite database)
         nmap_vuln_scanner.save_summary()
