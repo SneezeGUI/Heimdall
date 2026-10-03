@@ -16,6 +16,7 @@ always shown alongside the AI wording.
 from __future__ import annotations
 
 import json
+import re
 import logging
 import time
 from pathlib import Path
@@ -385,3 +386,150 @@ def trend_for(current: List[Dict[str, Any]],
         "stable": len(stable),
         "checked": len(cur),
     }
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 (1): natural-language Q&A over findings
+# ---------------------------------------------------------------------------
+
+_ASK_SYSTEM = (
+    "You are a security analyst answering a homelab operator's question about "
+    "their network. Answer ONLY from the supplied findings and statistics. "
+    "Be specific - name hosts, CVEs, ports. If the data does not answer the "
+    "question, say so plainly and say what scan would. Maximum 120 words. "
+    "No markdown headers, no bullet lists unless the question is a list."
+)
+
+
+def answer_for(question: str, findings: List[Dict[str, Any]],
+               shared_data=None, max_findings: int = 40) -> Dict[str, Any]:
+    """Answer a natural-language question over the findings ledger.
+
+    Fail-open to a deterministic fallback. `max_findings` bounds the prompt so
+    a Pi-class board can still serve the request - the worst findings go in
+    first, since those are what an operator is actually asking about.
+    """
+    q = (question or "").strip()
+    out = {"question": q, "text": "", "ai": False, "used_findings": 0}
+    if not q:
+        out["text"] = "Ask a question about the findings."
+        return out
+
+    # Worst-first: vulnerabilities, then by severity, then newest.
+    sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    ranked = sorted(
+        findings,
+        key=lambda f: (
+            0 if f.get("outcome") == "vulnerable" else 1,
+            sev_rank.get((f.get("severity") or "info").lower(), 5),
+            -float(f.get("ts") or 0),
+        ),
+    )
+    subset = ranked[:max(1, int(max_findings))]
+    out["used_findings"] = len(subset)
+
+    vulns = [f for f in subset if f.get("outcome") == "vulnerable"]
+    fallback = (
+        f"{len(vulns)} confirmed vulnerable and {len(subset) - len(vulns)} other "
+        f"results in scope. Enable the AI service for a natural-language answer."
+    ) if vulns else (
+        f"No confirmed vulnerabilities in the {len(subset)} results in scope. "
+        f"Enable the AI service for a natural-language answer."
+    )
+    out["text"] = fallback
+
+    if shared_data is None or not _enabled(shared_data, "ai_exploit_ask", True):
+        return out
+    svc = _service(shared_data)
+    if svc is None or not svc.is_enabled():
+        return out
+
+    lines = []
+    for f in subset:
+        lines.append(
+            f"- {f.get('ip')}:{f.get('port')} [{f.get('outcome')}] "
+            f"{f.get('title') or f.get('cve_id')} ({f.get('severity')}) "
+            f"{(f.get('evidence') or f.get('detail') or '')[:70]}"
+        )
+    user = (
+        f"QUESTION: {q}\n\n"
+        f"AVAILABLE FINDINGS ({len(subset)} of {len(findings)}, worst-first):\n"
+        + "\n".join(lines)
+    )
+    try:
+        reply = (svc._ask(_ASK_SYSTEM, user) or "").strip()
+    except Exception as exc:
+        logger.debug("ai ask failed: %s", exc)
+        return out
+    if reply:
+        out["text"] = reply[:900]
+        out["ai"] = True
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 (2): AI-authored scan scheduling suggestions
+# ---------------------------------------------------------------------------
+
+_SCHEDULE_SYSTEM = (
+    "You are a network security operations advisor. Based on observed network "
+    "state, suggest scan-schedule and aggression changes for a homelab "
+    "monitoring tool. You may suggest: scan_interval, scan_vuln_interval, "
+    "nmap timing template (-T0..-T5), exploit_min_cvss, exploit_max_per_host, "
+    "and exploit_nuclei_concurrency. Return ONLY a JSON object mapping config "
+    "key -> proposed value, with a short 'why' for each. Never suggest removing "
+    "scope guardrails (exploit_allow_all, exploit_allow_external) or disabling "
+    "the allowlist - those are safety controls. If nothing should change, "
+    "return an empty object. No commentary outside the JSON."
+)
+
+
+def suggest_schedule(state: Dict[str, Any], shared_data=None) -> Dict[str, Any]:
+    """Propose scan-schedule / aggression changes. SUGGESTIONS ONLY.
+
+    Never applied automatically - the operator must confirm every change.
+    Scope guardrails (exploit_allow_all, exploit_allow_external, allowlist)
+    are stripped from any proposal the model returns; this function cannot
+    weaken them.
+    """
+    # Hard safety: these keys are never editable through this path.
+    FORBIDDEN = {
+        "exploit_allow_all", "exploit_allow_external", "exploit_allowlist",
+        "enable_attacks", "manual_mode", "scan_subnets",
+    }
+    out = {"proposals": {}, "reasons": {}, "ai": False, "raw": ""}
+    if shared_data is None or not _enabled(shared_data, "ai_exploit_schedule", False):
+        out["raw"] = "disabled"
+        return out
+    svc = _service(shared_data)
+    if svc is None or not svc.is_enabled():
+        out["raw"] = "ai unavailable"
+        return out
+
+    try:
+        user = "OBSERVED STATE:\n" + json.dumps(state, default=str)[:3000]
+        reply = (svc._ask(_SCHEDULE_SYSTEM, user) or "").strip()
+        out["raw"] = reply[:2000]
+    except Exception as exc:
+        logger.debug("ai schedule failed: %s", exc)
+        return out
+
+    try:
+        m = re.search(r"\{.*\}", reply, re.S)
+        data = json.loads(m.group(0)) if m else {}
+    except Exception:
+        return out
+    if not isinstance(data, dict):
+        return out
+
+    for k, v in data.items():
+        if k in FORBIDDEN:
+            continue
+        if k == "why":
+            continue
+        out["proposals"][k] = v
+    if isinstance(data.get("why"), dict):
+        out["reasons"] = {k: str(v)[:200] for k, v in data["why"].items()}
+
+    out["ai"] = True
+    return out

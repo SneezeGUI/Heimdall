@@ -28590,6 +28590,70 @@ def get_exploit_correlation():
         return jsonify({'error': str(e), 'text': ''}), 500
 
 
+@app.route('/api/exploits/ask', methods=['POST'])
+def ask_exploit_findings():
+    """Natural-language Q&A over the findings ledger. Advisory only."""
+    try:
+        from actions.ai_insights import answer_for
+        from actions.exploit_engine import get_findings
+        payload = request.get_json(silent=True) or {}
+        question = (payload.get('question') or '').strip()
+        if not question:
+            return jsonify({'error': 'question required', 'text': ''}), 400
+        try:
+            maxf = max(5, min(120, int(payload.get('max_findings', 40))))
+        except Exception:
+            maxf = 40
+        rows = get_findings(limit=500).get('findings') or []
+        out = answer_for(question, rows, shared_data=shared_data, max_findings=maxf)
+        response = jsonify(out)
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    except Exception as e:
+        logger.error(f"exploit ask error: {e}")
+        return jsonify({'error': str(e), 'text': ''}), 500
+
+
+@app.route('/api/exploits/schedule-suggestions')
+def get_exploit_schedule_suggestions():
+    """AI-authored scan schedule / aggression proposals. SUGGESTIONS ONLY.
+
+    Nothing here is applied automatically. Scope guardrails
+    (exploit_allow_all, exploit_allow_external, exploit_allowlist) are
+    stripped from any proposal server-side - this endpoint cannot weaken them.
+    """
+    try:
+        from actions.ai_insights import suggest_schedule
+        from actions.exploit_engine import get_stats
+        import time as _time
+        stats = get_stats()
+        state = {
+            'findings': {k: stats.get(k) for k in
+                         ('attempted', 'vulnerable', 'not_vulnerable', 'errors', 'skipped')},
+            'hosts': stats.get('host_count'),
+            'config': {
+                k: shared_data.config.get(k) for k in
+                ('scan_interval', 'scan_vuln_interval', 'nmap_scan_aggressivity',
+                 'exploit_min_cvss', 'exploit_max_per_host',
+                 'exploit_nuclei_concurrency', 'exploit_nuclei_severity',
+                 'exploit_nuclei_timeout')
+            },
+            'resource': {
+                'load': open('/proc/loadavg').read().split()[0] if
+                        Path('/proc/loadavg').exists() else None,
+            },
+            'generated': _time.time(),
+        }
+        out = suggest_schedule(state, shared_data=shared_data)
+        out['current'] = state['config']
+        response = jsonify(out)
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    except Exception as e:
+        logger.error(f"exploit schedule suggestions error: {e}")
+        return jsonify({'error': str(e), 'proposals': {}}), 500
+
+
 @app.route('/api/exploits/trend')
 def get_exploit_trend():
     """New / resolved / regressed findings versus the previous snapshot.

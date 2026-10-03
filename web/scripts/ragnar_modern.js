@@ -610,6 +610,14 @@ const configMetadata = {
         label: "AI Correlation",
         description: "Lateral-movement hypotheses joining exploit findings with captured credentials. Framed as hypothesis, never fact. Cached. Fail-open to deterministic counts."
     },
+    ai_exploit_ask: {
+        label: "AI Findings Q&A",
+        description: "Ask natural-language questions over the findings ledger. Answers cite hosts, CVEs and ports from the supplied data only. Bounded prompt size so it works on small boards."
+    },
+    ai_exploit_schedule: {
+        label: "AI Scan Tuning",
+        description: "Let the model propose scan-interval, aggression and exploit-budget changes. SUGGESTIONS ONLY - nothing is applied automatically and you confirm every change in Config. Scope guardrails cannot be modified through this. Off by default."
+    },
     ai_exploit_trends: {
         label: "Finding Trends",
         description: "New / resolved / regressed findings versus the previous window. Deterministic - no model call."
@@ -20552,6 +20560,61 @@ function pollToolInstallLog() {
     }, 3000);
 }
 
+async function askExploitFindings() {
+    const input = document.getElementById('exploit-ask-input');
+    const out = document.getElementById('exploit-ask-answer');
+    if (!input || !out) return;
+    const q = (input.value || '').trim();
+    if (!q) return;
+    out.classList.remove('hidden');
+    out.textContent = 'Thinking…';
+    try {
+        const d = await fetchAPI('/api/exploits/ask', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ question: q })
+        });
+        out.textContent = (d && d.text) || 'No answer.';
+        out.title = d && d.ai ? 'AI answer from the findings ledger' : 'Deterministic fallback';
+    } catch (e) {
+        out.textContent = 'Ask failed: ' + e.message;
+    }
+}
+
+async function loadExploitSchedule() {
+    const body = document.getElementById('exploit-schedule-body');
+    if (!body) return;
+    body.classList.remove('hidden');
+    body.textContent = 'Asking for suggestions…';
+    try {
+        const d = await fetchAPI('/api/exploits/schedule-suggestions');
+        const props = (d && d.proposals) || {};
+        const keys = Object.keys(props);
+        if (!keys.length) {
+            body.textContent = d && d.raw === 'disabled'
+                ? 'Disabled. Enable AI Scan Tuning in Config to get suggestions.'
+                : (d && d.raw === 'ai unavailable')
+                    ? 'AI service unavailable.'
+                    : 'Nothing to change — current schedule looks reasonable.';
+            return;
+        }
+        const rows = keys.map(k => {
+            const cur = (d.current || {})[k];
+            const why = (d.reasons || {})[k] || '';
+            return `<div class="flex items-center gap-2 flex-wrap text-xs py-1 border-b border-slate-800">
+                <code class="text-slate-300">${escapeHtml(k)}</code>
+                <span class="text-slate-500">${escapeHtml(String(cur))}</span>
+                <span class="text-slate-600">&rarr;</span>
+                <span class="text-emerald-300 font-semibold">${escapeHtml(String(props[k]))}</span>
+                <span class="text-slate-500 italic">${escapeHtml(why)}</span>
+            </div>`;
+        }).join('');
+        body.innerHTML = '<div class="text-amber-400 text-xs mb-2">Suggestions only — nothing is applied. Set these in Config if you agree.</div>' + rows;
+    } catch (e) {
+        body.textContent = 'Suggestions unavailable: ' + e.message;
+    }
+}
+
 async function loadExploitTrend() {
     const body = document.getElementById('exploit-trend-body');
     if (!body) return;
@@ -24189,11 +24252,11 @@ function displayConfigForm(config) {
         'Network': ['network_max_failed_pings'],
         'Timing': ['startup_delay', 'web_delay', 'screen_delay', 'scan_interval'],
         'Display': ['epd_type', 'screen_reversed', 'spi_clock_mhz', 'gc9a01_mascot_color', 'ssd1306_i2c_address', 'lcd1602_i2c_address', 'max7219_spi_port', 'max7219_spi_device', 'max7219_block_orientation', 'display_brightness'],
-        'Exploits': ['notify_on_exploit', 'exploit_ai_remediation', 'ai_exploit_summary', 'ai_exploit_correlate', 'ai_exploit_trends', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'exploit_allowlist', 'exploit_min_cvss', 'exploit_max_per_host', 'exploit_ai_triage', 'exploit_ai_model', 'exploit_nuclei_concurrency', 'exploit_nuclei_broad', 'exploit_nuclei_severity', 'exploit_nuclei_timeout'],
+        'Exploits': ['notify_on_exploit', 'exploit_ai_remediation', 'ai_exploit_summary', 'ai_exploit_correlate', 'ai_exploit_trends', 'ai_exploit_ask', 'ai_exploit_schedule', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'exploit_allowlist', 'exploit_min_cvss', 'exploit_max_per_host', 'exploit_ai_triage', 'exploit_ai_model', 'exploit_nuclei_concurrency', 'exploit_nuclei_broad', 'exploit_nuclei_severity', 'exploit_nuclei_timeout'],
         'AI Credentials': ['ai_creds_enabled', 'ai_creds_max_pairs', 'ai_creds_model']
     };
 
-    const knownBooleans = ['notify_on_exploit', 'exploit_ai_remediation', 'ai_exploit_summary', 'ai_exploit_correlate', 'ai_exploit_trends', 'exploit_nuclei_broad', 'exploit_ai_triage', 'manual_mode', 'debug_mode', 'scan_vuln_running', 'scan_vuln_no_ports', 'enable_attacks', 'blacklistcheck', 'wardriving_enabled', 'wardriving_display', 'wardriving_auto_export', 'wardriving_wigle_include_zigbee', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'ai_creds_enabled'];
+    const knownBooleans = ['notify_on_exploit', 'exploit_ai_remediation', 'ai_exploit_summary', 'ai_exploit_correlate', 'ai_exploit_trends', 'ai_exploit_ask', 'ai_exploit_schedule', 'exploit_nuclei_broad', 'exploit_ai_triage', 'manual_mode', 'debug_mode', 'scan_vuln_running', 'scan_vuln_no_ports', 'enable_attacks', 'blacklistcheck', 'wardriving_enabled', 'wardriving_display', 'wardriving_auto_export', 'wardriving_wigle_include_zigbee', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'ai_creds_enabled'];
     const alwaysShowKeys = new Set(['network_max_failed_pings', 'gc9a01_mascot_color', 'ssd1306_i2c_address', 'lcd1602_i2c_address', 'spi_clock_mhz', 'max7219_spi_port', 'max7219_spi_device', 'max7219_block_orientation', 'display_brightness', 'wardriving_scan_interval', 'wardriving_gps_port', 'wardriving_gps_baudrate']);
     const fallbackValues = {
         network_max_failed_pings: 15,

@@ -908,6 +908,13 @@ class SharedData:
             # detection. See docs/EXPLOIT_AI_ROADMAP.md. Fail-open.
             "ai_exploit_correlate": True,
             "ai_exploit_trends": True,
+            # Tier 3: NL Q&A over findings; scan-schedule suggestions.
+            # The scheduler is OFF by default - it only ever proposes, and the
+            # operator must confirm every change. Scope guardrails
+            # (exploit_allow_all / _external / allowlist) are stripped
+            # server-side and cannot be weakened through it.
+            "ai_exploit_ask": True,
+            "ai_exploit_schedule": False,
 
             "ai_creds_enabled": False,
             "ai_creds_max_pairs": 25,
