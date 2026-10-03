@@ -1,0 +1,146 @@
+diff --git a/wifi_manager.py b/wifi_manager.py
+index 68443db0..dc027533 100755
+--- a/wifi_manager.py
++++ b/wifi_manager.py
+@@ -24,6 +24,67 @@ from db_manager import get_db
+ from wifi_interfaces import gather_wifi_interfaces, get_active_ethernet_interface
+ 
+ 
++
++
++# --------------------------------------------------------------------------
++# nl80211-aware WiFi state
++# --------------------------------------------------------------------------
++# `iwgetid`/`iwconfig` speak Wireless Extensions. Several modern drivers -
++# the Allwinner aicwf_sdio onboard radio among them - implement only
++# nl80211, so those tools exit 255 and every check reports "not connected"
++# against a live association. wpa_cli and iw use nl80211 and are reliable.
++
++def nl80211_ssids():
++    """Return {iface: ssid} for every associated station interface."""
++    out = {}
++    try:
++        ifaces = [n for n in sorted(__import__('os').listdir('/sys/class/net'))
++                  if n.startswith(('wlan', 'wlx', 'wlp', 'wls'))]
++    except Exception:
++        ifaces = []
++    for iface in ifaces:
++        ssid = ''
++        try:
++            r = subprocess.run(['wpa_cli', '-i', iface, 'status'],
++                               capture_output=True, text=True, timeout=5)
++            if r.returncode == 0:
++                state = ''
++                for line in (r.stdout or '').splitlines():
++                    if line.startswith('ssid='):
++                        ssid = line.split('=', 1)[1].strip()
++                    elif line.startswith('wpa_state='):
++                        state = line.split('=', 1)[1].strip()
++                if state and state != 'COMPLETED':
++                    ssid = ''
++        except Exception:
++            pass
++        if not ssid:
++            try:
++                r = subprocess.run(['iw', 'dev', iface, 'link'],
++                                   capture_output=True, text=True, timeout=5)
++                if r.returncode == 0:
++                    for line in (r.stdout or '').splitlines():
++                        if line.strip().startswith('SSID:'):
++                            ssid = line.split(':', 1)[1].strip()
++                            break
++            except Exception:
++                pass
++        if ssid:
++            out[iface] = ssid
++    return out
++
++
++def nl80211_any_connected():
++    return bool(nl80211_ssids())
++
++
++def nl80211_current_ssid():
++    ssids = nl80211_ssids()
++    for iface in sorted(ssids):
++        return ssids[iface]
++    return ''
++
++
+ class WiFiManager:
+     """Manages Wi-Fi connections, AP mode, and configuration for Ragnar"""
+     
+@@ -1470,6 +1531,11 @@ class WiFiManager:
+     def check_wifi_connection(self):
+         """Check if Wi-Fi is connected using multiple methods"""
+         try:
++            # nl80211 first: iwgetid/iwconfig speak Wireless Extensions, which
++            # the Allwinner onboard driver does not implement, so they exit 255
++            # and we would report disconnected on a live association.
++            if nl80211_any_connected():
++                return True
+             self._ensure_wifi_interfaces_up()
+             # Method 1: Check using nmcli for active wireless connections.
+             # Guarded: hosts without NetworkManager (containers, minimal
+@@ -1664,15 +1730,28 @@ class WiFiManager:
+     def get_current_ssid(self):
+         """Get the current connected SSID — the network's name, never a profile label."""
+         try:
++            # nl80211 first (wpa_cli / iw). iwgetid/iwconfig are WEXT-only and
++            # silently fail on drivers that implement just nl80211.
++            ssid = nl80211_current_ssid()
++            if ssid:
++                return ssid
+             client_iface = self._client_wifi_interface()
+ 
+             # Method 1: the connection active on the CLIENT radio — the dongle
+             # when one is fitted, since the built-in may be hosting the AP and
+             # would report the AP's own name instead. Resolve its SSID; the
+             # connection NAME is not the SSID (see _ssid_of_connection).
+-            result = subprocess.run(['nmcli', '-t', '-f', 'GENERAL.CONNECTION', 'dev', 'show', client_iface],
+-                                  capture_output=True, text=True, timeout=10)
+-            if result.returncode == 0 and result.stdout.strip():
++            # DietPi uses ifupdown + wpa_supplicant and ships no NetworkManager,
++            # so nmcli is often absent. Treat that as "method not available" and
++            # fall through to the kernel/iwgetid paths instead of logging ERROR.
++            try:
++                result = subprocess.run(['nmcli', '-t', '-f', 'GENERAL.CONNECTION', 'dev', 'show', client_iface],
++                                      capture_output=True, text=True, timeout=10)
++            except FileNotFoundError:
++                result = None
++            except Exception:
++                result = None
++            if result is not None and result.returncode == 0 and result.stdout.strip():
+                 for line in result.stdout.strip().split('\n'):
+                     if line.startswith('GENERAL.CONNECTION:'):
+                         conn = line.split(':', 1)[1].strip()
+@@ -1698,9 +1777,16 @@ class WiFiManager:
+                 pass  # iwgetid not available
+ 
+             # Method 4: any active Wi-Fi connection, resolved to its SSID.
+-            result = subprocess.run(['nmcli', '-t', '-f', 'ACTIVE,NAME,TYPE', 'con', 'show'],
+-                                  capture_output=True, text=True, timeout=10)
+-            if result.returncode == 0:
++            # nmcli is absent on DietPi (ifupdown + wpa_supplicant), so treat a
++            # missing binary as "this method does not apply" rather than an error.
++            try:
++                result = subprocess.run(['nmcli', '-t', '-f', 'ACTIVE,NAME,TYPE', 'con', 'show'],
++                                      capture_output=True, text=True, timeout=10)
++            except FileNotFoundError:
++                result = None
++            except Exception:
++                result = None
++            if result is not None and result.returncode == 0:
+                 for line in result.stdout.strip().split('\n'):
+                     parts = line.split(':')
+                     if len(parts) >= 3 and parts[0] == 'yes' and '802-11-wireless' in parts[2]:
+@@ -1708,7 +1794,8 @@ class WiFiManager:
+ 
+             return None
+         except Exception as e:
+-            self.logger.error(f"Error getting current SSID: {e}")
++            # Not being associated to a Wi-Fi network is normal on a wired box.
++            self.logger.debug(f"get_current_ssid: {e}")
+             return None
+ 
+     def scan_networks(self, interface=None):

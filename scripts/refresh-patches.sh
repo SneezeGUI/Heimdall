@@ -26,6 +26,10 @@ declare -a SPECS=(
   "webapp_modern.py|webapp-exploit-endpoints|API exploit fields"
   "web/scripts/ragnar_modern.js|web-dashboard-exploit-tile|dashboard tile + live update"
   "wifi_defense.py|wifi-monitor-adapter-selection|never monitor on the uplink radio"
+  "epd_helper.py|epd-probe-quiet-logging|failed driver load is a probe, not an error"
+  "display.py|display-nl80211-wifi-status|nl80211 SSID check before WEXT tools"
+  "wifi_manager.py|wifi-manager-nl80211-status|nl80211 SSID check before WEXT tools"
+  "multi_interface.py|scan-all-adapters|all-adapters mode really means all"
   "config/actions.json|actions-json-exploit-runner|ExploitRunner registry"
 )
 
