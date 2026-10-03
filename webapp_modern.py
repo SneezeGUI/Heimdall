@@ -8642,10 +8642,36 @@ def sync_all_counts():
             old_targets = shared_data.targetnbr
             old_ports = shared_data.portnbr
 
-            shared_data.targetnbr = aggregated_targets
+            # Hysteresis on decreases. This runs every 15s and hosts flap
+            # alive<->degraded (IoT, sleeping phones), which made the headline
+            # number bob constantly - what looked like "the dashboard resets".
+            # Increases commit immediately; a decrease only commits after it
+            # has held for 3 consecutive passes (~45s), so a transient dip
+            # never shows but a host that really left still does.
+            def _commit(attr, new_val, old_val):
+                pending = getattr(shared_data, "_counter_pending", None)
+                if pending is None:
+                    pending = {}
+                    shared_data._counter_pending = pending
+                key = "_pending_" + attr
+                if new_val >= old_val:
+                    pending.pop(key, None)
+                    setattr(shared_data, attr, new_val)
+                    return new_val
+                if pending.get(key, {}).get("value") == new_val:
+                    pending[key]["count"] += 1
+                else:
+                    pending[key] = {"value": new_val, "count": 1}
+                if pending[key]["count"] >= 3:
+                    pending.pop(key, None)
+                    setattr(shared_data, attr, new_val)
+                    return new_val
+                return old_val   # hold the higher value
+
+            aggregated_targets = _commit("targetnbr", aggregated_targets, old_targets)
+            aggregated_ports = _commit("portnbr", aggregated_ports, old_ports)
             shared_data.total_targetnbr = total_target_count
             shared_data.inactive_targetnbr = inactive_target_count
-            shared_data.portnbr = aggregated_ports
             shared_data.networkkbnbr = total_target_count
             
             if old_targets != aggregated_targets or old_ports != aggregated_ports:

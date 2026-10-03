@@ -35237,6 +35237,19 @@ function hideAdvVulnNotAvailable() {
 
 function updateScannerStatus(scanners, nucleiTemplates) {
     if (!scanners) return;
+    // Normalise once, at the top. `scanners` comes from server_capabilities,
+    // which does a PATH probe that misses ZAP's versioned /opt install and a
+    // RAM gate that can disagree with what is actually on disk. OR in the
+    // install-detection cache so EVERY downstream read (card grey-out,
+    // optgroup disable, daemon panel) agrees that the tool is present.
+    // Previously only the card-status text was patched, so ZAP showed
+    // "installed" but stayed greyed and unselectable.
+    if (typeof _toolInstallCache !== 'undefined' && _toolInstallCache) {
+        scanners = Object.assign({}, scanners);
+        for (const k of Object.keys(_toolInstallCache)) {
+            if (_toolInstallCache[k]) scanners[k] = true;
+        }
+    }
 
     // Cache so the nuclei template card can be re-rendered after a manual update
     advVulnScannersStatusCache = scanners;
@@ -35254,11 +35267,7 @@ function updateScannerStatus(scanners, nucleiTemplates) {
         const cardEl = document.getElementById(`scanner-${id.replace('_', '-')}`);
 
         if (statusEl) {
-            // OR in the install-detection cache: `scanners` comes from
-            // server_capabilities (RAM gates + a PATH probe that misses
-            // ZAP's versioned /opt install), so it can report a tool missing
-            // that is demonstrably present.
-            const available = !!scanners[id] || !!(_toolInstallCache && _toolInstallCache[id]);
+            const available = !!scanners[id];
             if (id === 'nuclei') {
                 updateNucleiCardStatus(statusEl, available, advVulnNucleiTemplatesCache, scanners.nuclei_installing, scanners.nuclei_templates_updating, scanners.nuclei_ram_ok, (advVulnMeshScan || {}).nuclei);
             } else if (id === 'zap') {
