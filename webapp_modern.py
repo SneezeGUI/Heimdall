@@ -28233,14 +28233,23 @@ def _tool_status(name: str) -> Dict:
                 path = cand
                 break
         if not path:
+            # os.walk, not pathlib: pathlib is not imported at module scope in
+            # this file and a NameError here was being swallowed by a bare
+            # except, so ZAP always reported "not installed".
             for root in ("/opt", "/usr/share", "/usr/local"):
                 try:
-                    hits = sorted(Path(root).glob("ZAP*/zap.sh"))
-                    if hits:
-                        path = str(hits[0])
+                    for dirpath, dirnames, _filenames in os.walk(root):
+                        base = os.path.basename(dirpath)
+                        if base.upper().startswith("ZAP"):
+                            cand = os.path.join(dirpath, "zap.sh")
+                            if os.path.exists(cand):
+                                path = cand
+                                break
+                        dirnames.sort()
+                    if path:
                         break
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("zap probe under %s failed: %s", root, exc)
     return {"name": name, "label": meta["label"], "kind": meta["kind"],
             "installed": bool(path), "path": path}
 
