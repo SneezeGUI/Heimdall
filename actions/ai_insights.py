@@ -222,3 +222,166 @@ def summary_for(findings: List[Dict[str, Any]], shared_data=None,
     cache[key] = {"text": out["text"], "ts": out["generated"]}
     _cache_save(cache)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 (1): correlate findings with captured credentials
+# ---------------------------------------------------------------------------
+
+def _load_credentials() -> List[Dict[str, Any]]:
+    """Captured (service, ip, user) tuples from the loot CSVs.
+
+    The connector modules write one CSV per service under
+    data/networks/<net>/loot/credentials/. Header row only means nothing has
+    been captured yet, which is fine - correlation is still worth building so
+    it lights up the moment a capture lands.
+    """
+    out: List[Dict[str, Any]] = []
+    root = Path(__file__).resolve().parents[1] / "data" / "networks"
+    if not root.is_dir():
+        return out
+    try:
+        import csv
+        for f in sorted(root.glob("*/loot/credentials/*.csv")):
+            svc = f.stem.lower()
+            try:
+                with f.open(newline="", encoding="utf-8", errors="replace") as fh:
+                    for row in csv.DictReader(fh):
+                        ip = (row.get("IP Address") or row.get("ip") or "").strip()
+                        user = (row.get("User") or row.get("username") or "").strip()
+                        if ip:
+                            out.append({"service": svc, "ip": ip,
+                                        "user": user, "source": str(f)})
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.debug("credential load failed: %s", exc)
+    return out
+
+
+_CORR_SYSTEM = (
+    "You are a network security analyst writing a lateral-movement assessment "
+    "for a homelab operator. Given confirmed exploit findings and captured "
+    "credentials, describe concrete attack paths an adversary on this LAN could "
+    "take. Be specific about which host is the pivot and why. Name the CVE and "
+    "the service. Maximum 90 words. No preamble, no markdown headers. If the "
+    "credentials and findings do not combine into a real path, say so plainly "
+    "rather than inventing one."
+)
+
+
+def correlate_for(findings: List[Dict[str, Any]], shared_data=None,
+                  credentials: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Lateral-movement hypotheses from findings + captured credentials.
+
+    Fail-open to a deterministic summary when AI is unavailable. Framed as
+    hypothesis, never as fact - these are correlations, not proven paths.
+    """
+    creds = credentials if credentials is not None else _load_credentials()
+    vulns = [f for f in findings if f.get("outcome") == "vulnerable"]
+    cred_hosts = sorted({c["ip"] for c in creds})
+    vuln_hosts = sorted({f.get("ip") for f in vulns if f.get("ip")})
+
+    fallback_parts = []
+    if creds and vulns:
+        both = sorted(set(cred_hosts) & set(vuln_hosts))
+        if both:
+            fallback_parts.append(f"{len(both)} host(s) have both credentials and findings")
+        else:
+            fallback_parts.append(
+                f"{len(cred_hosts)} host(s) with captured credentials, "
+                f"{len(vuln_hosts)} with findings - no direct overlap")
+    elif creds:
+        fallback_parts.append(f"{len(cred_hosts)} host(s) with captured credentials, no findings yet")
+    elif vulns:
+        fallback_parts.append(f"{len(vuln_hosts)} host(s) with findings, no credentials captured yet")
+    else:
+        fallback_parts.append("No credentials captured and no confirmed findings")
+    fallback = ". ".join(fallback_parts) + "."
+
+    out = {"text": fallback, "ai": False, "cached": False,
+           "credential_hosts": cred_hosts, "finding_hosts": vuln_hosts,
+           "overlap": sorted(set(cred_hosts) & set(vuln_hosts))}
+
+    if shared_data is None or not _enabled(shared_data, "ai_exploit_correlate", True):
+        return out
+    if not creds and not vulns:
+        return out
+
+    key = f"corr:{len(creds)}:{len(vulns)}:{len(set(cred_hosts) & set(vuln_hosts))}"
+    cache = _cache_load()
+    hit = cache.get(key)
+    if hit and time.time() - hit.get("ts", 0) < _SUMMARY_TTL:
+        out["text"] = hit.get("text"); out["ai"] = True; out["cached"] = True
+        return out
+
+    svc = _service(shared_data)
+    if svc is None or not svc.is_enabled():
+        return out
+
+    cred_lines = [f"- {c["service"]} {c["ip"]} user={c["user"] or '?'}" for c in creds[:20]]
+    vuln_lines = [f"- {f.get('ip')}:{f.get('port')} {f.get('title') or f.get('cve_id')} [{f.get('severity')}]"
+                  for f in vulns[:12]]
+    user = (
+        "CAPTURED CREDENTIALS:\n" + ("\n".join(cred_lines) if cred_lines else "(none)") + "\n\n"
+        "CONFIRMED FINDINGS:\n" + ("\n".join(vuln_lines) if vuln_lines else "(none)")
+    )
+    try:
+        reply = (svc._ask(_CORR_SYSTEM, user) or "").strip()
+    except Exception as exc:
+        logger.debug("ai correlation failed: %s", exc)
+        return out
+    if not reply:
+        return out
+    out["text"] = reply[:600]; out["ai"] = True; out["generated"] = time.time()
+    cache[key] = {"text": out["text"], "ts": out["generated"]}
+    _cache_save(cache)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 (2): trending / regression detection
+# ---------------------------------------------------------------------------
+
+def trend_for(current: List[Dict[str, Any]],
+              previous: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Diff two findings snapshots: new / resolved / regressed / stable.
+
+    Purely deterministic - no model call. Keyed on (ip, port, cve_id, poc_id)
+    so a re-scan of the same host does not look like churn. Cheap enough to run
+    on every dashboard refresh.
+    """
+    def key(f):
+        return (f.get("ip", ""), str(f.get("port")), f.get("cve_id", "-"),
+                f.get("poc_id", "") or f.get("detail", ""))
+
+    def outcome(f):
+        return (f.get("outcome") or "").lower()
+
+    cur = {}
+    for f in current:
+        cur.setdefault(key(f), f)
+    prev = {}
+    for f in previous:
+        prev.setdefault(key(f), f)
+
+    new = [f for k, f in cur.items() if k not in prev and outcome(f) == "vulnerable"]
+    resolved = [f for k, f in prev.items() if k not in cur and outcome(f) == "vulnerable"]
+    # regressed: same key, was clean, now vulnerable
+    regressed = [f for k, f in cur.items()
+                 if k in prev and outcome(f) == "vulnerable"
+                 and outcome(prev[k]) in ("not_vulnerable", "skipped", "error")]
+    stable = [f for k, f in cur.items()
+              if k in prev and outcome(f) == "vulnerable"
+              and outcome(prev[k]) == "vulnerable"]
+
+    return {
+        "new": [{"ip": f.get("ip"), "port": f.get("port"),
+                 "title": f.get("title"), "severity": f.get("severity")} for f in new],
+        "resolved": [{"ip": f.get("ip"), "port": f.get("port"),
+                      "title": f.get("title")} for f in resolved],
+        "regressed": [{"ip": f.get("ip"), "port": f.get("port"),
+                       "title": f.get("title"), "severity": f.get("severity")} for f in regressed],
+        "stable": len(stable),
+        "checked": len(cur),
+    }

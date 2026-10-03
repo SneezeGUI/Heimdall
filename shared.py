@@ -904,6 +904,10 @@ class SharedData:
             # Both are fail-open: an AI error falls back to static guidance.
             "exploit_ai_remediation": True,
             "ai_exploit_summary": True,
+            # Tier 2: lateral-movement hypotheses and new/resolved/regressed
+            # detection. See docs/EXPLOIT_AI_ROADMAP.md. Fail-open.
+            "ai_exploit_correlate": True,
+            "ai_exploit_trends": True,
 
             "ai_creds_enabled": False,
             "ai_creds_max_pairs": 25,

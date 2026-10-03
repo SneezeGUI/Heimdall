@@ -606,6 +606,14 @@ const configMetadata = {
         label: "AI Remediation",
         description: "Refine each finding's remediation with the AI model, contextualised to the host. Shown alongside the static guidance - never replaces it. Cached per finding. Fail-open to the static text."
     },
+    ai_exploit_correlate: {
+        label: "AI Correlation",
+        description: "Lateral-movement hypotheses joining exploit findings with captured credentials. Framed as hypothesis, never fact. Cached. Fail-open to deterministic counts."
+    },
+    ai_exploit_trends: {
+        label: "Finding Trends",
+        description: "New / resolved / regressed findings versus the previous window. Deterministic - no model call."
+    },
     ai_exploit_summary: {
         label: "AI Exploit Summary",
         description: "One-paragraph AI narrative over the findings ledger on the dashboard. Leads with the most important finding and says what is clean. Cached. Fail-open to a plain count."
@@ -20440,6 +20448,8 @@ async function loadExploitFindings() {
         renderExploitFindingsSummary(data, summary);
         renderExploitFindings(data.findings || [], list);
         loadExploitAiSummary();
+        loadExploitTrend();
+        loadExploitCorrelation();
     } catch (err) {
         console.error('exploit findings load failed', err);
         list.innerHTML = '<div class="text-red-400 text-sm py-8 text-center">Failed to load findings.</div>';
@@ -20540,6 +20550,52 @@ function pollToolInstallLog() {
             }
         } catch (e) { /* keep polling */ }
     }, 3000);
+}
+
+async function loadExploitTrend() {
+    const body = document.getElementById('exploit-trend-body');
+    if (!body) return;
+    try {
+        const d = await fetchAPI('/api/exploits/trend?window=24');
+        if (!d) return;
+        const chip = (label, arr, cls) => {
+            const n = Array.isArray(arr) ? arr.length : arr;
+            if (!n) return '';
+            return `<span class="px-2 py-0.5 rounded border text-xs font-semibold ${cls}">${label} ${n}</span>`;
+        };
+        const bits = [
+            chip('new', d.new, 'bg-red-950/60 border-red-700 text-red-200'),
+            chip('regressed', d.regressed, 'bg-orange-950/60 border-orange-700 text-orange-200'),
+            chip('resolved', d.resolved, 'bg-emerald-950/60 border-emerald-700 text-emerald-200'),
+        ].filter(Boolean);
+        const stable = `<span class="px-2 py-0.5 rounded border text-xs bg-slate-800 border-slate-700 text-slate-300">stable ${d.stable}</span>`;
+        body.innerHTML = (bits.length ? bits.join(' ') + ' ' : '') + stable
+            + `<div class="text-xs text-slate-500 mt-2">${d.checked} checks compared over ${d.window_hours}h</div>`;
+    } catch (e) {
+        body.textContent = 'Trend unavailable.';
+    }
+}
+
+async function loadExploitCorrelation() {
+    const body = document.getElementById('exploit-correlation-body');
+    if (!body) return;
+    try {
+        const d = await fetchAPI('/api/exploits/correlation');
+        if (!d) return;
+        body.textContent = d.text || 'No correlation data.';
+        body.title = d.ai ? 'AI-generated hypothesis' : 'Deterministic counts (AI unavailable)';
+        const meta = [];
+        if (d.credential_hosts && d.credential_hosts.length) meta.push('creds on ' + d.credential_hosts.length + ' host(s)');
+        if (d.finding_hosts && d.finding_hosts.length) meta.push('findings on ' + d.finding_hosts.length);
+        if (meta.length) {
+            const m = document.createElement('div');
+            m.className = 'text-xs text-purple-400/70 mt-2';
+            m.textContent = meta.join(' · ');
+            body.appendChild(m);
+        }
+    } catch (e) {
+        body.textContent = 'Correlation unavailable.';
+    }
 }
 
 async function loadExploitAiSummary() {
@@ -24133,11 +24189,11 @@ function displayConfigForm(config) {
         'Network': ['network_max_failed_pings'],
         'Timing': ['startup_delay', 'web_delay', 'screen_delay', 'scan_interval'],
         'Display': ['epd_type', 'screen_reversed', 'spi_clock_mhz', 'gc9a01_mascot_color', 'ssd1306_i2c_address', 'lcd1602_i2c_address', 'max7219_spi_port', 'max7219_spi_device', 'max7219_block_orientation', 'display_brightness'],
-        'Exploits': ['notify_on_exploit', 'exploit_ai_remediation', 'ai_exploit_summary', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'exploit_allowlist', 'exploit_min_cvss', 'exploit_max_per_host', 'exploit_ai_triage', 'exploit_ai_model', 'exploit_nuclei_concurrency', 'exploit_nuclei_broad', 'exploit_nuclei_severity', 'exploit_nuclei_timeout'],
+        'Exploits': ['notify_on_exploit', 'exploit_ai_remediation', 'ai_exploit_summary', 'ai_exploit_correlate', 'ai_exploit_trends', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'exploit_allowlist', 'exploit_min_cvss', 'exploit_max_per_host', 'exploit_ai_triage', 'exploit_ai_model', 'exploit_nuclei_concurrency', 'exploit_nuclei_broad', 'exploit_nuclei_severity', 'exploit_nuclei_timeout'],
         'AI Credentials': ['ai_creds_enabled', 'ai_creds_max_pairs', 'ai_creds_model']
     };
 
-    const knownBooleans = ['notify_on_exploit', 'exploit_ai_remediation', 'ai_exploit_summary', 'exploit_nuclei_broad', 'exploit_ai_triage', 'manual_mode', 'debug_mode', 'scan_vuln_running', 'scan_vuln_no_ports', 'enable_attacks', 'blacklistcheck', 'wardriving_enabled', 'wardriving_display', 'wardriving_auto_export', 'wardriving_wigle_include_zigbee', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'ai_creds_enabled'];
+    const knownBooleans = ['notify_on_exploit', 'exploit_ai_remediation', 'ai_exploit_summary', 'ai_exploit_correlate', 'ai_exploit_trends', 'exploit_nuclei_broad', 'exploit_ai_triage', 'manual_mode', 'debug_mode', 'scan_vuln_running', 'scan_vuln_no_ports', 'enable_attacks', 'blacklistcheck', 'wardriving_enabled', 'wardriving_display', 'wardriving_auto_export', 'wardriving_wigle_include_zigbee', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'ai_creds_enabled'];
     const alwaysShowKeys = new Set(['network_max_failed_pings', 'gc9a01_mascot_color', 'ssd1306_i2c_address', 'lcd1602_i2c_address', 'spi_clock_mhz', 'max7219_spi_port', 'max7219_spi_device', 'max7219_block_orientation', 'display_brightness', 'wardriving_scan_interval', 'wardriving_gps_port', 'wardriving_gps_baudrate']);
     const fallbackValues = {
         network_max_failed_pings: 15,

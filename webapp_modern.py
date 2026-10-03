@@ -28569,6 +28569,60 @@ def get_exploit_remediation():
         return jsonify({'error': str(e), 'static': ''}), 500
 
 
+@app.route('/api/exploits/correlation')
+def get_exploit_correlation():
+    """Lateral-movement hypotheses: findings x captured credentials.
+
+    Framed as hypothesis, never as fact. Fail-open to a deterministic count
+    when AI is unavailable.
+    """
+    try:
+        from actions.ai_insights import correlate_for
+        from actions.exploit_engine import get_findings
+        payload = get_findings(limit=200)
+        out = correlate_for(payload.get('findings') or [], shared_data=shared_data)
+        out['finding_count'] = payload.get('count', 0)
+        response = jsonify(out)
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    except Exception as e:
+        logger.error(f"exploit correlation error: {e}")
+        return jsonify({'error': str(e), 'text': ''}), 500
+
+
+@app.route('/api/exploits/trend')
+def get_exploit_trend():
+    """New / resolved / regressed findings versus the previous snapshot.
+
+    Deterministic diff of the ledger - no model call. `window` is the age in
+    hours to treat as 'previous'.
+    """
+    try:
+        from actions.ai_insights import trend_for
+        from actions.exploit_engine import get_findings
+        try:
+            window_h = max(1.0, min(24 * 30, float(request.args.get('window', 24))))
+        except Exception:
+            window_h = 24.0
+        import time as _time
+        cutoff = _time.time() - (window_h * 3600.0)
+
+        all_findings = get_findings(limit=500)
+        rows = all_findings.get('findings') or []
+        current = [r for r in rows if (r.get('ts') or 0) >= cutoff]
+        previous = [r for r in rows if (r.get('ts') or 0) < cutoff]
+        out = trend_for(current, previous)
+        out['window_hours'] = window_h
+        out['previous_count'] = len(previous)
+        out['current_count'] = len(current)
+        response = jsonify(out)
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    except Exception as e:
+        logger.error(f"exploit trend error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/exploits/summary')
 def get_exploit_summary():
     """Short AI narrative over the findings ledger for the dashboard."""
