@@ -28194,6 +28194,209 @@ def get_exploit_findings():
         return jsonify({'error': str(e)}), 500
 
 
+# --------------------------------------------------------------------------
+# Scanner tooling: install / status
+# --------------------------------------------------------------------------
+# nikto, sqlmap, whatweb, ZAP, nuclei, nmap each need to be present before the
+# adv-vuln tab can use them. Nothing installs them implicitly - the operator
+# opts in from the UI so a surprise multi-hundred-MB download never happens
+# mid-scan.
+
+SCANNER_TOOLS = {
+    "nmap":    {"label": "Nmap",     "bins": ["nmap"],    "kind": "apt"},
+    "nuclei":  {"label": "Nuclei",   "bins": ["nuclei"],  "kind": "binary"},
+    "nikto":   {"label": "Nikto",    "bins": ["nikto"],   "kind": "apt"},
+    "sqlmap":  {"label": "SQLMap",   "bins": ["sqlmap"],  "kind": "apt"},
+    "whatweb": {"label": "WhatWeb",  "bins": ["whatweb"], "kind": "apt"},
+    "zap":     {"label": "OWASP ZAP","bins": ["zap.sh", "zaproxy"], "kind": "zap"},
+    "ffuf":    {"label": "ffuf",     "bins": ["ffuf"],    "kind": "apt"},
+}
+
+
+def _tool_status(name: str) -> Dict:
+    meta = SCANNER_TOOLS.get(name)
+    if not meta:
+        return {"name": name, "installed": False, "path": None, "label": name}
+    path = None
+    for b in meta["bins"]:
+        found = shutil.which(b)
+        if found:
+            path = found
+            break
+    if meta["kind"] == "zap" and not path:
+        for cand in ("/opt/zaproxy/zap.sh", "/usr/share/zaproxy/zap.sh",
+                     "/opt/zap/zap.sh"):
+            if os.path.exists(cand):
+                path = cand
+                break
+    return {"name": name, "label": meta["label"], "kind": meta["kind"],
+            "installed": bool(path), "path": path}
+
+
+@app.route('/api/tools/status')
+def get_tools_status():
+    """Which scanner tools are present on this host."""
+    try:
+        tools = [_tool_status(n) for n in SCANNER_TOOLS]
+        return jsonify({"tools": tools,
+                        "all_installed": all(t["installed"] for t in tools),
+                        "install_script": os.path.exists(
+                            os.path.join(os.path.dirname(__file__),
+                                         "scripts", "install_advanced_tools.sh"))})
+    except Exception as e:
+        logger.error(f"tools status error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/tools/install', methods=['POST'])
+def install_tools():
+    """Install one scanner tool, or all missing ones.
+
+    Long-running (apt + ZAP download), so this runs the installer in the
+    background and reports progress via /api/tools/status. Never blocks the
+    web request on a multi-hundred-MB download.
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        name = (payload.get("tool") or "").strip().lower()
+        if name and name not in SCANNER_TOOLS:
+            return jsonify({"error": f"unknown tool: {name}"}), 400
+        if os.geteuid() != 0:
+            return jsonify({"error": "install must run as root"}), 403
+
+        import subprocess as _sp
+        log_path = os.path.join(os.path.dirname(__file__), "data", "tools_install.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+
+        def _run(cmd):
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} {' '.join(cmd)}\n")
+                fh.flush()
+                _sp.run(cmd, stdout=fh, stderr=_sp.STDOUT, timeout=1800, check=False)
+
+        wanted = [name] if name else [n for n, m in SCANNER_TOOLS.items()
+                                      if not _tool_status(n)["installed"]]
+        if not wanted:
+            return jsonify({"status": "nothing-to-do",
+                            "tools": [_tool_status(n) for n in SCANNER_TOOLS]})
+
+        threading.Thread(
+            target=_install_tools_worker,
+            args=(wanted, log_path), daemon=True,
+        ).start()
+        return jsonify({"status": "started", "installing": wanted, "log": log_path})
+    except Exception as e:
+        logger.error(f"tools install error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+def _install_tools_worker(names, log_path):
+    """Background install. Best-effort; every failure is logged, never raised."""
+    import subprocess as _sp
+
+    def _log(msg):
+        try:
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+        except Exception:
+            pass
+
+    def _run(cmd, timeout=1800):
+        _log("$ " + " ".join(cmd))
+        try:
+            r = _sp.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+            if r.returncode != 0:
+                _log(f"  rc={r.returncode} {(r.stderr or r.stdout or '')[:300]}")
+            return r.returncode == 0
+        except Exception as e:
+            _log(f"  failed: {e}")
+            return False
+
+    _run(["apt-get", "update", "-qq"], timeout=600)
+    for name in names:
+        meta = SCANNER_TOOLS.get(name, {})
+        kind = meta.get("kind")
+        _log(f"--- installing {name} ({kind}) ---")
+        if kind == "apt":
+            pkg = name
+            if not _run(["apt-get", "install", "-y", "--no-install-recommends", pkg]):
+                _log(f"  apt package '{pkg}' unavailable - skipping")
+        elif kind == "binary" and name == "nuclei":
+            _run(["bash", "-c",
+                  "cd /tmp && curl -sL https://github.com/projectdiscovery/nuclei/"
+                  "releases/latest/download/nuclei_3.11.1_linux_arm64.zip -o n.zip && "
+                  "python3 -c \"import zipfile;zipfile.ZipFile('/tmp/n.zip').extractall('/usr/local/bin')\" && "
+                  "chmod +x /usr/local/bin/nuclei && rm -f /tmp/n.zip"], timeout=900)
+        elif kind == "zap":
+            _run(["bash", "-c",
+                  "mkdir -p /opt && cd /opt && "
+                  "curl -sL https://github.com/zaproxy/zaproxy/releases/latest/download/"
+                  "ZAP_2.15.0_Linux.tar.gz -o zap.tgz && tar xzf zap.tgz && rm -f zap.tgz"], timeout=1800)
+        else:
+            _log(f"  no installer for kind={kind}")
+        st = _tool_status(name)
+        _log(f"  -> installed={st['installed']} path={st['path']}")
+    _log("--- install run finished ---")
+
+
+@app.route('/api/tools/install-log')
+def tools_install_log():
+    try:
+        log_path = os.path.join(os.path.dirname(__file__), "data", "tools_install.log")
+        tail = ""
+        if os.path.exists(log_path):
+            with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+                tail = "".join(fh.readlines()[-400:])
+        return jsonify({"log": tail})
+    except Exception as e:
+        return jsonify({'error': str(e), 'log': ''}), 500
+
+
+@app.route('/api/exploits/remediation', methods=['POST'])
+def get_exploit_remediation():
+    """AI-refined remediation for one finding. Static FINDING_META text is
+    always returned alongside - the AI wording is a refinement, never a
+    replacement. Fail-open: any AI error returns the static text alone.
+    """
+    try:
+        from actions.ai_insights import remediation_for
+        payload = request.get_json(silent=True) or {}
+        finding = payload.get('finding') or {}
+        if not finding:
+            return jsonify({'error': 'finding required'}), 400
+        host_ctx = payload.get('host_context') or ''
+        out = remediation_for(finding, shared_data=shared_data, host_context=host_ctx)
+        response = jsonify(out)
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    except Exception as e:
+        logger.error(f"exploit remediation error: {e}")
+        return jsonify({'error': str(e), 'static': ''}), 500
+
+
+@app.route('/api/exploits/summary')
+def get_exploit_summary():
+    """Short AI narrative over the findings ledger for the dashboard."""
+    try:
+        from actions.ai_insights import summary_for
+        from actions.exploit_engine import get_findings
+        limit = 200
+        try:
+            limit = max(1, min(500, int(request.args.get('limit', 200))))
+        except Exception:
+            pass
+        payload = get_findings(limit=limit)
+        out = summary_for(payload.get('findings') or [], shared_data=shared_data)
+        out['count'] = payload.get('count', 0)
+        out['by_severity'] = payload.get('by_severity', {})
+        response = jsonify(out)
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    except Exception as e:
+        logger.error(f"exploit summary error: {e}")
+        return jsonify({'error': str(e), 'text': ''}), 500
+
+
 @app.route('/api/dashboard/quick')
 def get_dashboard_quick():
     """OPTIMIZED: Combined fast endpoint that returns all essential dashboard data in one call.

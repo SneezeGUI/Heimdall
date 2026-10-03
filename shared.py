@@ -900,6 +900,11 @@ class SharedData:
             # AI-assisted credentials: ranked (user, password) pairs from the
             # model before the wordlist spray. Fail-open. See
             # actions/ai_credential_engine.py.
+            # AI narration over exploit findings - see actions/ai_insights.py.
+            # Both are fail-open: an AI error falls back to static guidance.
+            "exploit_ai_remediation": True,
+            "ai_exploit_summary": True,
+
             "ai_creds_enabled": False,
             "ai_creds_max_pairs": 25,
             "ai_creds_model": "",

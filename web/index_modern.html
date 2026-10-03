@@ -5794,6 +5794,12 @@
                     </div>
                 </div>
 
+                <div id="exploit-ai-summary" class="glass rounded-xl border border-purple-800/50 bg-purple-950/20 px-4 py-3 mb-4 hidden">
+                    <div class="flex items-start gap-2">
+                        <span class="text-purple-300 text-xs font-semibold uppercase tracking-wide mt-0.5">AI summary</span>
+                        <p id="exploit-ai-summary-text" class="text-purple-100 text-sm leading-relaxed"></p>
+                    </div>
+                </div>
                 <div id="exploit-findings-summary" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-5"></div>
                 <div id="exploit-findings-list" class="space-y-3">
                     <div class="text-slate-500 text-sm py-8 text-center">Loading findings…</div>
@@ -6901,6 +6907,30 @@
 
                 <!-- Mesh forwarding banner: this board can't run a heavy scanner, a peer can -->
                 <div id="mesh-scan-flag" class="hidden mb-6 p-3 sm:p-4 bg-cyan-900/25 border border-cyan-600/50 rounded-lg text-xs sm:text-sm text-cyan-100 leading-relaxed"></div>
+
+                <!-- Scanner tool install / status -->
+                <div class="glass-card p-4 mb-4">
+                    <div class="flex items-center justify-between gap-3 flex-wrap">
+                        <div>
+                            <div class="text-sm font-semibold text-white">Scanner tooling</div>
+                            <div class="text-xs text-gray-400 mt-1">Install and manage the tools the advanced scans need. Nothing downloads without your say-so.</div>
+                        </div>
+                        <button id="install-missing-tools" onclick="installScannerTool()"
+                                class="hidden bg-Ragnar-600 hover:bg-Ragnar-700 text-white text-xs px-3 py-2 rounded-lg">Install missing tools</button>
+                    </div>
+                    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 mt-3">
+                        <button onclick="installScannerTool('nmap')" class="glass-card p-2 text-center hover:bg-slate-700/60"><div class="text-xs font-medium">Nmap</div><div class="text-[10px] text-gray-400">install</div></button>
+                        <button onclick="installScannerTool('nuclei')" class="glass-card p-2 text-center hover:bg-slate-700/60"><div class="text-xs font-medium">Nuclei</div><div class="text-[10px] text-gray-400">install</div></button>
+                        <button onclick="installScannerTool('nikto')" class="glass-card p-2 text-center hover:bg-slate-700/60"><div class="text-xs font-medium">Nikto</div><div class="text-[10px] text-gray-400">install</div></button>
+                        <button onclick="installScannerTool('sqlmap')" class="glass-card p-2 text-center hover:bg-slate-700/60"><div class="text-xs font-medium">SQLMap</div><div class="text-[10px] text-gray-400">install</div></button>
+                        <button onclick="installScannerTool('whatweb')" class="glass-card p-2 text-center hover:bg-slate-700/60"><div class="text-xs font-medium">WhatWeb</div><div class="text-[10px] text-gray-400">install</div></button>
+                        <button onclick="installScannerTool('zap')" class="glass-card p-2 text-center hover:bg-slate-700/60"><div class="text-xs font-medium">ZAP</div><div class="text-[10px] text-gray-400">install</div></button>
+                    </div>
+                    <div id="tools-install-output" class="hidden mt-3">
+                        <div class="text-[11px] uppercase tracking-wide text-slate-500 font-semibold mb-1">Install log</div>
+                        <pre id="tools-install-log" class="text-xs text-slate-300 bg-slate-900/70 rounded-lg px-3 py-2 max-h-48 overflow-auto"></pre>
+                    </div>
+                </div>
 
                 <!-- OWASP ZAP Control Panel -->
                 <div class="glass-card p-3 sm:p-4 mb-6" id="zap-control-panel">

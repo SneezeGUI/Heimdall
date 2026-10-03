@@ -602,6 +602,14 @@ const configMetadata = {
         label: "Alert on Exploit Findings",
         description: "Push a notification (Pushover / ntfy / webhook) when a NEW vulnerable finding appears. Deduped per finding, so re-scans do not spam. Uses the sinks configured in Notifications."
     },
+    exploit_ai_remediation: {
+        label: "AI Remediation",
+        description: "Refine each finding's remediation with the AI model, contextualised to the host. Shown alongside the static guidance - never replaces it. Cached per finding. Fail-open to the static text."
+    },
+    ai_exploit_summary: {
+        label: "AI Exploit Summary",
+        description: "One-paragraph AI narrative over the findings ledger on the dashboard. Leads with the most important finding and says what is clean. Cached. Fail-open to a plain count."
+    },
     exploit_nuclei_concurrency: {
         label: "Nuclei Concurrency",
         description: "Nuclei thread count (1-64). Default 5 is safe for 512 MB boards. Raise on boards with real RAM — 25 works well on 4 GB+. Applies to both targeted and broad scans."
@@ -20431,6 +20439,7 @@ async function loadExploitFindings() {
         if (!data) throw new Error('no payload');
         renderExploitFindingsSummary(data, summary);
         renderExploitFindings(data.findings || [], list);
+        loadExploitAiSummary();
     } catch (err) {
         console.error('exploit findings load failed', err);
         list.innerHTML = '<div class="text-red-400 text-sm py-8 text-center">Failed to load findings.</div>';
@@ -20455,6 +20464,122 @@ function renderExploitFindingsSummary(data, el) {
         <div class="text-[11px] uppercase tracking-wide opacity-70">Hosts · Results</div>
         <div class="text-2xl font-bold">${hosts} · ${total}</div>
     </div>`;
+}
+
+// --- Scanner tool install / status -------------------------------------
+
+async function loadToolStatus() {
+    try {
+        const d = await fetchAPI('/api/tools/status');
+        if (!d || !d.tools) return;
+        d.tools.forEach(t => {
+            const el = document.getElementById('scanner-' + t.name + '-status');
+            if (!el) return;
+            el.textContent = t.installed ? 'installed' : 'not installed';
+            el.className = 'text-xs text-gray-400 hidden sm:block '
+                + (t.installed ? 'text-green-400' : 'text-amber-400');
+        });
+        const btn = document.getElementById('install-missing-tools');
+        if (btn) {
+            const missing = d.tools.filter(t => !t.installed).length;
+            btn.classList.toggle('hidden', missing === 0);
+            btn.textContent = `Install missing tools (${missing})`;
+        }
+    } catch (e) {
+        console.debug('tool status unavailable', e);
+    }
+}
+
+async function installScannerTool(name) {
+    const logEl = document.getElementById('tools-install-log');
+    const out = document.getElementById('tools-install-output');
+    if (out) {
+        out.classList.remove('hidden');
+        if (logEl) logEl.textContent = 'Starting install…';
+    }
+    try {
+        const d = await fetchAPI('/api/tools/install', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(name ? { tool: name } : {})
+        });
+        if (d && d.error) {
+            if (logEl) logEl.textContent = 'Error: ' + d.error;
+            return;
+        }
+        if (logEl) logEl.textContent = 'Installing: ' + ((d && d.installing) || []).join(', ');
+        pollToolInstallLog();
+    } catch (e) {
+        if (logEl) logEl.textContent = 'Install request failed: ' + e.message;
+    }
+}
+
+let _toolLogTimer = null;
+function pollToolInstallLog() {
+    if (_toolLogTimer) return;
+    _toolLogTimer = setInterval(async () => {
+        try {
+            const d = await fetchAPI('/api/tools/install-log');
+            const logEl = document.getElementById('tools-install-log');
+            if (d && d.log && logEl) {
+                logEl.textContent = d.log;
+                logEl.scrollTop = logEl.scrollHeight;
+            }
+            const st = await fetchAPI('/api/tools/status');
+            if (st && st.all_installed && logEl && logEl.textContent.includes('install run finished')) {
+                clearInterval(_toolLogTimer);
+                _toolLogTimer = null;
+                loadToolStatus();
+            }
+        } catch (e) { /* keep polling */ }
+    }, 3000);
+}
+
+async function loadExploitAiSummary() {
+    const box = document.getElementById('exploit-ai-summary');
+    const txt = document.getElementById('exploit-ai-summary-text');
+    if (!box || !txt) return;
+    try {
+        const d = await fetchAPI('/api/exploits/summary');
+        if (!d || !d.text) return;
+        txt.textContent = d.text;
+        box.classList.remove('hidden');
+        box.title = d.ai ? 'AI-generated summary' : 'Deterministic counts (AI unavailable)';
+    } catch (e) {
+        console.debug('exploit AI summary unavailable', e);
+    }
+}
+
+async function loadExploitAiRemediation(btn, finding) {
+    // Static FINDING_META guidance is already rendered. This refines it with
+    // the model, contextualised to the host, and is labelled as AI output.
+    const host = btn.closest('[data-exploit-host]');
+    const out = btn.parentElement.querySelector('.exploit-ai-remediation');
+    if (!out) return;
+    btn.disabled = true;
+    btn.textContent = 'Asking…';
+    try {
+        const d = await fetchAPI('/api/exploits/remediation', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ finding })
+        });
+        if (d && d.ai) {
+            out.innerHTML = '<div class="text-[11px] uppercase tracking-wide text-purple-400 font-semibold mb-1">Suggested action (AI)</div>'
+                + '<div class="text-purple-100 text-sm bg-purple-950/30 border border-purple-900 rounded-lg px-3 py-2">'
+                + escapeHtml(d.ai) + '</div>';
+            out.classList.remove('hidden');
+        } else {
+            out.innerHTML = '<div class="text-slate-500 text-xs">AI unavailable - using static guidance above.</div>';
+            out.classList.remove('hidden');
+        }
+    } catch (e) {
+        out.innerHTML = '<div class="text-red-400 text-xs">AI request failed.</div>';
+        out.classList.remove('hidden');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Suggest action (AI)';
+    }
 }
 
 function renderExploitFindings(rows, el) {
@@ -20494,6 +20619,11 @@ function renderExploitFindings(rows, el) {
                 <div>
                     <div class="text-[11px] uppercase tracking-wide text-slate-500 font-semibold mb-1">What to do</div>
                     <div class="text-emerald-200 text-sm bg-emerald-950/30 border border-emerald-900 rounded-lg px-3 py-2">${exploitEscape(r.remediation || '—')}</div>
+                    <div class="mt-2">
+                        <button class="text-xs px-2 py-1 rounded bg-purple-900/50 border border-purple-700 text-purple-200 hover:bg-purple-800/60"
+                                onclick="loadExploitAiRemediation(this, ${exploitEscape(JSON.stringify(r).replace(/</g,'\\u003c'))})">Suggest action (AI)</button>
+                        <div class="exploit-ai-remediation hidden mt-2"></div>
+                    </div>
                 </div>
                 <div class="flex flex-wrap items-center gap-3 pt-1">
                     ${r.poc_id ? `<span class="text-slate-400 text-xs">Probe: <code class="text-slate-300">${exploitEscape(r.poc_id)}</code></span>` : ''}
@@ -23996,11 +24126,11 @@ function displayConfigForm(config) {
         'Network': ['network_max_failed_pings'],
         'Timing': ['startup_delay', 'web_delay', 'screen_delay', 'scan_interval'],
         'Display': ['epd_type', 'screen_reversed', 'spi_clock_mhz', 'gc9a01_mascot_color', 'ssd1306_i2c_address', 'lcd1602_i2c_address', 'max7219_spi_port', 'max7219_spi_device', 'max7219_block_orientation', 'display_brightness'],
-        'Exploits': ['notify_on_exploit', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'exploit_allowlist', 'exploit_min_cvss', 'exploit_max_per_host', 'exploit_ai_triage', 'exploit_ai_model', 'exploit_nuclei_concurrency', 'exploit_nuclei_broad', 'exploit_nuclei_severity', 'exploit_nuclei_timeout'],
+        'Exploits': ['notify_on_exploit', 'exploit_ai_remediation', 'ai_exploit_summary', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'exploit_allowlist', 'exploit_min_cvss', 'exploit_max_per_host', 'exploit_ai_triage', 'exploit_ai_model', 'exploit_nuclei_concurrency', 'exploit_nuclei_broad', 'exploit_nuclei_severity', 'exploit_nuclei_timeout'],
         'AI Credentials': ['ai_creds_enabled', 'ai_creds_max_pairs', 'ai_creds_model']
     };
 
-    const knownBooleans = ['notify_on_exploit', 'exploit_nuclei_broad', 'exploit_ai_triage', 'manual_mode', 'debug_mode', 'scan_vuln_running', 'scan_vuln_no_ports', 'enable_attacks', 'blacklistcheck', 'wardriving_enabled', 'wardriving_display', 'wardriving_auto_export', 'wardriving_wigle_include_zigbee', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'ai_creds_enabled'];
+    const knownBooleans = ['notify_on_exploit', 'exploit_ai_remediation', 'ai_exploit_summary', 'exploit_nuclei_broad', 'exploit_ai_triage', 'manual_mode', 'debug_mode', 'scan_vuln_running', 'scan_vuln_no_ports', 'enable_attacks', 'blacklistcheck', 'wardriving_enabled', 'wardriving_display', 'wardriving_auto_export', 'wardriving_wigle_include_zigbee', 'exploit_enabled', 'exploit_allow_all', 'exploit_allow_external', 'ai_creds_enabled'];
     const alwaysShowKeys = new Set(['network_max_failed_pings', 'gc9a01_mascot_color', 'ssd1306_i2c_address', 'lcd1602_i2c_address', 'spi_clock_mhz', 'max7219_spi_port', 'max7219_spi_device', 'max7219_block_orientation', 'display_brightness', 'wardriving_scan_interval', 'wardriving_gps_port', 'wardriving_gps_baudrate']);
     const fallbackValues = {
         network_max_failed_pings: 15,
@@ -34480,6 +34610,7 @@ function updateWardrivingToggleButton() {
 // ============================================================================
 
 async function loadAdvancedVulnData() {
+    loadToolStatus();
     try {
         // Fetch status and findings in parallel for faster load
         const [statusResponse, findingsResponse] = await Promise.all([
