@@ -542,9 +542,12 @@ class Display:
                 self.shared_data.ragnarstatustext2 = wifi_status_text
                 # Per-tick: the display loop re-renders every few seconds.
                 # Only surface a change at INFO.
-                prev = getattr(self, "_last_wifi_status_text", None)
+                # Class-level cache: the display object is rebuilt on refresh,
+                # so a per-instance cache resets every tick and the line
+                # repeats forever.
+                prev = getattr(Display, "_last_wifi_status_text", None)
                 if wifi_status_text != prev:
-                    self._last_wifi_status_text = wifi_status_text
+                    Display._last_wifi_status_text = wifi_status_text
                     logger.info(f"[DISPLAY] WiFi status text: '{wifi_status_text}'")
                 else:
                     logger.debug(f"[DISPLAY] WiFi status text: '{wifi_status_text}'")
