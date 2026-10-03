@@ -272,13 +272,41 @@ class ServerCapabilities:
     _TOOL_BIN_DIRS = ('/usr/bin', '/usr/local/bin', '/usr/sbin', '/bin',
                       '/sbin', '/snap/bin')
 
+    # Tools whose executable name differs from the registry key, or that
+    # install outside PATH. ZAP unpacks to a versioned dir (/opt/ZAP_2.17.0/)
+    # and its launcher is `zap.sh`, so a plain `which("zap")` never finds it.
+    _TOOL_ALIASES = {
+        "zap": ("zap.sh", "zaproxy"),
+        "nuclei": ("nuclei",),
+    }
+    _TOOL_SEARCH_ROOTS = ("/opt", "/usr/share", "/usr/local")
+
     @classmethod
     def _tool_present(cls, tool_name):
-        """True if `tool_name` is on PATH or in a common bin dir."""
-        if shutil.which(tool_name):
-            return True
-        return any(os.path.exists(os.path.join(d, tool_name))
-                   for d in cls._TOOL_BIN_DIRS)
+        """True if `tool_name` is on PATH, in a common bin dir, or in a known
+        non-PATH install location."""
+        names = cls._TOOL_ALIASES.get(tool_name, (tool_name,))
+        for n in names:
+            if shutil.which(n):
+                return True
+            if any(os.path.exists(os.path.join(d, n))
+                   for d in cls._TOOL_BIN_DIRS):
+                return True
+        # Versioned installs (ZAP -> /opt/ZAP_2.17.0/zap.sh). Walk the usual
+        # roots rather than hardcoding a release number.
+        if tool_name in cls._TOOL_ALIASES:
+            for root in cls._TOOL_SEARCH_ROOTS:
+                try:
+                    for dirpath, dirnames, _files in os.walk(root):
+                        base = os.path.basename(dirpath)
+                        if tool_name == "zap" and base.upper().startswith("ZAP"):
+                            if any(os.path.exists(os.path.join(dirpath, n))
+                                   for n in names):
+                                return True
+                        dirnames.sort()
+                except Exception:
+                    pass
+        return False
 
     def _check_tool_availability(self):
         """Check which security tools are available"""
@@ -331,10 +359,19 @@ class ServerCapabilities:
         #     rest of the tab stays usable.
         # Advanced Vuln needs nmap, which Ragnar already uses.
         caps.advanced_vuln_enabled = caps.available_tools.get('nmap', False)
-        caps.zap_enabled = caps.total_ram_gb >= self.ZAP_MIN_RAM_GB
+        # ZAP needs BOTH the binary and the RAM floor. Gating on RAM alone
+        # greys the tool in on boxes that never installed it and out on boxes
+        # that have it but are small.
+        caps.zap_enabled = (
+            caps.total_ram_gb >= self.ZAP_MIN_RAM_GB
+            and caps.available_tools.get("zap", False)
+        )
         # Nuclei is the other memory-hungry scanner: greys out below ~900MB so
         # a Pi Zero 2 W can't crash on it (see NUCLEI_MIN_RAM_MB).
-        caps.nuclei_enabled = (caps.total_ram_gb * 1024) >= self.NUCLEI_MIN_RAM_MB
+        caps.nuclei_enabled = (
+            (caps.total_ram_gb * 1024) >= self.NUCLEI_MIN_RAM_MB
+            and caps.available_tools.get("nuclei", False)
+        )
 
         if caps.is_server_capable:
             # Parallel scanning: enabled on multi-core systems
