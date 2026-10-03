@@ -20468,17 +20468,24 @@ function renderExploitFindingsSummary(data, el) {
 
 // --- Scanner tool install / status -------------------------------------
 
+// Single source of truth for "is this tool actually installed".
+// updateScannerStatus() owns the DOM; this cache feeds it. Letting both write
+// the same element made them overwrite each other and ZAP flickered between
+// installed / not installed depending on which fired last.
+let _toolInstallCache = null;
+
 async function loadToolStatus() {
     try {
         const d = await fetchAPI('/api/tools/status');
         if (!d || !d.tools) return;
+        _toolInstallCache = {};
         d.tools.forEach(t => {
-            const el = document.getElementById('scanner-' + t.name + '-status');
-            if (!el) return;
-            el.textContent = t.installed ? 'installed' : 'not installed';
-            el.className = 'text-xs text-gray-400 hidden sm:block '
-                + (t.installed ? 'text-green-400' : 'text-amber-400');
+            _toolInstallCache[t.name] = !!t.installed;
         });
+        // Refresh whatever updateScannerStatus has already drawn.
+        if (typeof advVulnScannersStatusCache !== 'undefined' && advVulnScannersStatusCache) {
+            updateScannerStatus(advVulnScannersStatusCache, advVulnNucleiTemplatesCache);
+        }
         const btn = document.getElementById('install-missing-tools');
         if (btn) {
             const missing = d.tools.filter(t => !t.installed).length;
@@ -35247,7 +35254,11 @@ function updateScannerStatus(scanners, nucleiTemplates) {
         const cardEl = document.getElementById(`scanner-${id.replace('_', '-')}`);
 
         if (statusEl) {
-            const available = scanners[id];
+            // OR in the install-detection cache: `scanners` comes from
+            // server_capabilities (RAM gates + a PATH probe that misses
+            // ZAP's versioned /opt install), so it can report a tool missing
+            // that is demonstrably present.
+            const available = !!scanners[id] || !!(_toolInstallCache && _toolInstallCache[id]);
             if (id === 'nuclei') {
                 updateNucleiCardStatus(statusEl, available, advVulnNucleiTemplatesCache, scanners.nuclei_installing, scanners.nuclei_templates_updating, scanners.nuclei_ram_ok, (advVulnMeshScan || {}).nuclei);
             } else if (id === 'zap') {
