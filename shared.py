@@ -204,7 +204,7 @@ DISPLAY_PROFILES = {
 }
 
 
-logger = Logger(name="shared.py", level=logging.DEBUG) # Create a logger object 
+logger = Logger(name="shared.py", level=logging.INFO) # Create a logger object 
 
 class SharedData:
     """Shared data between the different modules."""
@@ -1781,6 +1781,16 @@ class SharedData:
         except FileNotFoundError:
             logger.error("Error loading configuration: File not found.")
             self.save_config()
+
+
+        # Apply the operator's log-level switches. Without this every module
+        # keeps whatever level it was constructed with (DEBUG, historically)
+        # and the log_debug / log_info config keys do nothing.
+        try:
+            from logger import configure_log_levels
+            configure_log_levels(self.config)
+        except Exception as _lerr:
+            logger.debug("log-level config not applied: %s", _lerr)
 
     def save_config(self):
         """Save the configuration to the shared configuration JSON file.

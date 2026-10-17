@@ -42,7 +42,7 @@ class VerticalFilter(logging.Filter):
 class Logger:
     LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'logs')
 
-    def __init__(self, name, level=logging.DEBUG, enable_file_logging=True):
+    def __init__(self, name, level=logging.INFO, enable_file_logging=True):
         self.logger = logging.getLogger(name)
         self.logger.setLevel(level)
         self.logger.propagate = False  # Prevent duplicate logs via root logger
@@ -145,3 +145,51 @@ if __name__ == "__main__":
     # Disable logging
     log.disable_logging()
     log.error("This error message should not appear")
+
+
+def configure_log_levels(cfg):
+    """Apply the operator's log-level config to every logger and handler.
+
+    The config has always carried log_debug / log_info / log_warning /
+    log_error / log_critical, but nothing ever read them: 55 modules were
+    hard-wired to `level=logging.DEBUG`, so DEBUG spammed the journal at ~13
+    lines/second with log_debug set to False. This walks the whole logging
+    hierarchy and sets one level, derived from which switches are on.
+    """
+    if not isinstance(cfg, dict):
+        return
+    # Lowest enabled level wins - that is the level that is *visible*.
+    order = [
+        ("log_critical", logging.CRITICAL),
+        ("log_error", logging.ERROR),
+        ("log_warning", logging.WARNING),
+        ("log_info", logging.INFO),
+        ("log_debug", logging.DEBUG),
+    ]
+    level = logging.WARNING          # sane default if nothing is set
+    for key, lvl in order:
+        if cfg.get(key):
+            level = lvl
+    # debug_mode is an independent switch that forces verbose output.
+    if cfg.get("debug_mode"):
+        level = logging.DEBUG
+
+    root = logging.getLogger()
+    root.setLevel(level)
+    for h in root.handlers:
+        try:
+            h.setLevel(level)
+        except Exception:
+            pass
+    for name, log in logging.Logger.manager.loggerDict.items():
+        try:
+            if isinstance(log, logging.Logger):
+                log.setLevel(level)
+                for h in log.handlers:
+                    try:
+                        h.setLevel(level)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    logging.getLogger().info(f"logging level set to {logging.getLevelName(level)}")

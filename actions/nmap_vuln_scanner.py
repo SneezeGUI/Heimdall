@@ -328,7 +328,6 @@ class NmapVulnScanner:
     DEFAULT_NSE_SCRIPTS = (
         "vulners.nse",
         "smb-vuln-ms17-010.nse",
-        "smb-vuln-cve-2009-3103.nse",
         "smb-vuln-cve2009-3103.nse",
         "smb-vuln-regsvc-dos.nse",
         "ssl-heartbleed.nse",
@@ -336,17 +335,40 @@ class NmapVulnScanner:
         "ssl-ccs-injection.nse",
         "ssl-dh-params.nse",
         "http-vuln-cve2017-5638.nse",
-        "http-vuln-cve2014-0160.nse",
     )
 
     def _nse_script_spec(self) -> str:
-        """Return the comma-joined NSE script list (config-overridable)."""
+        """Return the comma-joined NSE script list (config-overridable).
+
+        Names are validated against the installed script directory. nmap
+        aborts the whole scan with "match a category, filename, or directory"
+        when a name is wrong, and it logs a multi-line Lua traceback every
+        time - two bad names in the default list were producing ~700 log
+        lines a minute and silently failing every vuln scan.
+        """
         raw = self.shared_data.config.get("nmap_vuln_scripts")
         if isinstance(raw, str) and raw.strip():
-            return raw.strip()
-        if isinstance(raw, (list, tuple)) and raw:
-            return ",".join(str(x).strip() for x in raw if str(x).strip())
-        return ",".join(self.DEFAULT_NSE_SCRIPTS)
+            names = [x.strip() for x in raw.split(",") if x.strip()]
+        elif isinstance(raw, (list, tuple)) and raw:
+            names = [str(x).strip() for x in raw if str(x).strip()]
+        else:
+            names = list(self.DEFAULT_NSE_SCRIPTS)
+
+        script_dir = "/usr/share/nmap/scripts"
+        valid, dropped = [], []
+        for n in names:
+            bare = n[:-4] if n.endswith(".nse") else n
+            if os.path.isdir(script_dir):
+                if os.path.exists(os.path.join(script_dir, bare + ".nse")):
+                    valid.append(bare + ".nse")
+                else:
+                    dropped.append(n)
+            else:
+                valid.append(n)
+        if dropped:
+            logger.warning("nmap: skipping unknown NSE script(s): %s",
+                           ", ".join(dropped))
+        return ",".join(valid) if valid else "vulners.nse"
 
     def scan_vulnerabilities(self, ip, hostname, mac, ports):
         combined_result = ""
