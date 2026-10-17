@@ -15,6 +15,9 @@
 
 
 import logging
+
+# Highest-verbosity level the operator has allowed. None = unconstrained.
+_CONFIGURED_LEVEL = None
 from logging.handlers import RotatingFileHandler
 import os
 try:
@@ -43,6 +46,13 @@ class Logger:
     LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'logs')
 
     def __init__(self, name, level=logging.INFO, enable_file_logging=True):
+        # Honour the operator's configured floor. Modules construct their
+        # Logger at import time - some of them AFTER configure_log_levels has
+        # run - and an explicit level=logging.DEBUG in a call site would
+        # otherwise override the config silently. Whichever is *less* verbose
+        # wins: the config is the ceiling on noise.
+        if _CONFIGURED_LEVEL is not None and level < _CONFIGURED_LEVEL:
+            level = _CONFIGURED_LEVEL
         self.logger = logging.getLogger(name)
         self.logger.setLevel(level)
         self.logger.propagate = False  # Prevent duplicate logs via root logger
@@ -173,6 +183,9 @@ def configure_log_levels(cfg):
     # debug_mode is an independent switch that forces verbose output.
     if cfg.get("debug_mode"):
         level = logging.DEBUG
+
+    global _CONFIGURED_LEVEL
+    _CONFIGURED_LEVEL = level
 
     root = logging.getLogger()
     root.setLevel(level)
