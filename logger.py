@@ -192,4 +192,5 @@ def configure_log_levels(cfg):
                         pass
         except Exception:
             pass
-    logging.getLogger().info(f"logging level set to {logging.getLevelName(level)}")
+    # WARNING so we can confirm it ran even when INFO is filtered out.
+    logging.getLogger().warning(f"logging level set to {logging.getLevelName(level)}")

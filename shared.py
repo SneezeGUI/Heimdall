@@ -248,6 +248,12 @@ class SharedData:
         self.config = self.default_config.copy() # Configuration of the application
         # Load existing configuration first
         self.load_config()
+        # Apply the operator's log-level switches AFTER config is in place.
+        # This used to live at the end of load_config(), but that method only
+        # catches json.JSONDecodeError and FileNotFoundError - any other
+        # exception escaped and silently skipped the call, leaving 55 modules
+        # hard-wired to DEBUG and the log_debug config key doing nothing.
+        self._apply_log_levels()
 
         if not self._pager_mode and MultiInterfaceState is not None:
             self.multi_interface_state = MultiInterfaceState(self)
@@ -1751,6 +1757,18 @@ class SharedData:
             logger.error(f"Unexpected error in initialize_csv: {e}")
 
 
+    def _apply_log_levels(self):
+        """Push the log-level config onto every logger. Visible at WARNING so
+        we can confirm it ran - this is the switch that stops DEBUG spam."""
+        try:
+            from logger import configure_log_levels
+            configure_log_levels(self.config)
+        except Exception as _lerr:
+            try:
+                logger.warning("log-level config not applied: %s", _lerr)
+            except Exception:
+                pass
+
     def load_config(self):
         """Load the configuration from the shared configuration JSON file."""
         try:
@@ -1782,15 +1800,6 @@ class SharedData:
             logger.error("Error loading configuration: File not found.")
             self.save_config()
 
-
-        # Apply the operator's log-level switches. Without this every module
-        # keeps whatever level it was constructed with (DEBUG, historically)
-        # and the log_debug / log_info config keys do nothing.
-        try:
-            from logger import configure_log_levels
-            configure_log_levels(self.config)
-        except Exception as _lerr:
-            logger.debug("log-level config not applied: %s", _lerr)
 
     def save_config(self):
         """Save the configuration to the shared configuration JSON file.
