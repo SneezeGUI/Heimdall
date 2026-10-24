@@ -117,9 +117,14 @@ DEFAULT_SOURCES = {
                     'paths': ['/var/log/ragnar/aruba_guard.jsonl']},
     'apc_guard': {'label': 'APC Guard (NMC Ripple20)',
                   'paths': ['/var/log/ragnar/apc_guard.jsonl']},
+    'liebert_guard': {'label': 'Liebert Guard (RomPager / RDU101)',
+                      'paths': ['/var/log/ragnar/liebert_guard.jsonl']},
     # Continuous apcguard@<iface> daemon (python/apcguard.py, scripts/apcguard@.service).
     'apcguard': {'label': 'APC Guard daemon (NMC Ripple20)',
                  'paths': ['/var/log/ragnar/apcguard.jsonl']},
+    # Continuous liebert_guard@<iface> daemon (python/liebert_guard.py).
+    'liebertguard': {'label': 'Liebert Guard daemon (RomPager / RDU101)',
+                     'paths': ['/var/log/ragnar/liebertguard.jsonl']},
     # In-app L5-L7 passive observers (ssh_watch / telnet_watch do_*_watch) emit
     # their non-info findings here so the unified pane tails them too.
     'ssh_watch':     {'label': 'SSH Watch (regreSSHion / Terrapin)',
@@ -141,6 +146,15 @@ DEFAULT_SOURCES = {
     # flapping, Marker floods — the HIGH/CRITICAL findings land here.
     'lacp_watch':    {'label': 'LACP Watch (aggregation hijack / flapping)',
                       'paths': ['/var/log/ragnar/lacp_watch.jsonl']},
+    # 802.3ah Link OAM (do_oam_watch): Loopback Control link blackhole, forged /
+    # flapping failure flags, re-peering, cleartext MIB reads, malformed OAMPDUs.
+    'oam_watch':     {'label': 'OAM Watch (Link OAM loopback blackhole / flag forgery)',
+                      'paths': ['/var/log/ragnar/oam_watch.jsonl']},
+    # 802.1ag CFM / Y.1731 service OAM (do_cfm_watch): forged APS protection
+    # switching, forged AIS / CCM, moved / duplicate MEPs, linktrace sweeps, LBM
+    # floods, malformed CFM (CVE-2020-1639) and the CVE-2025-52961 load pattern.
+    'cfm_watch':     {'label': 'CFM Watch (802.1ag / Y.1731 protection-switch / CCM forgery)',
+                      'paths': ['/var/log/ragnar/cfm_watch.jsonl']},
     # RPC / NetLogon Watch (do_rpc_watch): Zerologon chain, NetLogon secure-channel
     # posture, DCERPC auth-trailer posture, NTLM weaknesses, DCSync / remote-exec /
     # backup-key / EPM-sweep, and WinRM/WS-Man posture. Coercion is Relay Watch's.
@@ -166,6 +180,16 @@ DEFAULT_SOURCES = {
     # (CVE-2018-6789, KEV) — do_smtp_watch.
     'smtp_watch':    {'label': 'SMTP Watch (Exim expansion / SNI / AUTH b64)',
                       'paths': ['/var/log/ragnar/smtp_watch.jsonl']},
+    # Modbus/TCP posture: off-baseline writes, FC8 Force Listen Only / restart, UMAS
+    # + the ModiPwn sequence (CVE-2021-22779) and malformed MBAP/PDU framing — the
+    # libmodbus trigger (CVE-2019-14462/14463, CVE-2024-10918) — do_modbus_watch.
+    'modbus_watch':  {'label': 'Modbus Watch (PLC write / listen-only / UMAS)',
+                      'paths': ['/var/log/ragnar/modbus_watch.jsonl']},
+    # LLDP (802.1AB) malformed-TLV CVE shapes (lldpd CVE-2015-8011, Cisco, Juniper
+    # l2cpd, OVS, Aruba, PAN-OS, SonicWall), LLDP flood and forged neighbour —
+    # do_lldp_watch. Version-screening notes stay in the card.
+    'lldp_watch':    {'label': 'LLDP Watch (malformed TLV / flood / forged neighbour)',
+                      'paths': ['/var/log/ragnar/lldp_watch.jsonl']},
     # MPLS / SR-MPLS / SRv6 label & segment manipulation (do_sr_mpls_watch): a label
     # or SRH on a customer-facing port (label-injection / VRF-hopping), reserved /
     # implicit-null labels forwarded, TTL-expired frames forwarded, SRv6 path
@@ -268,13 +292,21 @@ def normalize(raw, source):
     if ts is None:
         ts = time.time()
     codes = _codes(raw)
-    title = _first(raw, 'summary', 'reason', 'title', 'detail', 'message', 'msg',
+    title = _first(raw, 'summary', 'reason', 'title', 'note', 'detail', 'message', 'msg',
                    'signal', 'sni', 'subject_cn')
     if not title:
         title = ', '.join(codes) if codes else source
     src = _first(raw, 'src', 'sender_ip', 'server_ip', 'saddr', 'source_ip',
                  'identity', 'system')
     target = _first(raw, 'target', 'dst', 'group', 'victim', 'server_port')
+    # server/client records (liebert_guard): an attempt comes FROM the client at the
+    # server; a banner finding is about the server itself.
+    if src is None and raw.get('server') is not None:
+        attempt = str(raw.get('severity', '')).lower() in ('high', 'critical') \
+            and raw.get('banner') is None and raw.get('client') is not None
+        src = raw.get('client') if attempt else raw.get('server')
+        if attempt and target is None:
+            target = raw.get('server')
     module = raw.get('module') or source
     # Dedup key: same source + finding + endpoints = the same standing condition.
     key = '|'.join([source, ','.join(codes) or str(title),
@@ -492,6 +524,17 @@ def _self_test():
     apc = normalize({'module': 'apcguard', 'code': 'APC-101', 'severity': 'critical',
                      'title': 'Fragmented IPv4-in-IP tunnel datagram sent to an NMC',
                      'detail': {'ident': 7}, 'src': '8.8.8.8'}, 'apcguard')
+    lg = normalize({'module': 'liebert_guard', 'code': 'LG-101', 'severity': 'high',
+                    'server': '10.9.0.5', 'client': '203.0.113.9', 'banner': None,
+                    'note': 'HTTP request line with a method token over 64 bytes',
+                    'detail': 'method_len=70'}, 'liebertguard')
+    lb = normalize({'module': 'liebert_guard', 'code': 'LG-001', 'severity': 'critical',
+                    'server': '10.9.0.5', 'client': '10.9.0.77', 'banner': 'RomPager/4.07',
+                    'note': 'RomPager banner is in the CVE-2014-9222 range', 'detail': None},
+                   'liebertguard')
+    ck('liebert attempt: src=client target=server, note as title',
+       lg['src'] == '203.0.113.9' and lg['target'] == '10.9.0.5' and lg['title'].startswith('HTTP request'))
+    ck('liebert banner: src=server', lb['src'] == '10.9.0.5' and lb['title'].startswith('RomPager'))
     ck('apcguard title beats dict detail', apc['title'].startswith('Fragmented')
        and apc['severity'] == 'critical')
 

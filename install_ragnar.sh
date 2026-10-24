@@ -48,8 +48,58 @@ PKG_PRESENT_CMD=""
 ARCH=""
 IS_ARM=false
 
+# ── Unattended / image-build mode ─────────────────────────────────────────────
+# The installer is interactive by default (menus + y/n prompts). Two flags turn
+# that off so it can run with no human at the console:
+#
+#   --unattended   Answer every prompt from environment variables instead of
+#                  reading stdin. Used by the "Ragnar OS" image build and by
+#                  anyone scripting a fresh install.
+#   --image-build  Implies --unattended, and additionally assumes we are running
+#                  inside a pi-gen/chroot while an SD-card image is being built:
+#                  never start/restart a service, never touch a running kernel
+#                  (sysctl -p), never reboot, never probe localhost. Only enable
+#                  units so they come up on the target device's first boot.
+#
+# Environment variables consulted in unattended mode (all optional):
+#   RAGNAR_PROFILE           epaper | tft | server-display | headless |
+#                            hbp0 | docker  (default: headless)
+#   RAGNAR_DISPLAY           display driver id for epaper/tft profiles, e.g.
+#                            epd2in13_V4, gc9a01, ili9486, ssd1306, lcd1602 …
+#                            (default for tft: gc9a01; for epaper: epd2in13_V4)
+#   RAGNAR_INSTALL_ALL_DISPLAYS  1 = install every display driver even on a
+#                            headless profile (so a screen can be enabled later
+#                            from Config → Display without reinstalling). The OS
+#                            image sets this.
+#   RAGNAR_INSTALL_PISUGAR   y/n  (default: n)
+#   RAGNAR_INSTALL_ADVANCED  auto | yes | no  (default: auto = RAM-gated)
+#   RAGNAR_REBOOT            y/n  (default: n)
+#   RAGNAR_MESH_AUTHKEY …    see setup_ragnar_mesh (already unattended-aware)
+UNATTENDED=false
+IMAGE_BUILD=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --unattended|--non-interactive) UNATTENDED=true ;;
+        --image-build) UNATTENDED=true; IMAGE_BUILD=true ;;
+    esac
+done
+# Allow the environment to request unattended mode too (handy from pi-gen).
+[ "${RAGNAR_UNATTENDED:-0}" = "1" ] && UNATTENDED=true
+[ "${RAGNAR_IMAGE_BUILD:-0}" = "1" ] && { UNATTENDED=true; IMAGE_BUILD=true; }
+
 if [[ "$1" == "--help" ]]; then
-    echo "Usage: sudo ./install_ragnar.sh"
+    echo "Usage: sudo ./install_ragnar.sh [--unattended|--image-build]"
+    echo ""
+    echo "  (no flag)      Interactive install with menus (default)."
+    echo "  --unattended   Answer all prompts from RAGNAR_* environment variables."
+    echo "  --image-build  Unattended, and build-safe (enable units only, never"
+    echo "                 start services or reboot). Used to bake the Ragnar OS image."
+    echo ""
+    echo "Unattended env vars: RAGNAR_PROFILE, RAGNAR_DISPLAY, RAGNAR_INSTALL_PISUGAR,"
+    echo "  RAGNAR_INSTALL_ADVANCED, RAGNAR_INSTALL_ALL_DISPLAYS, RAGNAR_REBOOT,"
+    echo "  RAGNAR_MESH_AUTHKEY (see comments at the top of this script)."
+    echo ""
     echo "Make sure you have the necessary permissions and that all dependencies are met."
     exit 0
 fi
@@ -82,6 +132,13 @@ handle_error() {
     local error_message=$1
     log "ERROR" "An error occurred during: $error_message (Error code: $error_code)"
     log "ERROR" "Check the log file for details: $LOG_FILE"
+
+    # Unattended runs have no console to answer; skip the failed step and press
+    # on rather than block forever on a read that never returns.
+    if [ "$UNATTENDED" = true ]; then
+        log "WARNING" "Unattended mode — skipping failed step: $error_message"
+        return 0
+    fi
 
     echo -e "\n${RED}Would you like to:"
     echo "1. Retry this step"
@@ -236,9 +293,15 @@ detect_platform() {
        || grep -qi "Raspberry Pi" /proc/device-tree/model 2>/dev/null; then
         IS_PI=true
     fi
+    # Image builds run in a chroot whose /proc belongs to the build host (often
+    # an x86 CI runner), so the detection above sees the wrong machine. The
+    # target is a Pi by construction, so let the build force it on.
+    [ "${RAGNAR_FORCE_PI:-0}" = "1" ] && IS_PI=true
 
     case "$OS_ID" in
-        debian|ubuntu|raspbian)
+        debian|ubuntu|raspbian|kali)
+            # kali: the Ragnar OS "Ulfberht" edition is built on a Kali base.
+            # It is Debian-family (apt), so it shares this branch.
             PKG_MGR="apt"
             UPDATE_CMD="apt-get update -y"
             # noninteractive: packages like iperf3 ask debconf questions that
@@ -459,6 +522,11 @@ check_system_compatibility() {
     fi
     log "INFO" "Architecture detected: ${architecture} (proceeding without compatibility warnings)"
 
+    if [ "$should_ask_confirmation" = true ] && [ "$UNATTENDED" = true ]; then
+        log "WARNING" "Unattended mode — continuing despite compatibility warnings"
+        should_ask_confirmation=false
+    fi
+
     if [ "$should_ask_confirmation" = true ]; then
         echo -e "\n${YELLOW}Some system compatibility warnings were detected (see above).${NC}"
         echo -e "${YELLOW}The installation might not work as expected.${NC}"
@@ -495,6 +563,11 @@ check_internet() {
         log "WARNING" "No internet connectivity detected!"
         echo -e "${YELLOW}Internet connection is required to download Python packages.${NC}"
         echo -e "${YELLOW}Please check your network connection and try again.${NC}"
+        if [ "$UNATTENDED" = true ]; then
+            log "WARNING" "Unattended mode — continuing without verified internet connection"
+            return 0
+        fi
+
         echo -e "\nDo you want to:"
         echo "1. Continue anyway (installation may fail)"
         echo "2. Exit and fix network issues first (recommended)"
@@ -753,6 +826,26 @@ EOF
         log "WARNING" "rfkill not available - WiFi blocking status unknown"
     fi
 
+    # Keep ModemManager off Espressif USB serial/JTAG devices (VID 303a): the
+    # ESP-SDR node (RF Waterfall) and ESP32 GPS/wardrive nodes all enumerate as
+    # a ttyACM "USB JTAG/serial debug unit", which MM mistakes for a cellular
+    # modem and probes with AT commands + DTR/RTS toggles — that resets the chip
+    # and wedges a running SDR capture. Tag them ID_MM_DEVICE_IGNORE so MM leaves
+    # them alone (real LTE modems for the cellular-uplink feature keep working).
+    cat > /etc/udev/rules.d/99-ragnar-espsdr.rules << 'EOF'
+# Ragnar: ModemManager must not probe Espressif USB serial/JTAG devices
+# (ESP-SDR, ESP32 GPS/wardrive nodes). AT-command probing wedges them.
+SUBSYSTEM=="tty", ACTION=="add", ATTRS{idVendor}=="303a", ENV{ID_MM_DEVICE_IGNORE}="1"
+# usb-device match too, so MM skips the whole device, not just the tty.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="303a", ENV{ID_MM_DEVICE_IGNORE}="1"
+EOF
+    chmod 644 /etc/udev/rules.d/99-ragnar-espsdr.rules
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules 2>/dev/null || true
+        udevadm trigger --subsystem-match=tty 2>/dev/null || true
+    fi
+    log "SUCCESS" "ModemManager set to ignore Espressif serial devices (ESP-SDR / ESP32 nodes)"
+
     # RTL-SDR dongles (RTL-SDR Blog V3/V4, Nooelec NESDR, RTL-SDR.com, and any
     # generic RTL2832U stick) drive the sub-GHz half of the RF Waterfall and the
     # ISM decoder in rtl_sdr.py. Two things stop a freshly-plugged dongle from
@@ -862,10 +955,38 @@ EOF
 DAEMON_ARGS="-c -e -f -s"
 EOF
         systemctl enable lldpd 2>/dev/null || true
-        systemctl restart lldpd 2>/dev/null || true
+        [ "$IMAGE_BUILD" = true ] || systemctl restart lldpd 2>/dev/null || true
         log "SUCCESS" "Configured lldpd (LLDP/CDP/EDP/FDP/SONMP) for switch discovery"
     else
         log "WARNING" "lldpd not available - switch discovery (Switch & L2 tab) will be limited"
+    fi
+
+    # Raspberry Pi Connect (backup remote access, surfaced in the Mesh tab).
+    # Idempotent, ARM-only, never fails the install (see install_pi_connect.sh).
+    if [ -f "$ragnar_PATH/scripts/install_pi_connect.sh" ]; then
+        log "INFO" "Installing Raspberry Pi Connect (rpi-connect)..."
+        bash "$ragnar_PATH/scripts/install_pi_connect.sh" || \
+            log "WARNING" "Raspberry Pi Connect install reported a problem (optional feature)"
+    fi
+
+    # Bake the on-screen kiosk packages into the IMAGE so a capable board (>2 GiB
+    # RAM) can enable the kiosk on first boot (ragnar-firstboot.sh) with NO
+    # network. We only install the packages here; the kiosk is enabled at first
+    # boot, RAM-gated. (On a normal install the kiosk pulls these when enabled,
+    # so this bake is image-build-only.) openbox is the WM chromium --kiosk needs
+    # to go full-screen; without it the dashboard fills only part of the screen.
+    if [ "$IMAGE_BUILD" = true ]; then
+        log "INFO" "Baking on-screen kiosk packages (openbox + Xorg + Chromium) for first-boot enable..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            openbox xserver-xorg xinit x11-xserver-utils xserver-xorg-legacy xauth kbd \
+            matchbox-keyboard unclutter >/dev/null 2>&1 \
+            || log "WARNING" "Kiosk package bake incomplete (first-boot kiosk may need network)"
+        # Chromium package name differs: 'chromium' (Debian 13/trixie, Kali),
+        # 'chromium-browser' (older Raspberry Pi OS).
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends chromium >/dev/null 2>&1 \
+            || DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends chromium-browser >/dev/null 2>&1 \
+            || log "WARNING" "Chromium not baked (first-boot kiosk may need network)"
+        log "SUCCESS" "Kiosk packages baked (enabled at first boot on boards with >2 GiB RAM)"
     fi
 
     # The speedtest diagnostic probes `speedtest-cli` first, then a bare
@@ -986,7 +1107,13 @@ fs.file-max = 2097152
 kernel.pid_max = 32768
 kernel.threads-max = 65536
 EOF
-    sysctl -p
+    # No live kernel to tune inside an image-build chroot; the file is written
+    # and takes effect on the target device's first boot.
+    if [ "$IMAGE_BUILD" = true ]; then
+        log "INFO" "Image build — wrote sysctl.conf, skipping live 'sysctl -p'"
+    else
+        sysctl -p
+    fi
 
     # Ensure PAM limits are applied
     if ! grep -q "session required pam_limits.so" /etc/pam.d/common-session; then
@@ -1023,7 +1150,13 @@ install_pisugar_server() {
     echo -e "${BLUE}hardware button for Ragnar. If you have a PiSugar UPS${NC}"
     echo -e "${BLUE}attached, the pisugar-server daemon is required.${NC}"
     echo ""
-    read -p "Do you have a PiSugar UPS? Install pisugar-server? (y/n): " install_pisugar
+    local install_pisugar
+    if [ "$UNATTENDED" = true ]; then
+        install_pisugar="${RAGNAR_INSTALL_PISUGAR:-n}"
+        log "INFO" "Unattended PiSugar choice: $install_pisugar"
+    else
+        read -p "Do you have a PiSugar UPS? Install pisugar-server? (y/n): " install_pisugar
+    fi
 
     if [ "$install_pisugar" != "y" ] && [ "$install_pisugar" != "Y" ]; then
         log "INFO" "User opted out of PiSugar server installation"
@@ -1274,7 +1407,7 @@ print('SUCCESS: Set shared_config.json epd_type to $EPD_VERSION')
         ["sqlalchemy>=1.4.0"]="sqlalchemy"
         ["python-nmap>=0.7.0"]="nmap"
         ["flask>=3.0.0"]="flask"
-        ["flask-socketio>=5.3.0"]="flask_socketio"
+        ["flask-socketio>=5.6.1"]="flask_socketio"
         ["flask-cors>=4.0.0"]="flask_cors"
         ["psutil>=5.9.0"]="psutil"
         ["logger>=1.4"]="logger"
@@ -1294,6 +1427,21 @@ print('SUCCESS: Set shared_config.json epd_type to $EPD_VERSION')
         fi
     done
     
+    # flask-socketio: the Debian/Kali apt package (python3-flask-socketio,
+    # installed above) is 5.6.0, which crashes the web terminal's /terminal
+    # Socket.IO namespace on Flask 3.1+ with "AttributeError: property 'session'
+    # of 'RequestContext' object has no setter" — the connect handler reads the
+    # session and flask-socketio 5.6.0 tries to write it back to a now-read-only
+    # property. 5.6.1 fixes it. The apt package carries no dist-info RECORD, so
+    # pip cannot upgrade it in place (the plain pip loop above skips it on a mere
+    # presence check); install 5.6.1 alongside with --ignore-installed (it lands
+    # in /usr/local, which precedes /usr/lib on the import path, so it wins).
+    if ! python3 -c 'import sys,importlib.metadata as m; v=tuple(int(x) for x in m.version("flask-socketio").split(".")[:3]); sys.exit(0 if v>=(5,6,1) else 1)' 2>/dev/null; then
+        log "INFO" "Ensuring flask-socketio >= 5.6.1 (apt ships a build that breaks the web terminal)..."
+        pip3 install --break-system-packages --ignore-installed "flask-socketio>=5.6.1" || \
+            log "WARNING" "Could not upgrade flask-socketio to >=5.6.1 — the web terminal may not work until it is."
+    fi
+
     # Install OpenAI package separately for root (since service runs as root)
     log "INFO" "Installing OpenAI package for root user..."
     sudo pip3 install --break-system-packages --ignore-installed "openai>=2.0.0" || {
@@ -1317,9 +1465,10 @@ print('SUCCESS: Set shared_config.json epd_type to $EPD_VERSION')
     # and vice versa (no Waveshare library). SPI and I2C are already enabled by
     # configure_interfaces. Every dependency is small; installing all of them
     # costs far less than a reinstall to change screens.
-    if [ "$HEADLESS_MODE" = true ]; then
+    if [ "$HEADLESS_MODE" = true ] && [ "${RAGNAR_INSTALL_ALL_DISPLAYS:-0}" != "1" ]; then
         log "INFO" "Headless mode - skipping display driver installation"
     else
+        [ "$HEADLESS_MODE" = true ] && log "INFO" "Headless profile, but RAGNAR_INSTALL_ALL_DISPLAYS=1 — installing every display driver so a screen can be enabled later"
         log "INFO" "Installing display driver support for all screen types..."
 
         # SPI transport: e-Paper, GC9A01 / ST7735S / ILI9486 3.5" / Whisplay TFT, MAX7219.
@@ -1336,6 +1485,16 @@ print('SUCCESS: Set shared_config.json epd_type to $EPD_VERSION')
         pip3 install --break-system-packages luma.led_matrix luma.core >/dev/null 2>&1 \
             && log "SUCCESS" "luma.led_matrix installed (MAX7219 LED matrix)" \
             || log "WARNING" "luma.led_matrix failed to install — MAX7219 panels will not work"
+
+        # Waveshare library — backs every epd* profile. The interactive EPD
+        # menu clones this repo; an unattended / image build never visits that
+        # menu, so fetch it here if it is missing and we actually intend to
+        # support e-Paper screens.
+        if [ ! -d "/home/$ragnar_USER/e-Paper/RaspberryPi_JetsonNano/python" ]; then
+            log "INFO" "Fetching Waveshare e-Paper library source (needed for e-Paper screens)..."
+            ( cd "/home/$ragnar_USER" && clone_or_download https://github.com/waveshareteam/e-Paper.git e-Paper main ) \
+                >/dev/null 2>&1 || log "WARNING" "Could not fetch Waveshare e-Paper source — e-Paper screens stay unavailable until it is present"
+        fi
 
         # Waveshare library — backs every epd* profile.
         if [ -d "/home/$ragnar_USER/e-Paper/RaspberryPi_JetsonNano/python" ]; then
@@ -1606,7 +1765,7 @@ EOF
             grep -qE '^SystemMaxUse=' /etc/systemd/journald.conf 2>/dev/null \
                 || echo 'SystemMaxUse=200M' >> /etc/systemd/journald.conf
         fi
-        systemctl restart systemd-journald >/dev/null 2>&1 || true
+        [ "$IMAGE_BUILD" = true ] || systemctl restart systemd-journald >/dev/null 2>&1 || true
     }
     setup_persistent_journal
 
@@ -1618,6 +1777,7 @@ After=network.target
 
 [Service]
 ExecStartPre=-/bin/bash -c '/home/ragnar/Ragnar/kill_port_8000.sh; ip link set mon0 down >/dev/null 2>&1; iw dev mon0 del >/dev/null 2>&1; systemctl stop pwnagotchi 2>/dev/null; systemctl stop bettercap 2>/dev/null; true'
+ExecStartPre=-/bin/sh -c 'rfkill unblock all >/dev/null 2>&1 || true'
 EOF
 
     if [ -n "$wipe_exec" ]; then
@@ -1661,8 +1821,26 @@ EOF
     
     # Enable and start NetworkManager
     systemctl enable NetworkManager
-    systemctl start NetworkManager
-    
+    [ "$IMAGE_BUILD" = true ] || systemctl start NetworkManager
+
+    # Let NetworkManager own wlan0. The legacy wlan stack (dhcpcd, the
+    # standalone wpa_supplicant.service, hostapd, dnsmasq) is enabled by its
+    # Debian package defaults, and on a NetworkManager system every one of them
+    # fights NM for wlan0. On a live box NM has usually already won, so this is
+    # a no-op; but on a fresh image they all start at boot, hostapd/dhcpcd seize
+    # wlan0 for the AP, and the portal's hand-off to client mode leaves the
+    # interface administratively down ("wlan0 down"). Disable them so only NM
+    # drives the radio. hostapd/dnsmasq are started on demand by Ragnar's WiFi
+    # manager for AP mode, so they are only unmasked, never left enabled.
+    if systemctl list-unit-files NetworkManager.service >/dev/null 2>&1; then
+        for _unit in dhcpcd wpa_supplicant hostapd dnsmasq; do
+            [ "$IMAGE_BUILD" = true ] || systemctl stop "$_unit" 2>/dev/null || true
+            systemctl disable "$_unit" 2>/dev/null || true
+        done
+        systemctl unmask hostapd 2>/dev/null || true
+        log "INFO" "Legacy wlan services disabled — NetworkManager owns wlan0 (hostapd/dnsmasq start on demand for AP mode)"
+    fi
+
     # Configure NetworkManager for WiFi management priority
     cat > /etc/NetworkManager/conf.d/99-ragnar-wifi.conf << EOF
 [main]
@@ -1678,13 +1856,17 @@ wifi.scan-rand-mac-address=no
 wifi.cloned-mac-address=preserve
 EOF
 
-    # Ensure NetworkManager manages wlan0
-    nmcli dev set wlan0 managed yes 2>/dev/null || log "WARNING" "Could not set wlan0 to managed (interface may not exist yet)"
-    
+    # Ensure NetworkManager manages wlan0 (no live interface in a chroot)
+    if [ "$IMAGE_BUILD" != true ]; then
+        nmcli dev set wlan0 managed yes 2>/dev/null || log "WARNING" "Could not set wlan0 to managed (interface may not exist yet)"
+    fi
+
     # Enable and start services
-    systemctl daemon-reload
-    systemctl enable ragnar.service
-    if systemctl start ragnar.service; then
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable ragnar.service 2>/dev/null || true
+    if [ "$IMAGE_BUILD" = true ]; then
+        log "INFO" "Image build — ragnar.service enabled; it will start on the device's first boot"
+    elif systemctl start ragnar.service; then
         log "SUCCESS" "Started ragnar.service"
     else
         log "WARNING" "Failed to start ragnar.service (it will start on next boot); check logs"
@@ -1885,13 +2067,84 @@ select_headless_variant() {
     done
 }
 
+# Resolve the install profile from RAGNAR_PROFILE in unattended mode, setting
+# exactly the same globals the interactive menu cases set. Keeps the menu as the
+# single source of truth for what each profile means while letting an image
+# build (or any script) pick one without a TTY.
+resolve_profile_unattended() {
+    local profile="${RAGNAR_PROFILE:-headless}"
+    log "INFO" "Unattended install — profile: $profile"
+
+    case "$profile" in
+        epaper|epd|e-paper)
+            SERVER_INSTALL=false; HEADLESS_MODE=false; TFT_MODE=false
+            HEADLESS_VARIANT=""; HEADLESS_VARIANT_LABEL=""
+            RAGNAR_ENTRYPOINT="Ragnar.py"
+            EPD_VERSION="${RAGNAR_DISPLAY:-epd2in13_V4}"
+            ;;
+        tft|lcd)
+            SERVER_INSTALL=false; HEADLESS_MODE=false; TFT_MODE=true
+            HEADLESS_VARIANT=""; HEADLESS_VARIANT_LABEL=""
+            RAGNAR_ENTRYPOINT="Ragnar.py"
+            EPD_VERSION="${RAGNAR_DISPLAY:-gc9a01}"
+            ;;
+        server-display|display)
+            SERVER_INSTALL=true; HEADLESS_MODE=false; TFT_MODE=false
+            HEADLESS_VARIANT=""; HEADLESS_VARIANT_LABEL="Server install with display"
+            RAGNAR_ENTRYPOINT="Ragnar.py"
+            EPD_VERSION="${RAGNAR_DISPLAY:-}"
+            ;;
+        headless|server)
+            SERVER_INSTALL=true; HEADLESS_MODE=true; TFT_MODE=false
+            HEADLESS_VARIANT="server"; HEADLESS_VARIANT_LABEL="Server install"
+            RAGNAR_ENTRYPOINT="headlessRagnar.py"
+            ;;
+        hbp0|hbp0_ragnar)
+            SERVER_INSTALL=false; HEADLESS_MODE=true; TFT_MODE=false
+            HEADLESS_VARIANT="hbp0_ragnar"; HEADLESS_VARIANT_LABEL="hbp0_ragnar by DezusAZ"
+            RAGNAR_ENTRYPOINT="headlessRagnar.py"
+            ;;
+        docker)
+            log "INFO" "Unattended docker profile selected"
+            local rc=0
+            deploy_docker || rc=$?
+            clean_exit $rc
+            ;;
+        *)
+            log "WARNING" "Unknown RAGNAR_PROFILE='$profile' — falling back to headless"
+            SERVER_INSTALL=true; HEADLESS_MODE=true; TFT_MODE=false
+            HEADLESS_VARIANT="server"; HEADLESS_VARIANT_LABEL="Server install"
+            RAGNAR_ENTRYPOINT="headlessRagnar.py"
+            ;;
+    esac
+
+    log "INFO" "Resolved: entrypoint=$RAGNAR_ENTRYPOINT headless=$HEADLESS_MODE tft=$TFT_MODE display=${EPD_VERSION:-none}"
+}
+
 # Verify installation
 verify_installation() {
     log "INFO" "Verifying installation..."
-    
+
+    # In an image-build chroot nothing is running (no systemd, no network, no
+    # web server), so the "is it up?" checks below are all meaningless and would
+    # log scary warnings. Confirm the tools and Python modules are present
+    # instead, and leave the runtime verification to the device's first boot.
+    if [ "$IMAGE_BUILD" = true ]; then
+        for c in nmcli hostapd dnsmasq; do
+            command -v "$c" >/dev/null 2>&1 \
+                && log "SUCCESS" "$c present" \
+                || log "WARNING" "$c missing"
+        done
+        python3 -c "import flask, flask_socketio, psutil, netifaces" 2>/dev/null \
+            && log "SUCCESS" "Core Python modules present" \
+            || log "WARNING" "Some core Python modules missing (check the pip step)"
+        log "INFO" "Image build — skipping running-service / web-interface checks"
+        return 0
+    fi
+
     # Check WiFi management dependencies
     log "INFO" "Verifying WiFi management dependencies..."
-    
+
     # Check NetworkManager
     if systemctl is-active --quiet NetworkManager; then
         log "SUCCESS" "NetworkManager is running"
@@ -2132,6 +2385,14 @@ setup_ragnar_mesh() {
     echo -e "from anywhere without port forwarding — and so the units share alerts."
     echo -e "${YELLOW}You can also do this later from the web UI (Ragnar Mesh tab).${NC}"
     echo ""
+
+    # Unattended with no provisioning data: never prompt — leave the mesh off,
+    # exactly as declining the prompt would. The web UI can join later.
+    if [ "$UNATTENDED" = true ]; then
+        log "INFO" "Unattended, no mesh key supplied — skipping Tailscale/mesh setup"
+        return 0
+    fi
+
     read -p "Install Tailscale for mesh networking now? (y/n): " mesh_choice
 
     if [[ ! "$mesh_choice" =~ ^[Yy]$ ]]; then
@@ -2187,8 +2448,12 @@ main() {
     # IS_PI is set by detect_platform (called above); reuse it for the menu.
     local is_pi=$IS_PI
 
-    # Display menu and handle selection (loops on invalid input)
+    # Unattended: pick the profile from RAGNAR_PROFILE and skip the whole menu.
     local profile_choice=""
+    if [ "$UNATTENDED" = true ]; then
+        resolve_profile_unattended
+    else
+    # Display menu and handle selection (loops on invalid input)
     while true; do
         show_install_menu "$is_pi"
         read -r profile_choice
@@ -2319,9 +2584,12 @@ main() {
             esac
         fi
     done
+    fi  # end: interactive menu (skipped when UNATTENDED)
 
-    # Only attempt e-paper setup when not in server/headless profile
-    if [ "$HEADLESS_MODE" != true ]; then
+    # Only attempt e-paper setup when not in server/headless profile.
+    # In unattended mode EPD_VERSION is already set by resolve_profile_unattended,
+    # so skip the interactive display-selection prompts entirely.
+    if [ "$HEADLESS_MODE" != true ] && [ "$UNATTENDED" != true ]; then
 
         # ── TFT LCD display path ──────────────────────────────────────────────
         if [ "$TFT_MODE" = true ]; then
@@ -2632,8 +2900,18 @@ except:
     
     log "INFO" "System RAM: ${TOTAL_RAM_GB}GB / ${TOTAL_RAM_MB}MB (minimum: 7.5GB)"
     
-    if [ "$IS_PI_ZERO" = false ] && [ "$HAS_ENOUGH_RAM" = "1" ]; then
-        log "INFO" "System qualifies for advanced security tools (${TOTAL_RAM_GB}GB RAM, not Pi Zero)"
+    # RAGNAR_INSTALL_ADVANCED overrides the RAM gate in unattended mode:
+    #   no   → never install (image default — keeps the image small; a capable
+    #          device installs these from the web UI). Also the right choice for
+    #          an image build, where the build host's RAM is not the target's.
+    #   yes  → install regardless of the RAM gate.
+    #   auto → keep the RAM/Pi-Zero gate below (interactive default).
+    local _adv="${RAGNAR_INSTALL_ADVANCED:-auto}"
+    [ "$IMAGE_BUILD" = true ] && [ "$_adv" = "auto" ] && _adv="no"
+    if [ "$_adv" = "no" ]; then
+        log "INFO" "Advanced security tools skipped (RAGNAR_INSTALL_ADVANCED=no / image build). Install later from the web UI."
+    elif [ "$_adv" = "yes" ] || { [ "$IS_PI_ZERO" = false ] && [ "$HAS_ENOUGH_RAM" = "1" ]; }; then
+        log "INFO" "Installing advanced security tools (choice=$_adv, ${TOTAL_RAM_GB}GB RAM)"
         echo -e "\n${CYAN}═══════════════════════════════════════════════════════════════${NC}"
         echo -e "${CYAN}  Installing Advanced Security Tools${NC}"
         echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
@@ -2710,8 +2988,20 @@ except:
     echo "   sudo git pull   # Get latest updates"
     echo "   sudo systemctl restart ragnar"
 
-    read -p "Would you like to reboot now? (y/n): " reboot_now
-    if [ "$reboot_now" = "y" ]; then
+    # Never reboot while baking an image (there is no "system" to reboot — we
+    # are in a chroot). In other unattended runs, honour RAGNAR_REBOOT.
+    local reboot_now
+    if [ "$IMAGE_BUILD" = true ]; then
+        log "INFO" "Image build complete — Ragnar baked in, services enabled for first boot"
+        clean_exit 0
+    elif [ "$UNATTENDED" = true ]; then
+        reboot_now="${RAGNAR_REBOOT:-n}"
+        log "INFO" "Unattended reboot choice: $reboot_now"
+    else
+        read -p "Would you like to reboot now? (y/n): " reboot_now
+    fi
+
+    if [ "$reboot_now" = "y" ] || [ "$reboot_now" = "Y" ]; then
         if reboot; then
             log "INFO" "System reboot initiated."
         else

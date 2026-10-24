@@ -118,11 +118,17 @@ _NOT_MESH_VIDS = {0x1546, 0x067B}
 _GPS_WORDS = ('gps', 'gnss', 'u-blox', 'ublox', 'nmea')
 
 
-def _foreign_ports(allow_wardrive_companions=False):
-    """Ports other Ragnar components hold (see serial_claims.py)."""
+def _foreign_ports(allow_wardrive_companions=False, allow_soft=False):
+    """Ports other Ragnar components hold (see serial_claims.py).
+    ``allow_soft`` leaves out soft holders (a CYD bridge still listening for a
+    CYD), which hand the port back once connect() reserves it."""
     try:
         import serial_claims
-        excl = ('meshtastic', 'wardrive-companions') if allow_wardrive_companions else 'meshtastic'
+        excl = ('meshtastic',)
+        if allow_wardrive_companions:
+            excl += ('wardrive-companions',)
+        if allow_soft:
+            excl += tuple(serial_claims.SOFT_OWNERS)
         return serial_claims.claims(exclude_owner=excl)
     except Exception:
         return {}
@@ -165,7 +171,7 @@ def pick_serial_port():
     non-blacklisted port - a u-blox GPS included), this only considers
     Meshtastic USB chips that no other component holds, and refuses to guess
     when several qualify (a Heltec and a HuginnESP are both ESP32-S3)."""
-    cands, skipped = classify_mesh_candidates(_list_usb_serial(), _foreign_ports())
+    cands, skipped = classify_mesh_candidates(_list_usb_serial(), _foreign_ports(allow_soft=True))
     if len(cands) == 1:
         return cands[0], None
     if not cands:
@@ -197,7 +203,9 @@ def detect():
     mqtt_ok = _mqtt_client is not None
     mqtt_extra = {"mqtt_available": mqtt_ok, "mqtt_defaults": {
         "host": MESH_MQTT["host"], "port": MESH_MQTT["port"],
-        "user": MESH_MQTT["user"], "topic": MESH_MQTT["topic"]}}
+        "user": MESH_MQTT["user"], "topic": MESH_MQTT["topic"],
+        "regions": [{"id": r, "label": l, "topic": "msh/%s/#" % r}
+                    for r, l in MESH_MQTT_REGIONS]}}
     usb_id, usb_desc = None, None
     rc, out, _ = _run(["lsusb"], timeout=4)
     if rc == 0 and out:
@@ -298,6 +306,7 @@ class MeshLink:
         self._owner = None       # who started the link ('user', 'wardrift', ...)
         self._local_stats = {}   # latest LocalStats telemetry from our own node
         self._local_stats_ts = 0.0
+        self._traceroutes = {}   # dest node id -> latest traceroute result
 
     def status(self):
         with self._lock:
@@ -358,7 +367,13 @@ class MeshLink:
         self._take_local_stats(packet)
         try:
             dec = (packet or {}).get("decoded") or {}
-            if dec.get("portnum") not in ("TEXT_MESSAGE_APP", 1):
+            portnum = dec.get("portnum")
+            # A traceroute reply ("see the jumps"): the responder is the node we
+            # traced, and the payload carries the path of nodes the probe crossed.
+            if portnum in ("TRACEROUTE_APP", 70):
+                self._store_traceroute(packet, dec)
+                return
+            if portnum not in ("TEXT_MESSAGE_APP", 1):
                 return
             text = dec.get("text")
             if text is None and isinstance(dec.get("payload"), (bytes, bytearray)):
@@ -426,10 +441,10 @@ class MeshLink:
                 if not port:
                     return {"ok": False, "error": err}
             real = os.path.realpath(port)
-            # GPS / CYD ports are never taken. A wardriving companion listener
-            # yields: reserve the port, then give its USB monitor a moment to
-            # drop it before we open.
-            hard = _foreign_ports(allow_wardrive_companions=True)
+            # GPS / CYD ports are never taken. A wardriving companion listener,
+            # or a CYD bridge still listening for a CYD that isn't there, yields:
+            # reserve the port, then give it a moment to drop it before we open.
+            hard = _foreign_ports(allow_wardrive_companions=True, allow_soft=True)
             if real in hard:
                 return {"ok": False, "error": "%s is in use by %s" % (port, hard[real])}
             with self._lock:
@@ -565,6 +580,118 @@ class MeshLink:
         except Exception as exc:
             return {"ok": False, "error": "send failed: %s" % exc}
 
+    # ---- Traceroute ("see the jumps") -----------------------------------
+    @staticmethod
+    def _num_to_id(num):
+        if num is None:
+            return None
+        if isinstance(num, str):
+            return num
+        try:
+            return "!%08x" % (int(num) & 0xFFFFFFFF)
+        except (TypeError, ValueError):
+            return None
+
+    def _name_for(self, nid):
+        """Human name for a node id, from the node DB; falls back to the id."""
+        if not nid:
+            return "?"
+        for n in self._nodes:
+            if n.get("id") == nid:
+                return n.get("long_name") or n.get("short_name") or nid
+        return nid
+
+    def _store_traceroute(self, packet, dec):
+        """Parse a TRACEROUTE_APP reply into a forward (and, if present, return)
+        path of {id, name, snr_db} hops, keyed by the node we traced (the
+        responder). Mirrors the meshtastic CLI's own route reconstruction."""
+        try:
+            # The RouteDiscovery, either already decoded by the lib or as payload.
+            as_dict = dec.get("traceroute")
+            if not isinstance(as_dict, dict):
+                payload = dec.get("payload")
+                if not isinstance(payload, (bytes, bytearray)):
+                    return
+                from meshtastic import mesh_pb2
+                import google.protobuf.json_format as _json_format
+                rd = mesh_pb2.RouteDiscovery()
+                rd.ParseFromString(bytes(payload))
+                as_dict = _json_format.MessageToDict(rd)
+
+            origin_id = packet.get("toId") or self._num_to_id(packet.get("to"))   # us
+            target_id = packet.get("fromId") or self._num_to_id(packet.get("from"))  # traced node
+            if not target_id:
+                return
+
+            UNK = -128
+
+            def _chain(route_key, snr_key, start_id, end_id):
+                route = as_dict.get(route_key) or []
+                snrs = as_dict.get(snr_key) or []
+                valid = len(snrs) == len(route) + 1
+                chain = [{"id": start_id, "name": self._name_for(start_id), "snr_db": None}]
+                for i, num in enumerate(route):
+                    nid = self._num_to_id(num)
+                    snr = (snrs[i] / 4.0) if (valid and snrs[i] != UNK) else None
+                    chain.append({"id": nid, "name": self._name_for(nid), "snr_db": snr})
+                end_snr = (snrs[-1] / 4.0) if (valid and snrs and snrs[-1] != UNK) else None
+                chain.append({"id": end_id, "name": self._name_for(end_id), "snr_db": end_snr})
+                return chain, len(route) + 1
+
+            fwd, hops = _chain("route", "snrTowards", origin_id, target_id)
+            result = {"ok": True, "target": target_id,
+                      "target_name": self._name_for(target_id),
+                      "route": fwd, "hops": hops, "ts": time.time(), "inflight": False}
+            if "routeBack" in as_dict or "snrBack" in as_dict:
+                back, _ = _chain("routeBack", "snrBack", target_id, origin_id)
+                result["route_back"] = back
+            with self._lock:
+                self._traceroutes[target_id] = result
+        except Exception:
+            pass
+
+    def send_traceroute(self, dest, hop_limit=None, channel=0):  # pragma: no cover - hardware path
+        """Kick off a traceroute to `dest`. The library call blocks until the
+        reply (or a timeout), so it runs on a background thread; the reply is
+        captured by `_store_traceroute` over the receive bus and read back via
+        `get_traceroute`."""
+        with self._lock:
+            iface = self._iface
+            connected = self._connected
+        if not (iface and connected):
+            return {"ok": False, "error": "no Meshtastic node connected — traceroute needs a USB node (MQTT can't trace)"}
+        if not dest:
+            return {"ok": False, "error": "no destination node"}
+        try:
+            hl = int(hop_limit) if hop_limit else 7
+        except (TypeError, ValueError):
+            hl = 7
+        hl = max(1, min(hl, 7))
+        with self._lock:
+            self._traceroutes[dest] = {"inflight": True, "requested_ts": time.time()}
+
+        def _run():
+            err = None
+            try:
+                iface.sendTraceRoute(dest, hl, channelIndex=int(channel or 0))
+            except Exception as exc:
+                err = str(exc)
+            with self._lock:
+                cur = dict(self._traceroutes.get(dest) or {})
+                cur["inflight"] = False
+                # Keep a fresh captured route; only record the error otherwise.
+                if err and not (cur.get("ok") and cur.get("ts", 0) >= cur.get("requested_ts", 0)):
+                    cur["error"] = err
+                self._traceroutes[dest] = cur
+
+        threading.Thread(target=_run, name="mesh-traceroute", daemon=True).start()
+        return {"ok": True, "pending": True, "hop_limit": hl}
+
+    def get_traceroute(self, dest):
+        with self._lock:
+            res = self._traceroutes.get(dest)
+            return dict(res) if res else {"ok": False, "none": True}
+
     def stop(self):
         self._stop.set()
         try:
@@ -594,6 +721,40 @@ MESH_MQTT = {
     "topic": "msh/+/2/#",
     "publish_topic": "msh/2/json/mqtt/",    # downlink command topic (JSON)
 }
+
+# Region roots gateways publish under on the public broker (msh/<root>/...).
+# A region filter is "msh/<root>/#" so country/city sub-topics (msh/EU_868/SE/2/…,
+# msh/US/FL/2/…) are included; the default topic above only sees the region root.
+MESH_MQTT_REGIONS = [
+    ("EU_868", "Europe 868"), ("EU_433", "Europe 433"), ("UK_868", "UK 868"),
+    ("US", "United States"), ("ANZ", "Australia / NZ"), ("CN", "China"),
+    ("JP", "Japan"), ("KR", "Korea"), ("TW", "Taiwan"), ("IN", "India"),
+    ("RU", "Russia"), ("PL", "Poland"), ("TH", "Thailand"), ("MY_919", "Malaysia"),
+    ("SG_923", "Singapore"), ("PH", "Philippines"), ("BR_902", "Brazil"),
+    ("NZ_865", "New Zealand 865"), ("UA_868", "Ukraine"),
+]
+
+
+def mqtt_topic_region(topic):
+    """Region a message came from, read off its MQTT topic: the levels between
+    'msh' and the protocol version '2' (msh/EU_868/SE/2/e/... -> 'EU_868/SE').
+    Topics without a '2' level fall back to the first level after 'msh'."""
+    parts = (topic or "").split("/")
+    if len(parts) < 2 or parts[0] != "msh":
+        return None
+    if "2" in parts[1:]:
+        return "/".join(parts[1:parts.index("2", 1)]) or None
+    return parts[1] or None
+
+
+def mqtt_region_topic(region):
+    """Topic filter for a region root, or the global default for ''/'all'."""
+    region = (region or "").strip().strip("/")
+    if not region or region.lower() == "all":
+        return MESH_MQTT["topic"]
+    if not all(c.isalnum() or c in "_-" for c in region):
+        return None
+    return "msh/%s/#" % region
 
 # Meshtastic default channel PSK ("AQ==" -> the well-known LongFast key). Public-
 # channel traffic is encrypted with this, so it's readable; private channels use
@@ -702,7 +863,8 @@ def parse_mqtt_protobuf(topic, payload, key=_MESH_DEFAULT_KEY):
         return None
     sender = ("!%08x" % (frm & 0xFFFFFFFF)) if frm is not None else None
     rec = {"src": "mqtt", "from_num": frm, "sender": sender, "channel": channel,
-           "topic": topic, "ts": time.time(), "snr": snr}
+           "topic": topic, "region": mqtt_topic_region(topic),
+           "ts": time.time(), "snr": snr}
     if portnum == _PORT_TEXT:
         rec["type"] = "text"; rec["text"] = (pl or b"").decode("utf-8", "replace")
     elif portnum == _PORT_POSITION and pl:
@@ -746,7 +908,7 @@ def parse_mqtt_json(topic, payload):
         sender = "!%08x" % (frm & 0xFFFFFFFF)
     rec = {"type": t, "from_num": frm, "sender": sender, "to": d.get("to"),
            "channel": d.get("channel", 0), "ts": d.get("timestamp") or time.time(),
-           "topic": topic, "src": "mqtt"}
+           "topic": topic, "region": mqtt_topic_region(topic), "src": "mqtt"}
     if t == "text":
         rec["text"] = pl.get("text") if isinstance(pl, dict) else (pl if isinstance(pl, str) else None)
     elif t == "position" and isinstance(pl, dict):
@@ -819,6 +981,9 @@ class MeshMqtt:
             old, self._client, self._connected = self._client, None, False
         _stop_paho(old)
         with self._lock:
+            if self._cfg.get("topic") != cfg["topic"]:
+                self._positions = {}        # a new region/topic: drop the old feed
+                self._messages = []
             self._cfg = cfg
             self._error = None
             try:
@@ -887,11 +1052,13 @@ class MeshMqtt:
             if rec.get("lat") is not None and rec.get("lon") is not None and rec.get("sender"):
                 self._positions[rec["sender"]] = {
                     "id": rec["sender"], "lat": rec["lat"], "lon": rec["lon"],
-                    "long_name": rec.get("long_name"), "ts": time.time(), "src": "mqtt"}
+                    "long_name": rec.get("long_name"), "ts": time.time(), "src": "mqtt",
+                    "region": rec.get("region")}
             if rec.get("type") == "nodeinfo" and rec.get("sender"):
                 p = self._positions.setdefault(rec["sender"], {"id": rec["sender"], "src": "mqtt"})
                 p["long_name"] = rec.get("long_name") or p.get("long_name")
                 p["short_name"] = rec.get("short_name")
+                p["region"] = p.get("region") or rec.get("region")
                 p["ts"] = time.time()
             # the worldwide public feed is unbounded — evict the oldest stations
             if len(self._positions) > _MQTT_STATION_MAX:
@@ -1006,6 +1173,18 @@ def send_text(text, dest=None, channel=0, via="auto"):
     return last
 
 
+def traceroute(dest, hop_limit=None, channel=0):
+    """Start a traceroute to a node over the connected USB link."""
+    return _link.send_traceroute(dest, hop_limit=hop_limit, channel=channel)
+
+
+def traceroute_result(dest):
+    """Latest traceroute result for a node id (or a pending/none marker)."""
+    if not dest:
+        return {"ok": False, "error": "no node id"}
+    return _link.get_traceroute(dest)
+
+
 def status():
     st = _link.status()
     st["mqtt"] = _mqtt.status()
@@ -1031,6 +1210,7 @@ def nodes(bbox=None, limit=1500):
             merged.append({"id": p["id"], "num": None,
                            "long_name": p.get("long_name"), "short_name": p.get("short_name"),
                            "lat": p.get("lat"), "lon": p.get("lon"), "src": "mqtt",
+                           "region": p.get("region"),
                            "last_heard": int(p.get("ts") or 0), "is_self": False})
             have.add(p["id"])
     if bbox:
@@ -1138,6 +1318,30 @@ def selftest():
           normalize_node({"num": 0x11223344, "user": {}})["id"] == "!11223344")
     check("node: junk -> None", normalize_node(None) is None and normalize_node(42) is None)
 
+    # --- Traceroute reply parsing ("see the jumps") ---
+    tlink = MeshLink()
+    tlink._nodes = [
+        {"id": "!7c5b2a10", "long_name": "Base Camp"},
+        {"id": "!11112222", "long_name": "Relay"},
+        {"id": "!a1b2c3d4", "long_name": "Trail Node"},
+    ]
+    tr_packet = {"toId": "!7c5b2a10", "to": 2086892048,
+                 "fromId": "!a1b2c3d4", "from": 2712847316}
+    tr_dec = {"portnum": "TRACEROUTE_APP",
+              "traceroute": {"route": [0x11112222], "snrTowards": [20, -24]}}
+    tlink._store_traceroute(tr_packet, tr_dec)
+    tr = tlink.get_traceroute("!a1b2c3d4")
+    check("traceroute: parsed + keyed by traced node",
+          tr.get("ok") and tr.get("hops") == 2 and len(tr.get("route", [])) == 3, str(tr))
+    check("traceroute: hop chain ids in order",
+          [h["id"] for h in tr.get("route", [])] == ["!7c5b2a10", "!11112222", "!a1b2c3d4"],
+          str([h.get("id") for h in tr.get("route", [])]))
+    check("traceroute: SNR scaled /4, origin has none",
+          tr["route"][0]["snr_db"] is None and tr["route"][1]["snr_db"] == 5.0
+          and tr["route"][2]["snr_db"] == -6.0, str([h.get("snr_db") for h in tr["route"]]))
+    check("traceroute: names resolved from node DB",
+          tr["route"][1]["name"] == "Relay" and tr["target_name"] == "Trail Node", str(tr.get("target_name")))
+
     # lsusb USB-id probe
     lsu = ("Bus 001 Device 004: ID 10c4:ea60 Silicon Labs CP210x UART Bridge\n"
            "Bus 001 Device 001: ID 1d6b:0002 Linux Foundation root hub\n")
@@ -1217,6 +1421,23 @@ def selftest():
     check("tx: send with no serial/mqtt -> error (no crash)",
           r.get("ok") is False and "connected" in (r.get("error") or ""), str(r))
     check("tx: empty message rejected", send_text("   ").get("ok") is False)
+
+    # --- MQTT region filter ---
+    check("mqtt: region -> msh/<root>/# (sub-topics included)",
+          mqtt_region_topic("US") == "msh/US/#", mqtt_region_topic("US"))
+    check("mqtt: '' / all -> global default topic",
+          mqtt_region_topic("") == MESH_MQTT["topic"] and mqtt_region_topic("all") == MESH_MQTT["topic"])
+    check("mqtt: wildcard/odd region rejected",
+          mqtt_region_topic("+") is None and mqtt_region_topic("a/b") is None)
+    check("mqtt: message region from topic (sub-topics kept)",
+          mqtt_topic_region("msh/EU_868/SE/2/e/LongFast/!1") == "EU_868/SE"
+          and mqtt_topic_region("msh/US/2/json/x/!2") == "US"
+          and mqtt_topic_region("msh/EU_868/HQ-Gw/mesh1") == "EU_868"
+          and mqtt_topic_region("other/x") is None)
+    check("mqtt: decoded records carry region",
+          (parse_mqtt_json("msh/US/2/json/LongFast/!1", '{"type":"text","from":1,"payload":{"text":"hi"}}') or {}).get("region") == "US")
+    regs = [r["id"] for r in detect().get("mqtt_defaults", {}).get("regions", [])]
+    check("mqtt: detect() lists regions for the UI", "EU_868" in regs and "US" in regs, str(regs[:4]))
 
     passed = sum(1 for r in results if r["pass"])
     return {"pass": passed == len(results), "passed": passed,

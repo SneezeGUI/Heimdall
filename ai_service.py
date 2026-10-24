@@ -12,7 +12,18 @@ import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
-from openai import OpenAI
+try:
+    from openai import OpenAI
+except Exception:  # noqa: BLE001 — SDK optional
+    # The openai SDK may be absent on a lean/airgapped image. Importing this
+    # module must still succeed so the non-LLM helpers (normalize_base_url, the
+    # endpoint discovery/listing routes) keep working; real AI calls raise a
+    # clear, actionable error instead of a 500. Heal with the Ragnar updater or
+    # `pip install "openai>=2.0.0"`.
+    OpenAI = None
+
+_OPENAI_MISSING_MSG = ("The 'openai' package is not installed — run the Ragnar "
+                       "updater, or: pip install 'openai>=2.0.0'.")
 
 from logger import Logger
 from env_manager import EnvManager, load_env
@@ -127,6 +138,12 @@ class AIService:
             self.logger.warning(self.initialization_error)
             return
 
+        if OpenAI is None:
+            self.client = None
+            self.initialization_error = _OPENAI_MISSING_MSG
+            self.logger.warning(self.initialization_error)
+            return
+
         try:
             # Bound every request: the SDK default is 600s, so a single stuck or
             # rate-limited call (common when several field units share one API
@@ -196,6 +213,19 @@ class AIService:
                 self.logger.error("AI service failed to reinitialize after token reload.")
 
         return success
+
+    def complete(self, user_msg: str, system_msg: Optional[str] = None) -> Optional[str]:
+        """One-shot completion returning the model's raw text (or None).
+
+        Public entry over the unified `_ask` call, used by callers that need the
+        AI to emit a structured artifact rather than a cached 'analysis' — e.g.
+        the Ulfberht playbook generator. Routes OpenAI vs self-hosted the same
+        way every other call does. Returns None when AI is disabled/unavailable.
+        """
+        if system_msg is None:
+            system_msg = ("You are a security automation assistant. Output exactly one "
+                          "JSON object and nothing else — no prose, no markdown fences.")
+        return self._ask(system_msg, user_msg)
 
 
 
@@ -421,6 +451,8 @@ class AIService:
             return None  # already on the cloud — no separate fallback needed
         if self._fallback_client is not None:
             return self._fallback_client
+        if OpenAI is None:
+            return None  # SDK absent — no cloud fallback possible
         token = self.api_token or self.env_manager.get_token()
         if not token:
             return None

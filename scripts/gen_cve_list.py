@@ -42,9 +42,32 @@ FILE_OWNERS = {
     'python/apcguard.py': 'APC Guard',
     'python/apcguard_selftest.py': 'APC Guard',
     'python/apcguard_scapy_xcheck.py': 'APC Guard',
+    'python/liebert_guard.py': 'Liebert Guard',
+    'python/test_liebert_guard.py': 'Liebert Guard',
+    'python/liebert_guard_conformance.py': 'Liebert Guard',
+    'python/liebert_guard_scapy_selftest.py': 'Liebert Guard',
+    'python/aristaguard.py': 'Arista Guard',
+    'python/aristaguard_conformance.py': 'Arista Guard',
+    'python/aristaguard_scapy_xcheck.py': 'Arista Guard',
+    'python/lldpwatch.py': 'LLDP Watch',
+    'python/lldpwatch_frames.py': 'LLDP Watch',
+    'python/lldpwatch_conformance.py': 'LLDP Watch',
+    'python/lldpwatch_scapy_xcheck.py': 'LLDP Watch',
+    'python/cfmwatch.py': 'CFM Watch',
+    'python/ripwatch.py': 'RIP Watch',
+    'python/radiuswatch.py': 'RADIUS Watch',
     'actions/ble_pentest.py': 'BLE Pentest (active)',
 }
-FILE_PREFIX_OWNERS = {'python/dns_doctor_passive/': 'DNS Watch'}
+FILE_PREFIX_OWNERS = {'python/dns_doctor_passive/': 'DNS Watch',
+                      'python/modbuswatch/': 'Modbus Watch',
+                      'python/oamwatch/': 'OAM Watch',
+                      'python/oamwatch_tests/': 'OAM Watch',
+                      'python/cfmwatch_tests/': 'CFM Watch',
+                      # standalone igmpwatch package (v5) + its selftest name the same 3
+                      # IGMP/MLD CVEs the in-app do_igmp_watch detects — attribute to the
+                      # same owner so they dedupe rather than double-count under a file path.
+                      'igmpwatch/': 'IGMP / MLD Watch',
+                      'selftest.py': 'IGMP / MLD Watch'}
 # Files that only mention CVEs already owned elsewhere (labels, help text).
 MENTION_ONLY = {'webapp_modern.py', 'watchtower.py', 'web/scripts/ragnar_modern.js',
                 'web/index_modern.html'}
@@ -56,9 +79,13 @@ ND_PREFIXES = [
     ('_arista', 'Arista Guard'), ('_ARISTA', 'Arista Guard'), ('do_arista', 'Arista Guard'),
     ('_aruba', 'Aruba Guard'), ('_ARUBA', 'Aruba Guard'),
     ('_apc', 'APC Guard'), ('_APC', 'APC Guard'), ('do_apc', 'APC Guard'),
+    ('_liebert', 'Liebert Guard'), ('_LIEBERT', 'Liebert Guard'), ('do_liebert', 'Liebert Guard'),
     ('_arp', 'ARP Watch'),
     ('_cdp', 'CDP Watch'), ('_CDP', 'CDP Watch'),
+    ('_udld', 'CDP Watch'), ('_UDLD', 'CDP Watch'),
     ('_cisco', 'Cisco Guard'), ('_CISCO', 'Cisco Guard'), ('_ikev2', 'Cisco Guard'),
+    ('_lisp', 'Cisco Guard'), ('_LISP', 'Cisco Guard'),
+    ('_twamp', 'Cisco Guard'), ('_TWAMP', 'Cisco Guard'), ('_ipsla', 'Cisco Guard'),
     ('_dhcpv6', 'Cisco Guard'), ('_ipv6_rh0', 'Cisco Guard'), ('_vxlan', 'Cisco Guard'),
     ('_VXLAN', 'Cisco Guard'), ('_GUARD_IP6', 'Cisco Guard'),
     ('_juniper', 'Juniper Guard'), ('_JUNIPER', 'Juniper Guard'),
@@ -75,6 +102,7 @@ ND_PREFIXES = [
     ('_parse_autokey', 'NTP Watch'),
     ('_EIGRP', 'EIGRP Watch'), ('_eigrp', 'EIGRP Watch'),
     ('_isis', 'IS-IS Watch'),
+    ('_RIP', 'RIP Watch'), ('_rip', 'RIP Watch'), ('do_rip', 'RIP Watch'),
     ('_igmp', 'IGMP / MLD Watch'), ('_parse_igmp', 'IGMP / MLD Watch'),
     ('_decode_mld', 'IGMP / MLD Watch'),
     ('_dhcp', 'DHCP Guardian'), ('do_dhcp', 'DHCP Guardian'),
@@ -83,6 +111,11 @@ ND_PREFIXES = [
     ('_snmp', 'SNMP Watch'),
     ('_FTP', 'FTP Watch'), ('_ftp', 'FTP Watch'), ('do_ftp', 'FTP Watch'),
     ('_SMTP', 'SMTP Watch'), ('_smtp', 'SMTP Watch'), ('do_smtp', 'SMTP Watch'),
+    ('_MODBUS', 'Modbus Watch'), ('_modbus', 'Modbus Watch'), ('do_modbus', 'Modbus Watch'),
+    ('_LLDP', 'LLDP Watch'), ('_lldp', 'LLDP Watch'), ('do_lldp', 'LLDP Watch'),
+    ('_OAM', 'OAM Watch'), ('_oam', 'OAM Watch'), ('do_oam', 'OAM Watch'),
+    # before Cisco Guard's ('_CFM', ...) VXLAN-NGOAM prefix, which would swallow these
+    ('_CFMW', 'CFM Watch'), ('_cfmw', 'CFM Watch'), ('do_cfm', 'CFM Watch'),
     ('_RELAY', 'Relay / Coercion Watch'), ('_relay', 'Relay / Coercion Watch'),
     ('_parse_relay', 'Relay / Coercion Watch'), ('do_relay', 'Relay / Coercion Watch'),
     ('_ND_DNSSL', 'ICMP Watch'), ('_ISIS', 'IS-IS Watch'), ('_CFM', 'Cisco Guard'),
@@ -93,7 +126,26 @@ ND_PREFIXES = [
 # CVEs named inside a detector's finding text for comparison only — e.g. the
 # OpenSSH scp bug named as the "twin" of the netkit rcp CVE Telnet Watch detects,
 # and the Ripple20 IPv6 bug APC Guard names only to state it does not apply to APC.
-CONTEXT_CVES = {'CVE-2019-6111', 'CVE-2020-11897'}
+CONTEXT_CVES = {'CVE-2019-6111', 'CVE-2020-11897',
+                # cfmwatch: Huawei Y.1731 DoS (trigger never published, screening row only)
+                # and a Cisco IOS XR CFM bug rejected below the bar; both only named.
+                'CVE-2014-3223', 'CVE-2023-20233',
+                # dns_doctor_passive mdns.py "why the Avahi CVEs are absent" note: the
+                # remote crafted-packet bugs are 2006-2011, ~5.0 CVSS v2 (under the 6.5
+                # floor), not in CISA KEV -- named only to document the deliberate gap.
+                'CVE-2008-5081', 'CVE-2010-2244', 'CVE-2011-1002'}
+# Deliberately wrong IDs inside a vendored module's own mutation-test fixtures
+# (ptpwatch v4's README bite list swaps CVE-2024-42861 for this). Never a detection.
+IGNORED_CVES = {'CVE-2024-99999',
+                'CVE-9999-0001',   # lldpwatch conformance: operator extra_families fixture
+                # lldpwatch_conformance: the four SB220 4.3 siblings, asserted NOT screened
+                'CVE-2021-34775', 'CVE-2021-34776', 'CVE-2021-34777', 'CVE-2021-34778',
+                'CVE-2019-14810',  # oamwatch xcheck comment: Arista LDP, named only as a not-this-protocol example
+                # aristaguard QUARANTINED_CVES: named in-module ONLY so they can never be
+                # silently promoted into the catalog — no advisory/CVSS confirmed, no
+                # detection rule exists, they never fire. Not part of coverage.
+                'CVE-2024-27890', 'CVE-2020-15897', 'CVE-2024-12378',
+                'CVE-2026-11704', 'CVE-2025-6188', 'CVE-2023-24548'}
 # Per-CVE owner overrides where a shared helper names another vendor's CVE.
 CVE_OWNER_OVERRIDE = {'CVE-2021-0254': 'Juniper Guard'}
 # Owners (or owner+CVE) whose mention is context/reference, not a detection.
@@ -105,6 +157,9 @@ CONTEXT_OWNERS = {'BGP Path Watch:advisory', 'OSPF Watch:advisory', 'SR-MPLS Wat
 NAMES = {
     'CVE-2002-20001': 'D(HE)at', 'CVE-2022-40735': 'D(HE)at', 'CVE-2024-41996': 'D(HE)at',
     'CVE-2003-0001': 'Etherleak',
+    'CVE-2015-8011': 'lldpd lldp_decode Management Address overflow',
+    'CVE-2022-4338': 'Open vSwitch LLDP Auto Attach integer underflow',
+    'CVE-2014-9222': 'Misfortune Cookie', 'CVE-2025-41426': 'Liebert RDU101 / IS-UNITY HTTP method overflow',
     'CVE-2020-11896': 'Ripple20 IPv4 tunnelling RCE', 'CVE-2020-11897': 'Ripple20 IPv6 OOB write (not APC)',
     'CVE-2020-11898': 'Ripple20 ICMPv4 heap leak', 'CVE-2020-11899': 'Ripple20 IPv6 OOB read',
     'CVE-2020-11901': 'Ripple20 DNS resolver RCE', 'CVE-2020-11902': 'Ripple20 IPv6-in-IPv4 OOB read',
@@ -124,6 +179,8 @@ NAMES = {
     'CVE-2015-3306': 'ProFTPD mod_copy pre-auth copy',
     'CVE-2019-12815': 'ProFTPD mod_copy Limit bypass',
     'CVE-2023-51713': 'ProFTPD make_ftp_cmd OOB read',
+    'CVE-2019-14462': 'libmodbus FC15/16 count OOB read', 'CVE-2019-14463': 'libmodbus FC15/16 count OOB read',
+    'CVE-2024-10918': 'libmodbus over-length reply', 'CVE-2021-22779': 'ModiPwn (Modicon UMAS auth bypass)',
     'CVE-2015-4000': 'Logjam', 'CVE-2015-5434': 'MPLS VRF hopping (Comware)',
     'CVE-2015-8087': 'MPLS VRF hopping (Huawei)', 'CVE-2015-7704': "NTP Kiss-o'-Death spoof",
     'CVE-2015-7705': "NTP Kiss-o'-Death spoof", 'CVE-2015-7871': 'NTP crypto-NAK auth bypass',
@@ -134,6 +191,16 @@ NAMES = {
     'CVE-2019-5608': 'Fragmented IGMP/MLD membership', 'CVE-2020-0796': 'SMBGhost',
     'CVE-2020-1472': 'Zerologon', 'CVE-2020-3110': 'CDPwn', 'CVE-2020-3111': 'CDPwn',
     'CVE-2020-3118': 'CDPwn', 'CVE-2020-3119': 'CDPwn', 'CVE-2020-3120': 'CDPwn',
+    'CVE-2020-3505': 'LCDPwn (Video Surveillance 8000)', 'CVE-2020-3506': 'LCDPwn (Video Surveillance 8000)',
+    'CVE-2020-3507': 'LCDPwn (Video Surveillance 8000)', 'CVE-2020-3543': 'LCDPwn (Video Surveillance 8000)',
+    'CVE-2020-3544': 'LCDPwn (Video Surveillance 8000)', 'CVE-2021-1131': 'LCDPwn (Video Surveillance 8000)',
+    'CVE-2021-1521': 'LCDPwn (Video Surveillance 8000)', 'CVE-2021-1563': 'LCDPwn (Video Surveillance 7000)',
+    'CVE-2021-1564': 'LCDPwn (Video Surveillance 7000)', 'CVE-2021-1379': 'LCDPwn (IP Phone 68xx/78xx/88xx)',
+    'CVE-2022-20968': 'Cisco IP Phone 7800/8800 CDP stack overflow', 'CVE-2022-20824': 'Cisco NX-OS/FXOS CDP RCE',
+    'CVE-2022-20688': 'Cisco ATA 190 CDP OOB read', 'CVE-2022-20689': 'Cisco ATA 190 CDP length validation',
+    'CVE-2022-20690': 'Cisco ATA 190 CDP length validation', 'CVE-2022-20691': 'Cisco ATA 190 CDP resource exhaustion',
+    'CVE-2022-20766': 'Cisco ATA 190 CDP OOB read', 'CVE-2022-20804': 'Cisco Unified CM CDP DoS',
+    'CVE-2021-26111': 'FortiSwitch lldpmedd memory exhaustion', 'CVE-2023-41910': 'lldpd cdp_decode OOB read',
     'CVE-2020-8616': 'NXNSAttack', 'CVE-2020-11868': 'NTP zero-origin sync block',
     'CVE-2020-12243': 'OpenLDAP nested-filter DoS', 'CVE-2020-16898': 'Bad Neighbor',
     'CVE-2020-16899': 'RA DNSSL DoS', 'CVE-2020-25583': 'RA DNSSL DoS (rtsold)',
@@ -149,6 +216,24 @@ NAMES = {
     'CVE-2024-30388': 'LACP malformed-PDU flap', 'CVE-2024-33655': 'DNSBomb',
     'CVE-2024-43532': 'RemoteRegistry NTLM relay', 'CVE-2024-49112': 'LDAPNightmare',
     'CVE-2024-49113': 'LDAPNightmare', 'CVE-2025-20315': 'CAPWAP malformed header',
+    'CVE-2024-20311': 'IOS/IOS-XE LISP crafted-packet DoS', 'CVE-2025-20111': 'NX-OS health-monitor frame DoS',
+    'CVE-2011-3323': 'Quagga ospf6d IPv6 prefix DoS', 'CVE-2018-14880': 'tcpdump OSPFv3 parser over-read',
+    'CVE-2018-0466': 'Cisco IOS-XR OSPFv3 DoS', 'CVE-2013-5565': 'Cisco OSPFv3 DoS',
+    'CVE-2025-8872': 'Arista EOS OSPFv3 DoS', 'CVE-2013-0149': 'Cisco IOS OSPF LSA manipulation',
+    'CVE-2024-44070': 'FRR bgp_attr_encap Tunnel-Encap crash',
+    'CVE-2021-1368': 'UDLD port-channel RCE', 'CVE-2021-34714': 'UDLD reload DoS',
+    'CVE-2025-20154': 'TWAMP server OOB array-access reload', 'CVE-2021-34720': 'IP SLA/TWAMP socket memory exhaustion',
+    'CVE-2025-20188': 'IOS-XE WLC OOB AP-image hardcoded-JWT upload (10.0)', 'CVE-2026-20133': 'Catalyst SD-WAN Manager API flaw',
+    'CVE-2018-15439': 'SB switch default privileged account re-enabled', 'CVE-2025-20311': 'Catalyst 9000 crafted-frame egress port block',
+    'CVE-2025-20313': 'IOS-XE secure boot bypass', 'CVE-2025-20314': 'IOS-XE secure boot bypass',
+    'CVE-2025-20327': 'IE Switch Device Manager crafted-URL DoS',
+    'CVE-2023-20024': 'Cisco SB switch web-UI DoS', 'CVE-2023-20156': 'Cisco SB switch web-UI DoS',
+    'CVE-2023-20157': 'Cisco SB switch web-UI DoS', 'CVE-2023-20158': 'Cisco SB switch web-UI DoS',
+    'CVE-2023-20162': 'Cisco SB switch web-UI info disclosure',
+    'CVE-2026-20267': 'IOS XE access control (Aug-2026 wave)', 'CVE-2026-20268': 'IOS XE buffer restriction (Aug-2026 wave)',
+    'CVE-2026-20269': 'IOS XE resource lifetime (Aug-2026 wave)', 'CVE-2026-20270': 'IOS XE calc error (Aug-2026 wave)',
+    'CVE-2026-20271': 'IOS XE input validation (Aug-2026 wave)', 'CVE-2026-20272': 'IOS XE RCE (Aug-2026 wave, 9.8)',
+    'CVE-2026-20273': 'IOS XE input validation (Aug-2026 wave)',
     'CVE-2025-20700': 'Airoha RACE', 'CVE-2025-20701': 'Airoha RACE', 'CVE-2025-20702': 'Airoha RACE',
     'CVE-2025-22474': 'Dell OS10 SSRF', 'CVE-2025-33073': 'SMB reflective relay',
     'CVE-2025-36911': 'WhisperPair', 'CVE-2025-38741': 'Duplicate SSH host key',
@@ -162,8 +247,14 @@ NAMES = {
 def tracked_files():
     out = subprocess.run(['git', 'ls-files', '*.py', '*.js', '*.html'], cwd=ROOT,
                          capture_output=True, text=True, check=True).stdout.split()
-    # Never scan this script: its NAMES table would count as a detector.
-    return [p for p in out if p != 'scripts/gen_cve_list.py']
+    # Never scan this script: its NAMES table would count as a detector. And never
+    # scan the vendored BGP Pathwatch v6 passive tiers: they ship self-test-only
+    # (no live Ragnar capture adapter/route — see #959), so the parser CVEs their
+    # own test corpus names must keep the BGP/SR-MPLS watchers' intended CONTEXT
+    # (posture-advisory) classification, not be miscounted as live-detected here.
+    return [p for p in out
+            if p != 'scripts/gen_cve_list.py'
+            and not p.startswith('python/bgp_pathwatch/')]
 
 
 def nd_owner(name):
@@ -210,6 +301,18 @@ def sr_reference_span(lines):
     return -1, -1
 
 
+def deferred_span(lines):
+    """(start, end) line indexes of radiuswatch's DEFERRED_CVES dict literal. CVEs
+    named there are triaged-and-rejected (undetectable passively — DHCP decoder, EAP-pwd
+    side channels, logrotate priv-esc), so they are context, never detected."""
+    for i, l in enumerate(lines):
+        if l.startswith('DEFERRED_CVES'):
+            for j in range(i + 1, len(lines)):
+                if lines[j].startswith('}'):
+                    return i, j
+    return -1, -1
+
+
 def html_card(lines, i):
     for j in range(i, -1, -1):
         m = re.search(r'<h3[^>]*>([^<]+)', lines[j])
@@ -230,6 +333,7 @@ def collect():
         if not any(CVE_RE.search(l) for l in lines):
             continue
         sr_a, sr_b = sr_reference_span(lines) if path == 'sr_mplswatch.py' else (-1, -1)
+        df_a, df_b = deferred_span(lines) if path == 'python/radiuswatch.py' else (-1, -1)
         owner = None
         nxt = next_owners(lines) if path == 'network_diagnostics.py' else []
         doc_end = module_docstring_end(lines)
@@ -242,6 +346,8 @@ def collect():
                 cur = nxt[i] if l.startswith('#') else owner
             for m in CVE_RE.finditer(l):
                 cve = m.group(0)
+                if cve in IGNORED_CVES:
+                    continue
                 mentions[cve].append(l)
                 if path in MENTION_ONLY:
                     if path == 'web/index_modern.html':
@@ -259,7 +365,7 @@ def collect():
                     status = 'active' if path.startswith('actions/') else 'detected'
                     # Module-docstring scope notes and reference tables name
                     # CVEs without detecting them.
-                    if sr_a <= i <= sr_b or i < doc_end:
+                    if sr_a <= i <= sr_b or df_a <= i <= df_b or i < doc_end:
                         status = 'context' if status == 'detected' else status
                 else:
                     det = next((d for p, d in FILE_PREFIX_OWNERS.items()

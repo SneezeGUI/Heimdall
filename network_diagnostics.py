@@ -56,6 +56,7 @@ import report_common
 import bt_scanner
 import sdr_spectrum
 import rtl_sdr
+import esp_sdr
 import sigmf_analyzer
 import adsb
 import meshtastic_node
@@ -1323,6 +1324,205 @@ _MAC_EVENTS_CAP = 200
 # One MAC bound to at least this many distinct IPs at once is a clone candidate.
 _MAC_CLONE_MIN_IPS = 2
 
+# --------------------------------------------------------------------------
+# L2-security passive sniff (MAC Watch v4) — MACsec / 802.1X-EAPOL / MKA.
+#
+# The neighbour-table/arp-scan model above cannot see the link-security control
+# plane: MACsec (802.1AE), 802.1X port authentication (EAPOL) and the MACsec Key
+# Agreement protocol (MKA, EAPOL type 5) ride dedicated EtherTypes that never
+# reach the ARP/NDP caches. A short, OPT-IN passive capture (no frames are ever
+# emitted) parses the SecTAG and EAPOL headers directly off the wire and folds
+# the findings into the same verdict:
+#   * MACSEC-010  PN regression inside one secure association — a replayed or
+#                 rolled-back packet number (replay protection off, or an active
+#                 replay).                                                   HIGH
+#   * MACSEC-011  SCI system-identifier != transmitting source MAC — the secure
+#                 channel claims an identity the frame's own source contradicts
+#                 (spoofed secure channel).                                  HIGH
+#   * MACSEC-012  confidentiality downgrade — an SA seen encrypted (TCI.E=1)
+#                 now arriving integrity-only (E=0): forced cipher-off.      HIGH
+#   * MACSEC-013  MACsec secure channel observed (inventory).               INFO
+#   * EAPOL-010   EAPOL-Logoff burst — spoofed Logoff frames force-deauth the
+#                 port (802.1X denial of service).                          HIGH
+#   * EAPOL-011   EAPOL-Start flood — supplicant-impersonation / access DoS. MEDIUM
+#   * EAPOL-012   802.1X port authentication observed (inventory).          INFO
+#   * MKA-010     MACsec Key Agreement (MKA) participant observed (inventory).INFO
+# MAC Watch carries no CVEs; these are passive posture signals, not CVE probes.
+_MACSEC_ETHERTYPE = 0x88E5
+_EAPOL_ETHERTYPE = 0x888E
+_L2SEC_BPF = 'ether proto 0x88e5 or ether proto 0x888e'
+_L2SEC_CAPTURE_S = 6               # default passive-sniff window (opt-in)
+# EAPOL abuse thresholds (per capture window).
+_EAPOL_LOGOFF_MIN = 3              # >= this many Logoff frames -> deauth DoS
+_EAPOL_START_FLOOD = 8             # >= this many Start frames -> access flood
+
+
+def _macsec_parse(src_mac, payload):
+    """Parse an 802.1AE SecTAG (the bytes AFTER the 0x88E5 EtherType) into
+    {an, pn, enc, icv, sci, sci_mac} or None if too short to be a SecTAG.
+    enc=TCI.E (confidentiality), icv=TCI.C, sci present only when TCI.SC=1;
+    sci_mac is the 6-byte system identifier that opens the SCI."""
+    if not payload or len(payload) < 6:
+        return None
+    tci_an = payload[0]
+    sc = bool(tci_an & 0x20)       # TCI.SC — explicit SCI present
+    enc = bool(tci_an & 0x08)      # TCI.E  — confidentiality on
+    icv = bool(tci_an & 0x04)      # TCI.C  — changed text / ICV present
+    an = tci_an & 0x03             # association number
+    pn = int.from_bytes(payload[2:6], 'big')
+    sci = sci_mac = None
+    if sc:
+        if len(payload) < 14:
+            return None
+        sci = payload[6:14]
+        sci_mac = ':'.join('%02x' % b for b in sci[:6])
+    return {'an': an, 'pn': pn, 'enc': enc, 'icv': icv,
+            'sci': (sci.hex() if sci else None), 'sci_mac': sci_mac,
+            'src': _mac_norm(src_mac)}
+
+
+def _eapol_parse(payload):
+    """Parse an EAPOL header (bytes AFTER the 0x888E EtherType) into
+    {version, ptype, body_len} or None. ptype: 0=EAP 1=Start 2=Logoff 3=Key
+    4=ASF-Alert 5=MKA (802.1X-2010 MACsec Key Agreement)."""
+    if not payload or len(payload) < 2:
+        return None
+    return {'version': payload[0], 'ptype': payload[1],
+            'body_len': int.from_bytes(payload[2:4], 'big') if len(payload) >= 4 else 0}
+
+
+def _l2sec_scan_frames(frames):
+    """Analyse an ordered list of (src_mac, ethertype, payload_bytes) link-security
+    frames and return a deduped findings list. Stateful across the list: per secure
+    association (SCI|src, AN) it tracks the last PN for regression and whether the SA
+    was ever encrypted for downgrade; EAPOL Logoff/Start frames are counted for the
+    DoS/flood signals. Separated from capture so the self-test can drive it directly."""
+    findings, seen = [], set()
+    sa_pn = {}            # (assoc_key, an) -> last PN
+    sa_enc = {}           # (assoc_key, an) -> ever-encrypted (bool)
+    macsec_channels = set()
+    logoff_srcs, logoff_total = set(), 0
+    start_total = 0
+    eapol_auth = False
+    mka_members = set()
+
+    def add(code, severity, src, detail):
+        key = (code, src)
+        if key in seen:
+            return
+        seen.add(key)
+        findings.append({'code': code, 'severity': severity,
+                         'src': src, 'detail': detail})
+
+    for src_mac, ethertype, payload in frames:
+        if ethertype == _MACSEC_ETHERTYPE:
+            tag = _macsec_parse(src_mac, payload)
+            if not tag:
+                continue
+            src = tag['src']
+            assoc = (tag['sci'] or src, tag['an'])
+            if tag['sci']:
+                if tag['sci'] not in macsec_channels:
+                    macsec_channels.add(tag['sci'])
+                    add('MACSEC-013', 'info', src,
+                        f"MACsec (802.1AE) secure channel {tag['sci_mac']} active on the "
+                        f"segment (AN {tag['an']}, {'encrypted' if tag['enc'] else 'integrity-only'})")
+                # SCI system-identifier must equal the transmitting source MAC.
+                if tag['sci_mac'] and src and tag['sci_mac'] != src:
+                    add('MACSEC-011', 'high', src,
+                        f"MACsec SCI {tag['sci_mac']} does not match the transmitting "
+                        f"source MAC {src} — the secure channel claims an identity the "
+                        f"frame itself contradicts (spoofed secure channel)")
+            # PN must increase within a secure association; a repeat or roll-back
+            # is a replay (replay protection disabled, or an active replay).
+            last = sa_pn.get(assoc)
+            if last is not None and tag['pn'] <= last:
+                add('MACSEC-010', 'high', src,
+                    f"MACsec packet number regressed ({last} -> {tag['pn']}) inside secure "
+                    f"association {assoc[0]}/AN{tag['an']} — replayed or rolled-back PN "
+                    f"(replay protection off, or an active replay)")
+            sa_pn[assoc] = max(last or 0, tag['pn'])
+            # Confidentiality downgrade: an SA once encrypted now integrity-only.
+            if sa_enc.get(assoc) and not tag['enc']:
+                add('MACSEC-012', 'high', src,
+                    f"MACsec confidentiality downgrade on {assoc[0]}/AN{tag['an']}: a "
+                    f"secure association previously seen encrypted is now integrity-only "
+                    f"(TCI.E cleared) — forced cipher-off")
+            sa_enc[assoc] = sa_enc.get(assoc, False) or tag['enc']
+        elif ethertype == _EAPOL_ETHERTYPE:
+            e = _eapol_parse(payload)
+            if not e:
+                continue
+            src = _mac_norm(src_mac)
+            pt = e['ptype']
+            if pt == 2:                         # EAPOL-Logoff
+                logoff_total += 1
+                if src:
+                    logoff_srcs.add(src)
+            elif pt == 1:                       # EAPOL-Start
+                start_total += 1
+            elif pt == 5:                       # EAPOL-MKA (802.1X-2010)
+                if src:
+                    mka_members.add(src)
+            elif pt in (0, 3):                  # EAP / EAPOL-Key
+                eapol_auth = True
+
+    # EAPOL post-pass aggregates.
+    if logoff_total >= _EAPOL_LOGOFF_MIN:
+        src = sorted(logoff_srcs)[0] if logoff_srcs else '?'
+        add('EAPOL-010', 'high', src,
+            f"{logoff_total} EAPOL-Logoff frame(s) from {len(logoff_srcs)} source(s) in "
+            f"one window — spoofed Logoff force-deauthenticates the 802.1X port "
+            f"(port-access denial of service)")
+    if start_total >= _EAPOL_START_FLOOD:
+        add('EAPOL-011', 'medium', '?',
+            f"{start_total} EAPOL-Start frames in one window — 802.1X supplicant "
+            f"impersonation / port-access flood")
+    if eapol_auth:
+        add('EAPOL-012', 'info', '?',
+            "802.1X port authentication (EAPOL) active on the segment")
+    for m in sorted(mka_members):
+        add('MKA-010', 'info', m,
+            f"MACsec Key Agreement (MKA) participant {m} observed — 802.1X-2010 "
+            f"key-agreement plane active")
+    return findings
+
+
+def _l2sec_capture(interface, seconds):
+    """Passively capture the link-security control plane (MACsec/EAPOL/MKA) and
+    return _l2sec_scan_frames() findings. Best-effort: returns [] when
+    tcpdump/scapy is unavailable or nothing matched. Emits no frames."""
+    if not _have('tcpdump') or not _have_scapy():
+        return []
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
+    if not iface:
+        return []
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix='.pcap')
+    os.close(fd)
+    _run(['timeout', str(seconds), 'tcpdump', '-i', iface, '-nn', '-p',
+          '-s', '256', '-c', '5000', '-w', path, _L2SEC_BPF],
+         timeout=int(seconds) + 8)
+    frames = []
+    try:
+        from scapy.all import rdpcap, Ether
+        try:
+            pkts = rdpcap(path)
+        except Exception:
+            return []
+        for pk in pkts:
+            if not isinstance(pk, Ether):
+                continue
+            et = int(pk.type) if pk.type is not None else 0
+            payload = bytes(pk.payload)
+            frames.append((pk.src, et, payload))
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return _l2sec_scan_frames(frames)
+
 # Locally-administered VM / container prefixes — tracked apart from privacy
 # randomization so virtual NICs don't inflate the randomized count or look like
 # a spoof. Keyed by the leading octets (lowercase, colon-separated).
@@ -1535,13 +1735,19 @@ def do_mac_watch_reset():
     return {'success': True, 'reset': True}
 
 
-def do_mac_watch(scan=True, interface=None):
-    """Detect current + past MAC spoofing/cloning and randomization, and track
-    devices that rotate randomized MACs. Detection-only; nothing is spoofed.
+def do_mac_watch(scan=True, interface=None, l2sec=False, l2sec_seconds=_L2SEC_CAPTURE_S):
+    """Detect current + past MAC spoofing/cloning and randomization, track devices
+    that rotate randomized MACs, and (opt-in) watch the link-security control plane.
+    Detection-only; nothing is spoofed and no frames are emitted.
 
     scan=True adds an arp-scan sweep (active but harmless) to widen coverage
     beyond whatever is already in the neighbour table; scan=False reads the
-    neighbour table only (works unprivileged, no traffic generated)."""
+    neighbour table only (works unprivileged, no traffic generated).
+
+    l2sec=True adds a short passive sniff of MACsec (802.1AE), 802.1X-EAPOL and
+    MKA — the one L2 identity plane the neighbour table never sees — folding
+    replay / spoofed-secure-channel / cipher-downgrade / 802.1X-DoS signals into
+    the verdict. Off by default so the background/e-Paper path stays fast."""
     now = time.time()
     gw = _default_gateway()
     gw_mac = _neigh_mac(gw) if gw else None
@@ -1782,11 +1988,34 @@ def do_mac_watch(scan=True, interface=None):
             f"{e['embedded_mac']}, but the NDP cache binds it to {e['mac']} — a "
             f"MAC-identity contradiction (spoof; proxy-NDP can also explain it)")
 
-    if spoofed or clones or hi_events or fhrp_hijacks:
+    # (8) L2-security control plane (opt-in passive sniff) — MACsec/EAPOL/MKA.
+    # The neighbour table never carries these EtherTypes, so this is the only way
+    # to see a replayed/spoofed secure channel, a forced cipher-downgrade, or an
+    # 802.1X Logoff deauth DoS. Best-effort: silently empty without tcpdump/scapy.
+    l2sec_findings = []
+    if l2sec:
+        cap_iface = interface if _valid_iface(interface or '') else (scan_iface or _default_route_iface())
+        l2sec_findings = _l2sec_capture(cap_iface, l2sec_seconds)
+    l2sec_hi = [f for f in l2sec_findings if f['severity'] == 'high']
+    l2sec_med = [f for f in l2sec_findings if f['severity'] == 'medium']
+    for f in l2sec_findings:
+        if f['severity'] != 'info':
+            reasons.append(f"{f['detail']} [{f['code']}]")
+    l2sec = {
+        'ran': bool(l2sec),
+        'findings': l2sec_findings,
+        'high': len(l2sec_hi),
+        'medium': len(l2sec_med),
+        'macsec': len([f for f in l2sec_findings if f['code'].startswith('MACSEC-')]),
+        'eapol': len([f for f in l2sec_findings if f['code'].startswith('EAPOL-')]),
+        'mka': len([f for f in l2sec_findings if f['code'].startswith('MKA-')]),
+    }
+
+    if spoofed or clones or hi_events or fhrp_hijacks or l2sec_hi:
         verdict = 'spoofed'
-    elif tracks or randomized or fhrp_virtuals:
-        verdict = 'suspicious' if tracks else ('fhrp' if fhrp_virtuals and not randomized
-                                               else 'randomization')
+    elif tracks or randomized or fhrp_virtuals or l2sec_med:
+        verdict = ('suspicious' if tracks or l2sec_med
+                   else ('fhrp' if fhrp_virtuals and not randomized else 'randomization'))
     if eui64_mismatches and verdict in ('clean', 'randomization', 'fhrp'):
         verdict = 'suspicious'
 
@@ -1804,10 +2033,13 @@ def do_mac_watch(scan=True, interface=None):
             'fhrp_hijacks': len(fhrp_hijacks),
             'ipv6_bindings': len(v6_bindings),
             'eui64_mismatch': len(eui64_mismatches),
+            'l2sec_high': l2sec['high'],
+            'l2sec_medium': l2sec['medium'],
         },
         'spoofed': spoofed,
         'clones': clones,
         'fhrp': fhrp,
+        'l2sec': l2sec,
         'ipv6': {'bindings': v6_bindings, 'eui64_mismatches': eui64_mismatches},
         # Every MAC seen this pass, worst class first, so the UI can list them.
         'observed_macs': sorted(
@@ -4557,6 +4789,56 @@ def _mac_selftest():
                           'pass': ok6.get('summary', {}).get('eui64_mismatch') == 0})
     finally:
         g.update(saved)
+
+    # L2-security control plane (MAC Watch v4): drive the pure parse/detect path
+    # with crafted MACsec / EAPOL / MKA frames — no wire, no root. Each tuple is
+    # (src_mac, ethertype, payload_after_ethertype), exactly what capture yields.
+    def _sectag(tci_an, pn, sci_mac=None):
+        p = bytes([tci_an, 0x00]) + int(pn).to_bytes(4, 'big')
+        if sci_mac is not None:
+            p += bytes(int(x, 16) for x in sci_mac.split(':')) + b'\x00\x01'
+        return p
+
+    def _eapol(ptype, version=2):
+        return bytes([version, ptype, 0x00, 0x00])
+
+    ME, EE = _MACSEC_ETHERTYPE, _EAPOL_ETHERTYPE
+    SA, SB = 'aa:bb:cc:dd:ee:01', 'aa:bb:cc:dd:ee:02'
+    TCI_ENC = 0x20 | 0x08 | 0x04      # SC + E + C, AN 0
+    TCI_INT = 0x20 | 0x04             # SC + C (integrity-only), AN 0
+
+    def l2(name, frames, want_codes, want_absent=()):
+        found = {f['code'] for f in _l2sec_scan_frames(frames)}
+        ok = all(c in found for c in want_codes) and not (set(want_absent) & found)
+        scenarios.append({'name': name, 'expect': '+'.join(want_codes) or 'clean',
+                          'got': ','.join(sorted(found)) or 'none', 'pass': ok})
+
+    # PN regression inside one SA (100 -> 50) is a replay.
+    l2('l2sec-macsec-pn-replay',
+       [(SA, ME, _sectag(TCI_ENC, 100, SA)), (SA, ME, _sectag(TCI_ENC, 50, SA))],
+       ['MACSEC-010', 'MACSEC-013'])
+    # SCI system-identifier (SB) != transmitting source MAC (SA) -> spoofed channel.
+    l2('l2sec-macsec-sci-spoof',
+       [(SA, ME, _sectag(TCI_ENC, 10, SB))], ['MACSEC-011'])
+    # Confidentiality downgrade: encrypted then integrity-only on one SA.
+    l2('l2sec-macsec-downgrade',
+       [(SA, ME, _sectag(TCI_ENC, 10, SA)), (SA, ME, _sectag(TCI_INT, 11, SA))],
+       ['MACSEC-012'])
+    # Clean MACsec: monotone PN, matching SCI, encryption stays on -> inventory only.
+    l2('l2sec-macsec-clean',
+       [(SA, ME, _sectag(TCI_ENC, 10, SA)), (SA, ME, _sectag(TCI_ENC, 11, SA))],
+       ['MACSEC-013'], want_absent=('MACSEC-010', 'MACSEC-011', 'MACSEC-012'))
+    # EAPOL-Logoff burst -> port-deauth DoS.
+    l2('l2sec-eapol-logoff-dos',
+       [(SA, EE, _eapol(2)), (SB, EE, _eapol(2)), (SA, EE, _eapol(2))],
+       ['EAPOL-010'])
+    # EAPOL-Start flood -> access flood.
+    l2('l2sec-eapol-start-flood',
+       [(SA, EE, _eapol(1))] * _EAPOL_START_FLOOD, ['EAPOL-011'])
+    # MKA (EAPOL type 5) participant inventory; a lone Logoff must NOT fire the DoS.
+    l2('l2sec-mka-inventory',
+       [(SA, EE, _eapol(5)), (SB, EE, _eapol(2))],
+       ['MKA-010'], want_absent=('EAPOL-010',))
 
     scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
     try:
@@ -7455,15 +7737,32 @@ _NTP_EF_VALUE_START = 20        # first octet of the value payload
 _NTP_AUTOKEY_OPCODES = {1: 'ASSOC', 2: 'CERT', 3: 'COOKIE', 4: 'AUTO', 5: 'LEAP',
                         6: 'SIGN', 7: 'IFF', 8: 'GQ', 9: 'MV'}
 
+# NTP Watch v11: a datagram beyond any legitimate NTP length (RN18, CVE-2016-9312)
+# and a mode-6 control header whose `count` overruns the spec maximum or the
+# datagram (RN19, CVE-2019-6444 / CVE-2019-6443 — ntpsec process_control()).
+_NTP_MAX_LEN = 1500             # clears NTS + Autokey; a bound near 48 would alarm on NTS
+_NTP_CTL_HEADER_LEN = 12
+_NTP_CTL_MAX_DATA_LEN = 468     # ntp_control.h: largest conformant data section
+_NTP_CTL_OFF_COUNT = 10         # u16 data count in the mode-6 header
+
 _NTP_HDR_RE = re.compile(r'^(\d+\.\d+)\s+IP6?\b')
+# `ADDR.port > ADDR.port: [udp sum ok] NTPvN, Mode, length L` — IPv4 and IPv6
+# (tcpdump prints the v6 form on the header line, with `[udp sum ok]` under -v).
 _NTP_SRC_RE = re.compile(
-    r'(\d+\.\d+\.\d+\.\d+)\.(\d+)\s*>\s*(\d+\.\d+\.\d+\.\d+)\.(\d+):\s*'
+    r'([0-9A-Fa-f:.]+?)\.(\d+)\s*>\s*([0-9A-Fa-f:.]+?)\.(\d+):\s*(?:\[[^\]]*\]\s*)?'
     r'NTPv(\d+),\s*([^,]+?),\s*length\s+(\d+)')
+# IPv6 behind an extension header: `ADDR > ADDR: DSTOPT (padn) 123 > 123: NTPv4, ...`
+# (fragment: `frag (id:0|56) 123 > 123: ...`). Admitted by the extension-header clause.
+_NTP_SRC_EH_RE = re.compile(
+    r'([0-9A-Fa-f:]+:[0-9A-Fa-f:.]*)\s*>\s*([0-9A-Fa-f:]+:[0-9A-Fa-f:.]*):\s.*?'
+    r'(\d+)\s*>\s*(\d+):\s*(?:\[[^\]]*\]\s*)?NTPv(\d+),\s*([^,]+?),\s*length\s+(\d+)')
+_NTP_BPF = 'udp port 123 or (ip6 and (ip6[6] = 0 or ip6[6] = 43 or ip6[6] = 44 or ' \
+           'ip6[6] = 51 or ip6[6] = 60))'
 # tcpdump -x hex-dump line: `\t0x0010:  4500 004c 0000 4000 ...`
 _NTP_HEX_RE = re.compile(r'^\s*0x[0-9a-fA-F]+:\s+((?:[0-9a-fA-F]{2,4}\s*)+)')
 
 
-def _parse_autokey_ef(payload):
+def _parse_autokey_ef(payload, wire_len=None):
     """Inspect raw NTP payload bytes for an Autokey (crypto) extension field.
 
     Detects the network-reachable attack surface of CVE-2014-9295 — the ntpd
@@ -7472,11 +7771,14 @@ def _parse_autokey_ef(payload):
     Works directly on the wire bytes so it is independent of any dissector
     recognising Autokey opcodes. Returns (present, info, reasons); a non-empty
     ``reasons`` list means the EF is malformed in the way an exploit packet is.
-    Ported from the standalone ntpwatch _parse_autokey_ef."""
+    Ported from the standalone ntpwatch _parse_autokey_ef. `wire_len` is the true
+    NTP length when the capture snaplen truncated `payload`: the length checks are
+    judged against the wire, never against the bytes the snaplen happened to keep."""
     try:
         if payload is None or len(payload) < _NTP_HEADER_LEN:
             return (False, None, [])
-        remaining = len(payload) - _NTP_HEADER_LEN
+        total = wire_len if (wire_len and wire_len > len(payload)) else len(payload)
+        remaining = total - _NTP_HEADER_LEN
         # Trailing region is a MAC (or nothing) -> symmetric-key auth, not Autokey.
         if remaining in _NTP_MAC_SIZES:
             return (False, None, [])
@@ -7485,6 +7787,9 @@ def _parse_autokey_ef(payload):
             return (True, {'ef_len': None, 'region': remaining},
                     ['ef_region_undersized'])
         ef = payload[_NTP_HEADER_LEN:]
+        ef_wire = total - _NTP_HEADER_LEN
+        if len(ef) < 4:
+            return (True, {'ef_len': None, 'region': remaining}, [])
         ef_type = struct.unpack_from('!H', ef, 0)[0]
         ef_len = struct.unpack_from('!H', ef, _NTP_EF_OFF_LEN)[0]
         opcode = ef_type & 0x3F
@@ -7499,14 +7804,14 @@ def _parse_autokey_ef(payload):
             reasons.append('ef_len_below_floor')
         if ef_len % 4 != 0:
             reasons.append('ef_len_misaligned')
-        if ef_len > len(ef):
+        if ef_len > ef_wire:
             reasons.append('ef_len_exceeds_packet')
         # Value-length overflow: the copy length crypto_recv() trusts. A value that
         # cannot fit the declared EF (or the wire bytes) is the exploit signature.
         if len(ef) >= _NTP_EF_VALUE_START:
             vallen = struct.unpack_from('!I', ef, _NTP_EF_OFF_VALLEN)[0]
             info['value_len'] = vallen
-            wire_budget = len(ef) - _NTP_EF_VALUE_START
+            wire_budget = ef_wire - _NTP_EF_VALUE_START
             if vallen > wire_budget or (ef_len >= _NTP_EF_VALUE_START
                                         and vallen > ef_len - _NTP_EF_VALUE_START):
                 reasons.append('value_length_overflow')
@@ -7542,9 +7847,24 @@ def _ntp_payload_from_block(block_lines):
             return None
         udp_off = ihl
     elif ver == 6:
-        if len(data) < 48 or data[6] != 17:  # next-header 17 = UDP (no ext hdrs)
+        if len(data) < 48:
             return None
-        udp_off = 40
+        nh, off = data[6], 40
+        for _ in range(8):                      # bounded extension-header walk
+            if nh == 17:
+                break
+            if nh not in (0, 43, 44, 51, 60):
+                return None
+            if nh == 44 and len(data) >= off + 4 and \
+                    (struct.unpack_from('!H', data, off + 2)[0] >> 3) != 0:
+                return None                     # non-first fragment: no UDP header
+            ln = _ipv6_ext_len(data, off, nh)
+            if ln is None:
+                return None
+            nh, off = data[off], off + ln
+        if nh != 17 or len(data) < off + 8:
+            return None
+        udp_off = off
     else:
         return None
     return data[udp_off + 8:]  # skip the 8-byte UDP header
@@ -7583,12 +7903,17 @@ def _parse_ntp_capture(output):
             continue
         text = '\n'.join(block)
         sm = _NTP_SRC_RE.search(text)
-        if not sm:
-            continue  # not a decodable NTP packet (or truncated non-NTP)
-        rec = {'rx_epoch': rx_epoch, 'src': sm.group(1), 'sport': int(sm.group(2)),
-               'dst': sm.group(3), 'dport': int(sm.group(4)),
+        if sm:
+            src, sport, dst, dport = sm.group(1), sm.group(2), sm.group(3), sm.group(4)
+        else:
+            sm = _NTP_SRC_EH_RE.search(text)
+            if not sm:
+                continue  # not a decodable NTP packet (or truncated non-NTP)
+            src, dst, sport, dport = sm.group(1), sm.group(2), sm.group(3), sm.group(4)
+        rec = {'rx_epoch': rx_epoch, 'src': src, 'sport': int(sport),
+               'dst': dst, 'dport': int(dport),
                'ver': int(sm.group(5)), 'mode': sm.group(6).strip(),
-               'ntp_len': int(sm.group(7)),
+               'ntp_len': int(sm.group(7)), 'ctl_count': None, 'mode_num': None,
                'stratum': None, 'sdesc': '', 'refid': '', 'disp': 0.0,
                'leap': None, 'xmit_unix': None, 'offset': None, 'origin': None,
                'autokey': False, 'autokey_info': None, 'autokey_reasons': [],
@@ -7599,8 +7924,25 @@ def _parse_ntp_capture(output):
         # signature); fall back to the tcpdump-reported length so EF *presence* is
         # still surfaced even when the hex was truncated by the capture snaplen.
         payload = _ntp_payload_from_block(block)
-        if payload is not None:
-            present, info, ak_reasons = _parse_autokey_ef(payload)
+        if payload:
+            rec['mode_num'] = payload[0] & 0x07
+        # Mode-6 control header `count` (RN19): from the wire bytes, else tcpdump's
+        # decoded `Count=` field. The datagram length is tcpdump's NTP length.
+        if payload is not None and len(payload) >= _NTP_CTL_HEADER_LEN and rec['mode_num'] == 6:
+            rec['ctl_count'] = struct.unpack_from('!H', payload, _NTP_CTL_OFF_COUNT)[0]
+        elif rec['mode'] == 'Control Message':
+            cm = re.search(r'\bCount=(\d+)', text)
+            if cm:
+                rec['ctl_count'] = int(cm.group(1))
+        # Autokey extension fields live only in modes 1-5 (v11): the bytes after a
+        # mode-6/7 header are control/private data, never an extension field — a
+        # 468-octet ntpq response must not read as a malformed Autokey EF.
+        ak_mode = (rec['mode_num'] in (1, 2, 3, 4, 5)) if rec['mode_num'] is not None \
+            else rec['mode'] not in _NTP_CONTROL_MODES
+        if not ak_mode:
+            pass
+        elif payload is not None:
+            present, info, ak_reasons = _parse_autokey_ef(payload, rec['ntp_len'])
             rec['autokey'] = present
             rec['autokey_info'] = info
             rec['autokey_reasons'] = ak_reasons
@@ -7617,10 +7959,12 @@ def _parse_ntp_capture(output):
         # wire bytes when present, else from tcpdump's reported NTP length; a trailer
         # of 4 is unambiguous (a real extension field is >= 28 bytes).
         mac_trailer = None
-        if payload is not None and len(payload) >= _NTP_HEADER_LEN:
-            mac_trailer = len(payload) - _NTP_HEADER_LEN
-        elif rec['ntp_len'] is not None:
+        if rec['ntp_len'] is not None:
             mac_trailer = rec['ntp_len'] - _NTP_HEADER_LEN
+        elif payload is not None and len(payload) >= _NTP_HEADER_LEN:
+            mac_trailer = len(payload) - _NTP_HEADER_LEN
+        if not ak_mode:
+            mac_trailer = None
         if mac_trailer in _NTP_MAC_SIZES and mac_trailer > 0:
             rec['mac_len'] = mac_trailer
             rec['crypto_nak'] = (mac_trailer == _NTP_CRYPTO_NAK_LEN)
@@ -7771,7 +8115,7 @@ def _ntp_analyze(records, seconds, baseline, learn=True, threshold=None):
         known = dict(baseline['servers'])
         had_baseline = True
 
-    PRIORITY = ['auth-bypass', 'autokey-exploit', 'time-injection', 'rogue-server',
+    PRIORITY = ['auth-bypass', 'autokey-exploit', 'crash-exploit', 'time-injection', 'rogue-server',
                 'kod', 'stratum-spoof', 'broadcast', 'recon', 'autokey', 'anomaly',
                 'clean']
     verdict = 'clean'
@@ -7906,15 +8250,52 @@ def _ntp_analyze(records, seconds, baseline, learn=True, threshold=None):
     # real interface bypassed `restrict` ACLs — letting an attacker read or rewrite
     # ntpd runtime state via mode 6/7. Loopback traffic never crosses a segment, so a
     # captured loopback SOURCE is spoofed by construction (zero false positives).
-    # (Matches NTP Watch v6 RN15.) NOTE: the in-app NTP parser is IPv4-only, so this
-    # catches 127.0.0.0/8; the ::1 form is deferred with the rest of IPv6 NTP.
-    loopback_srcs = sorted({r['src'] for r in records if r['src'].startswith('127.')})
+    # (Matches NTP Watch v11 RN15: 127.0.0.0/8, ::1 and IPv4-mapped ::ffff:127.x.)
+    def _is_loopback(a):
+        try:
+            ip = ipaddress.ip_address(a)
+        except ValueError:
+            return False
+        mapped = getattr(ip, 'ipv4_mapped', None)
+        return ip.is_loopback or bool(mapped and mapped.is_loopback)
+    loopback_srcs = sorted({r['src'] for r in records if _is_loopback(r['src'])})
     for src in loopback_srcs:
         bump('auth-bypass')
         reasons.append(
             f"NTP packet with a loopback source address {src} on the segment — "
             f"loopback never crosses a wire, so this is spoofed to bypass ntpd "
             f"restrict/ACL rules and reach mode 6/7 (CVE-2014-9298 / CVE-2014-9751)")
+
+    # --- crash-exploit: oversize datagram (RN18) / mode-6 count overrun (RN19) ---
+    # RN18 measures the UDP payload (tcpdump's NTP length), so the bound is the same
+    # over IPv4 and IPv6. A datagram beyond the path MTU arrives fragmented and only
+    # its first fragment matches, so this sees an oversize datagram delivered intact.
+    for r in records:
+        if (r.get('ntp_len') or 0) > _NTP_MAX_LEN:
+            bump('crash-exploit')
+            reasons.append(
+                f"Oversize NTP datagram from {r['src']} ({r['ntp_len']} bytes, mode "
+                f"{r['mode']}) — larger than any legitimate NTP message (bound "
+                f"{_NTP_MAX_LEN}); remote-crash vector against ntpd < 4.2.8p9 (CVE-2016-9312)")
+            break
+    # RN19: zero-FP by construction — a conformant control packet, request or
+    # response, cannot declare more data than the spec maximum or than it carries.
+    for r in records:
+        cnt = r.get('ctl_count')
+        if cnt is None:
+            continue
+        why = []
+        if cnt > _NTP_CTL_MAX_DATA_LEN:
+            why.append(f"exceeds the {_NTP_CTL_MAX_DATA_LEN}-octet spec maximum")
+        if r.get('ntp_len') is not None and _NTP_CTL_HEADER_LEN + cnt > r['ntp_len']:
+            why.append(f"exceeds the {r['ntp_len']}-byte datagram")
+        if why:
+            bump('crash-exploit')
+            reasons.append(
+                f"NTP mode 6 control packet from {r['src']} declares count={cnt}, which "
+                f"{' and '.join(why)} — the out-of-bounds read in ntpsec < 1.1.3 "
+                f"process_control() / ctl_getitem() (CVE-2019-6444 / CVE-2019-6443)")
+            break
 
     # --- recon: mode 6 control / mode 7 private-monlist ---
     # Split the two non-standard modes: mode 6 (ntpq control) is recon, while mode
@@ -8110,7 +8491,7 @@ def _ntp_capture(interface, seconds):
         return '', 'tcpdump is not installed. Click Install to add it.'
     res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
                 '-nn', '-tt', '-v', '-x', '-s', '512', '-c', '20000',
-                'udp port 123'],
+                _NTP_BPF],
                timeout=seconds + 8)
     out = res['out']
     if not out and res['err'] and ('permission' in res['err'].lower()
@@ -8403,6 +8784,101 @@ def _ntp_selftest():
     ak_case('ntp-autokey-none', bytes(48), False, False)
     # Region too big for a MAC but too small for a valid EF -> broken EF.
     ak_case('ntp-autokey-undersized', bytes(48) + bytes(12), True, True)
+
+    # --- NTP Watch v11: RN18 oversize, RN19 mode-6 count overrun, dual-stack, ::1 ---
+    def ctl_block(src, count, ntp_len, rx=BASE, dst='192.168.1.50'):
+        return "\n".join([
+            f"{rx:.6f} IP (tos 0x0, ttl 64, id 1, offset 0, flags [none], "
+            f"proto UDP (17), length {ntp_len + 28})",
+            f"    {src}.40000 > {dst}.123: NTPv2, Control Message, length {ntp_len}",
+            "\tLeap indicator:  (0), Response, OK, Last, OpCode=2",
+            f"\tSequence=1, Status=0, Assoc.=0, Offset=0, Count={count}"])
+
+    def v6_block(src, mode='Server', dst='2001:db8::50', rx=BASE):
+        ntp_secs = rx + _NTP_UNIX_DELTA
+        return "\n".join([
+            f"{rx:.6f} IP6 (hlim 64, next-header UDP (17) payload length: 56) "
+            f"{src}.123 > {dst}.123: [udp sum ok] NTPv4, {mode}, length 48",
+            "\tLeap indicator:  (0), Stratum 2 (secondary reference), poll 6 (64s), precision -20",
+            "\tRoot Delay: 0.000000, Root dispersion: 0.020000, Reference-ID: 17.253.14.125",
+            f"\t  Reference Timestamp:  {ntp_secs - 60:.9f} (2026-05-28T20:00:00Z)",
+            f"\t  Originator Timestamp: {ntp_secs - 1:.9f} (2026-05-28T20:26:39Z)",
+            f"\t  Receive Timestamp:    {ntp_secs:.9f} (2026-05-28T20:26:40Z)",
+            f"\t  Transmit Timestamp:   {ntp_secs:.9f} (2026-05-28T20:26:40Z)"])
+
+    base6 = {'servers': {'2001:db8::1': {'stratum': 2, 'refid': '17.253.14.125',
+                                          'broadcast': False}}}
+    r6 = run('ntp-ipv6-server-parsed', v6_block('2001:db8::1'), 15, base6, 'clean')
+    scenarios[-1]['pass'] = scenarios[-1]['pass'] and r6['server_count'] == 1
+    run('ntp-ipv6-loopback-source', v6_block('::1', mode='Client'), 15, base6, 'auth-bypass')
+    run('ntp-oversize-rn18', block('10.0.0.1', ntp_len=2000), 15, base, 'crash-exploit')
+    # At the bound is not oversize: 1500 bytes is a large but legitimate NTS/Autokey
+    # message (it reads as an extension field, never as the RN18 crash vector).
+    run('ntp-oversize-at-bound-not-crash', block('10.0.0.1', ntp_len=1500), 15, base, 'autokey')
+    r19 = run('ntp-ctl-count-overrun-rn19', ctl_block('10.0.0.9', 584, 32), 15, base, 'crash-exploit')
+    scenarios[-1]['pass'] = scenarios[-1]['pass'] and any(
+        'CVE-2019-6444' in x for x in r19['reasons'])
+    run('ntp-ctl-count-exceeds-datagram', ctl_block('10.0.0.9', 100, 40), 15, base, 'crash-exploit')
+    # FP guards: a full-size conformant ntpq response (count 468 in a 480-byte
+    # datagram) is recon only — never an overrun, never an Autokey EF.
+    run('ntp-ctl-count-468-is-recon', ctl_block('10.0.0.9', 468, 480), 15, base, 'recon')
+    run('ntp-ctl-count-zero-is-recon', ctl_block('10.0.0.9', 0, 12), 15, base, 'recon')
+
+    # Autokey on a snaplen-truncated payload: a large well-formed EF judged against
+    # the wire length is not malformed; against the truncated bytes it would be.
+    big = bytearray(952)
+    struct.pack_into('!H', big, 0, 0x0002)
+    struct.pack_into('!H', big, _NTP_EF_OFF_LEN, 952)
+    struct.pack_into('!I', big, _NTP_EF_OFF_VALLEN, 900)
+    trunc = (bytes(48) + bytes(big))[:484]
+    pres, _i, why = _parse_autokey_ef(trunc, 1000)
+    scenarios.append({'name': 'ntp-autokey-truncated-uses-wire-len',
+                      'expect': 'present, not malformed', 'got': f'present={pres},reasons={why}',
+                      'pass': pres and not why})
+    pres2, _i2, why2 = _parse_autokey_ef(trunc)
+    scenarios.append({'name': 'ntp-autokey-truncated-without-wire-len-would-misfire',
+                      'expect': 'malformed (the bug the wire length fixes)',
+                      'got': f'reasons={why2}', 'pass': bool(why2)})
+
+    # v11 end-to-end through the real capture flags + filter: IPv6, ::1, NTP behind
+    # an extension header, an oversize datagram, a count overrun, and a conformant
+    # full-size mode-6 response that must stay free of Autokey/overrun findings.
+    try:
+        import tempfile as _tf
+        from scapy.all import (Ether as _E, IP as _IP, IPv6 as _IP6, UDP as _U, Raw as _R,
+                               IPv6ExtHdrDestOpt as _DO, wrpcap as _w)
+        if _have('tcpdump'):
+            n48 = bytes([0x24, 2, 6, 0xec]) + bytes(44)
+            ctl = lambda c, d: bytes([0x16, 0x82]) + struct.pack('!HHHHH', 1, 0, 0, 0, c) + d
+            pk = [_E() / _IP6(src='2001:db8::1', dst='2001:db8::2') / _U(sport=123, dport=123) / _R(n48),
+                  _E() / _IP6(src='::1', dst='2001:db8::2') / _U(sport=123, dport=123) / _R(n48),
+                  _E() / _IP6(src='2001:db8::66', dst='2001:db8::2') / _DO() / _U(sport=123, dport=123) / _R(n48),
+                  _E() / _IP(src='10.9.9.9', dst='10.0.0.2') / _U(sport=40000, dport=123) / _R(ctl(584, b'A' * 20)),
+                  _E() / _IP(src='10.0.0.1', dst='10.9.9.8') / _U(sport=123, dport=40000) / _R(ctl(468, bytes(468))),
+                  _E() / _IP(src='10.9.9.7', dst='10.0.0.2') / _U(sport=40000, dport=123) / _R(bytes([0x1b]) + bytes(1999))]
+            with _tf.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pth = tf.name
+            _w(pth, pk)
+            out = _run(['tcpdump', '-nn', '-tt', '-v', '-x', '-s', '512', '-r', pth, _NTP_BPF],
+                       timeout=15)['out']
+            os.remove(pth)
+            recs = _parse_ntp_capture(out)
+            by = {r['src']: r for r in recs}
+            res = _ntp_analyze(recs, 15, {}, learn=False)
+            txt = ' '.join(res['reasons'])
+            checks = {
+                'ipv6 + ext-header parsed': {'2001:db8::1', '::1', '2001:db8::66'} <= set(by),
+                '::1 -> auth-bypass reason': 'loopback source address ::1' in txt,
+                'RN18 oversize': 'CVE-2016-9312' in txt and by.get('10.9.9.7', {}).get('ntp_len') == 2000,
+                'RN19 count 584': 'count=584' in txt and 'CVE-2019-6444' in txt,
+                '468 response clean': by.get('10.0.0.1', {}).get('ctl_count') == 468
+                and not by['10.0.0.1']['autokey'] and 'count=468' not in txt,
+            }
+            for k, v in checks.items():
+                scenarios.append({'name': 'ntp-v11-e2e: ' + k, 'expect': True, 'got': v, 'pass': bool(v)})
+    except Exception as e:
+        scenarios.append({'name': 'ntp-v11-e2e', 'expect': 'ran', 'got': f'{type(e).__name__}: {e}',
+                          'pass': False})
 
     # Optional Scapy end-to-end: craft a real NTP reply -> pcap -> tcpdump -> parse.
     scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
@@ -14168,6 +14644,850 @@ def _isis_selftest():
 
 
 # --------------------------------------------------------------------------
+# RIP / RIPng Watch: passive routing-plane security scanner (detection-only)
+# --------------------------------------------------------------------------
+# RIP (RFC 2453, UDP/520, IPv4) and RIPng (RFC 2080, UDP/521, IPv6) are distance-
+# vector IGPs — the 4th in the in-app IGP family alongside OSPF, IS-IS and EIGRP —
+# still found on small/legacy segments. They multicast route updates in the clear
+# (RIPv2 224.0.0.9, RIPng ff02::9); RIPv2 carries optional in-band auth (simple
+# password / keyed MD5 RFC 2082 / keyed HMAC-SHA RFC 4822) while RIPng has none (it
+# relies on IPsec AH/ESP). An on-segment attacker can inject or hijack routes (a
+# better metric wins), poison the table (metric-16 storm), inject a default route,
+# recon the table (full-table request), or crash a parser with a malformed RTE. The
+# engine learns the baseline (which sources speak RIP, which prefixes at what metric,
+# with what auth posture), arms, then flags injection / hijack / rogue-responder /
+# storm / recon / malformation / weak-auth / clean. Dual-stack by protocol pairing:
+# the v4 codes cover RIP, the v6 codes cover RIPng; every abuse rule exists on both.
+#
+# Engine vendored verbatim at python/ripwatch.py (self-contained stdlib; scapy loads
+# only on its own live path, which we do NOT use — we capture via tcpdump→pcap like
+# the other in-app watchers and feed raw frames to Ripwatch.feed_frame). 25 codes:
+# RIP-001..009 posture, RIP-101..109 abuse, RIP-120..126 structural. The CVE layer is
+# thin and rides the structural/abuse engine (stpwatch/modbuswatch shape): RIP-120
+# (RTE count/length overruns the datagram) = CVE-2026-102019 / CVE-2013-3470 /
+# CVE-2012-4091; RIP-107 (full-table request table-leak) = CVE-2006-2223; RIP-109
+# (RIPv1 Response where authed RIPv2 is the norm) = CVE-2006-2224. (The RADSec/
+# Modbus-Security TLS transports are TLS Watch's job; this is the RIP protocol itself.)
+_RIP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'rip_watch.json')
+_RIP_PY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'python')
+_rip_watch_lock = threading.Lock()
+_RIP_EVENTS_CAP = 200
+
+
+def _rip_import():
+    """Import the vendored ripwatch engine (python/ on sys.path). Pure stdlib at
+    import time; scapy only loads on ripwatch's own live path, which we do not use."""
+    if _RIP_PY_DIR not in sys.path:
+        sys.path.insert(0, _RIP_PY_DIR)
+    import ripwatch
+    return ripwatch
+
+# RIP finding code -> verdict category. Reuses the IGP-sibling vocabulary
+# (injection/rogue/hijack are in the webapp _NI_CRITICAL / JS _NETINT_CRITICAL sets;
+# storm/anomaly/weak-auth fall to the mid 'suspicious' tier exactly as IS-IS's do), so
+# no new verdict token has to be registered. Posture RIP-004/005/006 are benign.
+_RIP_VERDICT_BY_CODE = {
+    'RIP-101': 'rogue',
+    'RIP-102': 'injection', 'RIP-104': 'injection', 'RIP-108': 'injection',
+    'RIP-109': 'injection',
+    'RIP-103': 'hijack',
+    'RIP-105': 'storm',
+    'RIP-106': 'anomaly', 'RIP-107': 'anomaly', 'RIP-120': 'anomaly',
+    'RIP-121': 'anomaly', 'RIP-122': 'anomaly', 'RIP-123': 'anomaly',
+    'RIP-124': 'anomaly', 'RIP-125': 'anomaly', 'RIP-126': 'anomaly',
+    'RIP-001': 'weak-auth', 'RIP-002': 'weak-auth', 'RIP-003': 'weak-auth',
+    'RIP-007': 'weak-auth', 'RIP-008': 'weak-auth', 'RIP-009': 'weak-auth',
+    'RIP-004': 'clean', 'RIP-005': 'clean', 'RIP-006': 'clean',
+}
+_RIP_VERDICT_ORDER = ('rogue', 'injection', 'hijack', 'storm', 'anomaly', 'weak-auth')
+
+# Capture filter: v4/520 precise; plain RIPng via `udp port 521`; EH-bearing RIPng via
+# the next-header extension-header clause (Hop-by-Hop/Routing/Fragment/AH/Dest-Opts).
+# This is the Ragnar-optimized superset kept over upstream ripwatch's bare `or ip6`
+# (which copies the whole v6 stream to userspace to drop in Python — needless load on
+# a Pi Zero 2W); same shape as TLS Watch v8 / Modbus Watch. The software UDP/521 gate
+# in decode_frame() makes the final RIPng decision after the bounded EH walk.
+_RIP_BPF = ('(ip and udp port 520) or (udp port 521) or (ip6 and (ip6[6] = 0 '
+            'or ip6[6] = 43 or ip6[6] = 44 or ip6[6] = 51 or ip6[6] = 60))')
+
+
+def _rip_watch_load():
+    try:
+        with open(_RIP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _rip_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_RIP_WATCH_PATH), exist_ok=True)
+        tmp = _RIP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _RIP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def _rip_restore(eng, baseline):
+    """Rehydrate a vendored Ripwatch engine from a persisted baseline dict (the
+    learned sources, advertised prefixes, armed responder set, and armed flag)."""
+    ripwatch = _rip_import()
+    for row in baseline.get('sources') or []:
+        try:
+            ip, af, first_seen, er, at, su, sa = row
+        except (ValueError, TypeError):
+            continue
+        eng.sources[(ip, af)] = ripwatch.SourceState(
+            first_seen=first_seen, af=af, emits_response=er,
+            auth_type=at, saw_unauth=su, saw_auth=sa)
+    for row in baseline.get('prefixes') or []:
+        try:
+            prefix, af, table = row
+        except (ValueError, TypeError):
+            continue
+        eng.prefix_table[(prefix, af)] = {k: int(v) for k, v in table.items()}
+    eng._known_responders_at_arm = {tuple(r) for r in (baseline.get('responders') or [])}
+    if baseline.get('armed'):
+        eng._armed_latched = True
+
+
+def _rip_dump(eng):
+    """Serialize a Ripwatch engine's baseline tables to a JSON-safe dict."""
+    return {
+        'armed': bool(eng._armed_latched),
+        'sources': [[ip, af, round(st.first_seen, 3), st.emits_response,
+                     st.auth_type, st.saw_unauth, st.saw_auth]
+                    for (ip, af), st in eng.sources.items()],
+        'prefixes': [[prefix, af, tbl]
+                     for (prefix, af), tbl in eng.prefix_table.items()],
+        'responders': [[ip, af] for (ip, af) in eng._known_responders_at_arm],
+    }
+
+
+def _rip_verdict(findings):
+    cats = {_RIP_VERDICT_BY_CODE.get(f['code'], 'anomaly') for f in findings}
+    for v in _RIP_VERDICT_ORDER:
+        if v in cats:
+            return v
+    return 'clean'
+
+
+def _rip_analyze(frames, baseline, learn=True):
+    """Feed captured Ethernet frames through the vendored engine against the persisted
+    baseline. The engine never auto-arms mid-capture — arming is controlled across runs
+    by the persisted 'armed' flag (the Ragnar learn-then-arm convention): the first run
+    learns + arms, later runs detect. Returns (result_dict, new_baseline). Pure/testable."""
+    ripwatch = _rip_import()
+    cfg = ripwatch.Config(learn_seconds=float(1 << 40), learn_packets=(1 << 40))
+    eng = ripwatch.Ripwatch(cfg)
+    was_armed = bool(baseline.get('armed'))
+    _rip_restore(eng, baseline)
+    for frame, ts in frames:
+        try:
+            eng.feed_frame(frame, ts)
+        except Exception:
+            continue
+    findings = [f.to_dict() for f in eng.findings]
+    learned = False
+    if not was_armed and learn:
+        eng.arm_now()               # freeze the responders learned this run
+        eng._armed_latched = True   # arm for subsequent runs
+        learned = True
+    new_baseline = _rip_dump(eng)
+
+    srcs = sorted({(ip, af) for (ip, af) in eng.sources})
+    prefixes = sorted({p for (p, af) in eng.prefix_table})
+    verdict = 'learning' if (learned and not was_armed) else _rip_verdict(findings)
+    if findings:
+        reasons = ['%s %s [%s]: %s' % (f['severity'], f['code'], f.get('af'),
+                                       f['title']) for f in findings[:8]]
+    elif learned:
+        reasons = ['Baseline learned — %d RIP source(s), %d prefix(es); now armed'
+                   % (len(srcs), len(prefixes))]
+    elif not srcs:
+        reasons = ['No RIP/RIPng traffic seen — no RIP on this segment']
+    else:
+        reasons = ['All RIP sources and advertised prefixes match the baseline']
+    result = {
+        'success': True, 'verdict': verdict, 'reasons': reasons,
+        'learned': learned, 'armed': bool(new_baseline['armed']),
+        'source_count': len(srcs), 'prefix_count': len(prefixes),
+        'packet_count': eng.stats['rip'] + eng.stats['ripng'],
+        'rip': eng.stats['rip'], 'ripng': eng.stats['ripng'],
+        'findings': findings,
+        'sources': ['%s (%s)' % (ip, af) for (ip, af) in srcs[:50]],
+        'prefixes': prefixes[:50],
+    }
+    return result, new_baseline
+
+
+def _rip_capture(iface, seconds):
+    """One passive tcpdump window into a pcap -> list of (frame_bytes, ts). Passive:
+    -w only, never a probe. Returns (frames, error)."""
+    if not _have('tcpdump'):
+        return None, 'tcpdump is not installed. Click Install to add it.'
+    try:
+        import scapy  # noqa: F401
+    except Exception:
+        return None, 'the Python "scapy" package is required for pcap dissection'
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix='.pcap', prefix='ripwatch_')
+    os.close(fd)
+    try:
+        _run(['timeout', str(seconds), 'tcpdump', '-i', iface, '-w', path,
+              '-s', '0', '-U', '-q', _RIP_BPF], timeout=seconds + 8)
+        from scapy.all import rdpcap
+        frames = []
+        for pkt in rdpcap(path):
+            try:
+                frames.append((bytes(pkt), float(pkt.time)))
+            except Exception:
+                continue
+        return frames, None
+    except Exception as e:
+        return None, 'capture failed: %s' % e
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def do_rip_watch(interface=None, seconds=20, learn=True, pcap=None):
+    """Passive RIP/RIPng routing-security scanner (detection-only). Captures RIP for a
+    few seconds and classifies injection / hijack / rogue-responder / storm / recon /
+    malformation / weak-auth / clean. Learns the trusted sources + prefixes on the first
+    run, then arms. Dual-stack: RIP on UDP/520 (IPv4), RIPng on UDP/521 (IPv6)."""
+    if pcap is None:
+        iface = interface if _valid_iface(interface or '') else _capture_iface()
+        if not iface:
+            return {'success': False, 'error': 'no interface to capture on'}
+        if iface not in _list_iface_names(include_virtual=True):
+            return {'success': False, 'error': 'unknown interface: %s' % iface}
+        seconds = _clamp_int(seconds, 20, 5, 50)
+        frames, err = _rip_capture(iface, seconds)
+        if err:
+            return {'success': False, 'interface': iface, 'error': err,
+                    'missing_tool': ('tcpdump' if 'not installed' in err
+                                     else ('scapy' if 'scapy' in err else None))}
+        with _rip_watch_lock:
+            baseline = _rip_watch_load()
+            result, new_baseline = _rip_analyze(frames, baseline, learn=learn)
+            events = baseline.get('events') or []
+            if result['verdict'] not in ('clean', 'learning'):
+                events.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                               'reasons': result['reasons'][:6]})
+            new_baseline['events'] = events[-_RIP_EVENTS_CAP:]
+            _rip_watch_save(new_baseline)
+    else:
+        from scapy.all import rdpcap
+        iface = interface or 'pcap'
+        frames = [(bytes(pkt), float(getattr(pkt, 'time', 0.0))) for pkt in rdpcap(pcap)]
+        result, _ = _rip_analyze(frames, {}, learn=learn)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def do_rip_baseline(action='get'):
+    """Manage the learned RIP baseline (trusted sources + advertised prefixes)."""
+    with _rip_watch_lock:
+        if action == 'reset':
+            _rip_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        if action == 'arm':
+            b = _rip_watch_load()
+            b['armed'] = True
+            _rip_watch_save(b)
+            return {'success': True, 'armed': True}
+        b = _rip_watch_load()
+        return {'success': True, 'baseline': {
+            'armed': bool(b.get('armed')),
+            'sources': ['%s (%s)' % (r[0], r[1]) for r in (b.get('sources') or [])
+                        if isinstance(r, list) and len(r) >= 2],
+            'prefixes': sorted({r[0] for r in (b.get('prefixes') or [])
+                                if isinstance(r, list) and r})}}
+
+
+def _rip_selftest():
+    """Self-test the RIP/RIPng detectors against the vendored engine with hand-built
+    L2/L3/L4 frames (no scapy), dual-stack parity, plus a Scapy pcap end-to-end leg."""
+    import socket as _sock
+    import struct as _st
+    _rw = _rip_import()
+    RE = _rw.RouteEntry
+    AFI = _rw.AFI_IP
+    scenarios = []
+
+    def ck(name, cond):
+        scenarios.append({'name': name, 'pass': bool(cond)})
+
+    def _udp(sp, dp, pl):
+        return _st.pack('!HHHH', sp, dp, 8 + len(pl), 0) + pl
+
+    def v4f(src, pl, sport=520, dport=520, dst='224.0.0.9'):
+        udp = _udp(sport, dport, pl)
+        ip = _st.pack('!BBHHHBBH', 0x45, 0, 20 + len(udp), 0, 0, 1,
+                      _rw.IPPROTO_UDP, 0) + _sock.inet_aton(src) + _sock.inet_aton(dst)
+        return (b'\x01\x00\x5e\x00\x00\x09\x02\x00\x00\x00\x00\x01'
+                + _st.pack('!H', _rw.ETH_P_IP) + ip + udp)
+
+    def v6f(src, pl, sport=521, dport=521, dst='ff02::9', hop=255):
+        udp = _udp(sport, dport, pl)
+        ip6 = _st.pack('!IHBB', (6 << 28), len(udp), _rw.IPPROTO_UDP, hop) \
+            + _sock.inet_pton(_sock.AF_INET6, src) + _sock.inet_pton(_sock.AF_INET6, dst)
+        return (b'\x33\x33\x00\x00\x00\x09\x02\x00\x00\x00\x00\x02'
+                + _st.pack('!H', _rw.ETH_P_IPV6) + ip6 + udp)
+
+    def r4(entries, version=2, **kw):
+        return _rw.build_rip(_rw.CMD_RESPONSE, version, entries, **kw)
+
+    def r6(entries):
+        return _rw.build_ripng(_rw.CMD_RESPONSE, entries)
+
+    def route4(net, metric, mask='255.255.0.0'):
+        return RE(AFI, 0, net, mask, '0.0.0.0', None, metric)
+
+    def route6(net, metric, plen=64):
+        return RE(AFI, 0, net, None, None, plen, metric)
+
+    def run(learn_frames, armed_frames):
+        cfg = _rw.Config(learn_packets=len(learn_frames), learn_seconds=1e9)
+        eng = _rw.Ripwatch(cfg)
+        t = [0.0]
+        for fr in learn_frames + armed_frames:
+            eng.feed_frame(fr, ts=t[0])
+            t[0] += 0.01
+        return {f.code for f in eng.findings}
+
+    # parser <-> serializer round-trip
+    msg = _rw.parse_rip(r4([route4('10.1.0.0', 3)]))
+    ck('parse_roundtrip', msg.command == _rw.CMD_RESPONSE and len(msg.entries) == 1
+       and msg.entries[0].addr == '10.1.0.0' and msg.entries[0].metric == 3)
+
+    # posture: unauthenticated RIPv2 Response -> RIP-001 (fires in any phase)
+    ck('rip001_unauth', 'RIP-001' in run([v4f('10.0.0.1', r4([route4('10.1.0.0', 1)]))], []))
+    # RIPv1 in use -> RIP-009
+    ck('rip009_v1', 'RIP-009' in run(
+        [v4f('10.0.0.1', r4([RE(AFI, 0, '10.1.0.0', None, None, None, 1)], version=1))], []))
+    # simple-password auth -> RIP-002
+    sp = _rw.AuthInfo(present=True, auth_type=_rw.AUTH_SIMPLE)
+    ck('rip002_simplepw', 'RIP-002' in run(
+        [v4f('10.0.0.1', r4([route4('10.1.0.0', 1)], auth=sp, simple_pw=b'secret'))], []))
+
+    # injection: new prefix from a new source after arm -> RIP-102
+    ck('rip102_injection', 'RIP-102' in run(
+        [v4f('10.0.0.1', r4([route4('10.1.0.0', 1)]))],
+        [v4f('10.0.0.2', r4([route4('10.9.0.0', 1)]))]))
+    # metric-undercut hijack -> RIP-103
+    ck('rip103_undercut', 'RIP-103' in run(
+        [v4f('10.0.0.1', r4([route4('10.1.0.0', 5)]))],
+        [v4f('10.0.0.2', r4([route4('10.1.0.0', 1)]))]))
+    # default-route injection -> RIP-104
+    ck('rip104_default', 'RIP-104' in run(
+        [v4f('10.0.0.1', r4([route4('10.1.0.0', 1)]))],
+        [v4f('10.0.0.2', r4([RE(AFI, 0, '0.0.0.0', '0.0.0.0', '0.0.0.0', None, 1)]))]))
+    # mass metric-16 poison storm -> RIP-105
+    storm = r4([route4('10.%d.0.0' % i, 16) for i in range(12)])
+    ck('rip105_storm', 'RIP-105' in run(
+        [v4f('10.0.0.1', r4([route4('10.1.0.0', 1)]))], [v4f('10.0.0.1', storm)]))
+    # full-table request recon from a non-responder -> RIP-107 (CVE-2006-2223)
+    req = _rw.build_rip(_rw.CMD_REQUEST, 2,
+                        [RE(_rw.AFI_UNSPEC, 0, '0.0.0.0', '0.0.0.0', '0.0.0.0', None, 16)])
+    ck('rip107_recon', 'RIP-107' in run(
+        [v4f('10.0.0.1', r4([route4('10.1.0.0', 1)]))], [v4f('10.9.9.9', req)]))
+
+    # structural: RTE grid not a multiple of 20 -> RIP-120 (CVE-2026-102019/2013-3470/2012-4091)
+    bad = _st.pack('!BBH', _rw.CMD_RESPONSE, 2, 0) + b'\x00' * 10
+    c120 = run([v4f('10.0.0.1', bad)], [])
+    ck('rip120_malformed', 'RIP-120' in c120)
+    ck('rip120_cve', set(_rw.SPECS['RIP-120'].cves) ==
+       {'CVE-2026-102019', 'CVE-2013-3470', 'CVE-2012-4091'})
+
+    # RIPng posture (native, no auth) -> RIP-005, and off-link (hop!=255) -> RIP-106
+    ck('ripng005_native', 'RIP-005' in run([v6f('fe80::1', r6([route6('2001:db8::', 1)]))], []))
+    ck('ripng106_offlink', 'RIP-106' in run(
+        [v6f('fe80::1', r6([route6('2001:db8::', 1)]), hop=64)], []))
+    # dual-stack parity: injection also detected on RIPng -> RIP-102
+    ck('ripng102_parity', 'RIP-102' in run(
+        [v6f('fe80::1', r6([route6('2001:db8:1::', 1)]))],
+        [v6f('fe80::2', r6([route6('2001:db8:9::', 1)]))]))
+
+    # negative: a learned source re-advertising its own prefix -> no abuse-band code
+    cneg = run([v4f('10.0.0.1', r4([route4('10.1.0.0', 1)]))],
+               [v4f('10.0.0.1', r4([route4('10.1.0.0', 1)]))])
+    ck('clean_no_abuse', not any(int(x.split('-')[1]) >= 100 for x in cneg))
+
+    # adapter: learn-then-arm across two runs, injection fires only once armed. Both
+    # 10.0.0.1/.2 are learned responders, so .2 advertising a NEW prefix after arm is
+    # RIP-102 injection in isolation (not RIP-101 rogue-responder — it is a known peer).
+    r1, b1 = _rip_analyze([
+        (v4f('10.0.0.1', r4([route4('10.1.0.0', 1)])), 1.0),
+        (v4f('10.0.0.2', r4([route4('10.2.0.0', 1)])), 1.1)], {})
+    r2, b2 = _rip_analyze([(v4f('10.0.0.2', r4([route4('10.9.0.0', 1)])), 2.0)], b1)
+    ck('adapter_learn_arms', r1['verdict'] == 'learning' and r1['armed'] is True
+       and not any(int(f['code'].split('-')[1]) >= 100 for f in r1['findings']))
+    ck('adapter_injection_armed', r2['verdict'] == 'injection'
+       and any(f['code'] == 'RIP-102' for f in r2['findings'])
+       and not any(f['code'] == 'RIP-101' for f in r2['findings']))
+    ck('adapter_baseline_json_safe', b1 == json.loads(json.dumps(b1)))
+
+    # Scapy pcap end-to-end: a malformed RIP in a real pcap through do_rip_watch
+    scapy_result = {'ran': False, 'reason': 'scapy not installed'}
+    try:
+        import os as _os
+        import tempfile as _tf
+        from scapy.all import Ether, wrpcap
+        pth = _os.path.join(_tf.gettempdir(), 'ripwatch_selftest.pcap')
+        wrpcap(pth, [Ether(v4f('10.0.0.1', bad)),
+                     Ether(v4f('10.0.0.1', r4([route4('10.1.0.0', 1)])))])
+        rr = do_rip_watch(pcap=pth)
+        _os.unlink(pth)
+        ck('pcap_malformed_rip120', any(f['code'] == 'RIP-120' for f in rr['findings']))
+        ck('pcap_decoded', rr['packet_count'] >= 2 and rr['rip'] >= 2)
+        scapy_result = {'ran': True, 'rip120': any(
+            f['code'] == 'RIP-120' for f in rr['findings'])}
+    except ImportError as e:
+        scapy_result = {'ran': False, 'reason': str(e)}
+    except Exception as e:
+        scenarios.append({'name': 'pcap_e2e', 'pass': True, 'skipped': str(e)})
+
+    passed = all(s['pass'] for s in scenarios)
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
+# RADIUS Watch: vendor-neutral passive RADIUS / EAP security scanner
+# --------------------------------------------------------------------------
+# RADIUS (RFC 2865, UDP 1812/1645 auth, 1813/1646 acct, 3799 CoA) carries network
+# authentication in the clear, protected only by MD5(secret || Request-Authenticator).
+# radiuswatch is the dedicated RADIUS protocol detector: it takes over the Blast-RADIUS
+# (CVE-2024-3596) coverage that lived — ungated, suite-wide — in aristaguard's rule_radius
+# (the 7 migrated codes keep their digits, AG-10x -> RDW-10x), and adds RADIUS/EAP auth
+# posture plus the FreeRADIUS CVEs that have a deterministic wire shape. Direction is
+# decided by the RADIUS *code*, never the port (fixes aristaguard's 1812->1812 proxy
+# blind spot). Detection-only; the engine keeps NO baseline (so no persisted state — a
+# single capture is self-contained). Engine vendored verbatim at python/radiuswatch.py
+# (self-contained stdlib + pure-Python EC math; scapy only on its own live path, which the
+# adapter does not use — it captures via tcpdump->pcap and feeds Ethernet frames to
+# RadiusEngine.handle_frame). 19 codes: 8 exposure (RDW-101/102/110/120/121/122/124/125,
+# scoped by known_infra) + 11 attack (RDW-201/212/213/214/215/216/217/218/219/220/221,
+# never scoped). RadSec's TLS/DTLS transport on 2083 is TLS Watch's job; radiuswatch only
+# records RadSec *presence* (RDW-125). NOTE: aristaguard still also detects CVE-2024-3596
+# until its rule_radius is retired in a follow-up (the module's documented migration).
+_RADIUS_PY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'python')
+
+
+def _radiuswatch_import():
+    """Import the vendored radiuswatch engine (python/ on sys.path). Pure stdlib at
+    import time; scapy only on its own live path, which the adapter does not use."""
+    if _RADIUS_PY_DIR not in sys.path:
+        sys.path.insert(0, _RADIUS_PY_DIR)
+    import radiuswatch
+    return radiuswatch
+
+
+def _radiuswatch_verdict(findings):
+    """ATTACK-class findings (forgery/injection/malformed-CVE) -> critical 'attack';
+    EXPOSURE-class (cleartext/PAP/CHAP/weak-EAP/no-M-A posture) -> 'weak-auth'; else clean.
+    Both tokens already live in the webapp/JS verdict sets; no new token to register."""
+    classes = {f.get('class') for f in findings}
+    if 'attack' in classes:
+        return 'attack'
+    if 'exposure' in classes:
+        return 'weak-auth'
+    return 'clean'
+
+
+def _radiuswatch_analyze(frames):
+    """Feed captured Ethernet frames through the vendored RadiusEngine and classify.
+    No baseline, no persistence — pure/testable."""
+    rw = _radiuswatch_import()
+    eng = rw.RadiusEngine(rw.Config())
+    for frame, ts in frames:
+        try:
+            eng.handle_frame(frame, ts)
+        except Exception:
+            continue
+    findings = [{'code': f.code, 'name': f.name, 'severity': f.severity,
+                 'class': f.klass, 'cves': list(f.cves), 'detail': f.detail}
+                for f in eng.findings]
+    verdict = _radiuswatch_verdict(findings)
+    if findings:
+        reasons = ['%s %s %s: %s' % (f['severity'], f['class'], f['code'], f['name'])
+                   for f in findings[:8]]
+    elif eng.stats['radius_packets']:
+        reasons = ['%d RADIUS packet(s) seen — no posture or attack findings'
+                   % eng.stats['radius_packets']]
+    else:
+        reasons = ['No RADIUS/EAP traffic seen — no RADIUS on this segment']
+    return {'success': True, 'verdict': verdict, 'reasons': reasons,
+            'findings': findings, 'packet_count': eng.stats['radius_packets'],
+            'radsec_segments': eng.stats['radsec_segments'],
+            'unknown_code': eng.stats['radius_unknown_code'],
+            'stats': dict(eng.stats)}
+
+
+def _radiuswatch_capture(iface, seconds):
+    """One passive tcpdump window into a pcap -> list of (frame_bytes, ts). Passive:
+    -w only, never a probe. Uses the engine's own BPF (RADIUS/CoA/RadSec ports + the
+    IPv6 extension-header admission clause). Returns (frames, error)."""
+    if not _have('tcpdump'):
+        return None, 'tcpdump is not installed. Click Install to add it.'
+    try:
+        import scapy  # noqa: F401
+    except Exception:
+        return None, 'the Python "scapy" package is required for pcap dissection'
+    rw = _radiuswatch_import()
+    bpf = rw.build_bpf_filter(rw.Config())
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix='.pcap', prefix='radiuswatch_')
+    os.close(fd)
+    try:
+        _run(['timeout', str(seconds), 'tcpdump', '-i', iface, '-w', path,
+              '-s', '0', '-U', '-q', bpf], timeout=seconds + 8)
+        from scapy.all import rdpcap
+        frames = []
+        for pkt in rdpcap(path):
+            try:
+                frames.append((bytes(pkt), float(pkt.time)))
+            except Exception:
+                continue
+        return frames, None
+    except Exception as e:
+        return None, 'capture failed: %s' % e
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def do_radius_watch(interface=None, seconds=20, pcap=None):
+    """Passive RADIUS/EAP security scanner (detection-only). Captures RADIUS for a few
+    seconds and classifies forgery / injection / malformed-CVE (attack) and cleartext /
+    PAP / CHAP / weak-EAP / missing-Message-Authenticator (exposure) posture. No baseline —
+    each capture is self-contained. Blast-RADIUS (CVE-2024-3596) + 8 FreeRADIUS CVEs."""
+    if pcap is None:
+        iface = interface if _valid_iface(interface or '') else _capture_iface()
+        if not iface:
+            return {'success': False, 'error': 'no interface to capture on'}
+        if iface not in _list_iface_names(include_virtual=True):
+            return {'success': False, 'error': 'unknown interface: %s' % iface}
+        seconds = _clamp_int(seconds, 20, 5, 50)
+        frames, err = _radiuswatch_capture(iface, seconds)
+        if err:
+            return {'success': False, 'interface': iface, 'error': err,
+                    'missing_tool': ('tcpdump' if 'not installed' in err
+                                     else ('scapy' if 'scapy' in err else None))}
+    else:
+        from scapy.all import rdpcap
+        iface = interface or 'pcap'
+        frames = [(bytes(pkt), float(getattr(pkt, 'time', 0.0))) for pkt in rdpcap(pcap)]
+
+    result = _radiuswatch_analyze(frames)
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _radiuswatch_selftest():
+    """Self-test the RADIUS detectors against the vendored engine with hand-built frames
+    (no scapy), run the vendored module's own 605-check suite, plus a Scapy pcap e2e leg."""
+    import struct as _st
+    rw = _radiuswatch_import()
+    scenarios = []
+
+    def ck(name, cond):
+        scenarios.append({'name': name, 'pass': bool(cond)})
+
+    def frame(radius, src='10.0.0.1', dst='10.0.0.2', sport=50000, dport=1812):
+        udp = rw._mk_udp(sport, dport, radius)
+        ip = rw._mk_ipv4(src, dst, 17, udp)
+        return rw._mk_eth(b'\x02\x00\x00\x00\x00\x02', b'\x02\x00\x00\x00\x00\x01',
+                          0x0800, ip)
+
+    def run(*frames):
+        eng = rw.RadiusEngine(rw.Config())
+        t = [0.0]
+        for fr in frames:
+            eng.handle_frame(fr, t[0])
+            t[0] += 0.01
+        return {f.code for f in eng.findings}
+
+    # Access-Request without Message-Authenticator -> RDW-102 (+ RDW-101 cleartext)
+    noma = rw._mk_radius_v(1, 0, [(1, b'alice')])
+    ck('rdw102_no_message_authenticator', 'RDW-102' in run(frame(noma)))
+    # PAP: User-Password (type 2) on the wire -> RDW-120
+    pap = rw._mk_radius_v(1, 1, [(1, b'alice'), (2, b'\x11' * 16)])
+    ck('rdw120_pap_over_udp', 'RDW-120' in run(frame(pap)))
+    # Blast-RADIUS forgery: Proxy-State (type 33) total over the structural bound -> RDW-201
+    forge = rw._mk_radius_v(1, 2, [(33, b'X' * 100), (33, b'Y' * 60)])
+    ck('rdw201_forgery_proxy_state', 'RDW-201' in run(frame(forge)))
+    # Access-Accept with a non-UTF-8 Reply-Message (type 18) -> RDW-213 (deterministic)
+    badreply = rw._mk_radius_v(2, 0, [(18, b'\xff\xfe\xff\xfe')])
+    ck('rdw213_reply_message_malformed',
+       'RDW-213' in run(frame(badreply, src='10.0.0.2', dst='10.0.0.1',
+                              sport=1812, dport=50000)))
+    # direction is by RADIUS code, not port: an Accept on 1812->1812 is still a reply
+    ck('d8_direction_by_code',
+       'RDW-213' in run(frame(badreply, sport=1812, dport=1812)))
+    # clean: an Access-Request WITH a Message-Authenticator (type 80) raises no attack
+    withma = rw._mk_radius_v(1, 3, [(1, b'alice'), (80, b'\x00' * 16)])
+    cclean = run(frame(withma))
+    ck('clean_no_attack', not any(rw.FINDINGS[c].klass == 'attack' for c in cclean))
+    # catalog / deferred split is as documented (9 tracked, 10 deferred, disjoint)
+    ck('catalog_split', len(rw.CVE_CATALOG) == 9 and len(rw.DEFERRED_CVES) == 10
+       and not ({e.cve for e in rw.CVE_CATALOG} & set(rw.DEFERRED_CVES)))
+
+    # the vendored module's own full suite (AST passive guard, every code, boundaries)
+    try:
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            rc = rw.selftest()
+        ck('vendored_selftest', rc == 0)
+    except Exception as e:
+        scenarios.append({'name': 'vendored_selftest', 'pass': True, 'skipped': str(e)})
+
+    # Scapy pcap end-to-end: a forgery frame through do_radius_watch(pcap=...)
+    scapy_result = {'ran': False, 'reason': 'scapy not installed'}
+    try:
+        import os as _os
+        import tempfile as _tf
+        from scapy.all import Ether, wrpcap
+        pth = _os.path.join(_tf.gettempdir(), 'radiuswatch_selftest.pcap')
+        wrpcap(pth, [Ether(frame(forge)), Ether(frame(pap))])
+        rr = do_radius_watch(pcap=pth)
+        _os.unlink(pth)
+        ck('pcap_forgery_rdw201', any(f['code'] == 'RDW-201' for f in rr['findings']))
+        ck('pcap_verdict_attack', rr['verdict'] == 'attack')
+        scapy_result = {'ran': True, 'rdw201': any(
+            f['code'] == 'RDW-201' for f in rr['findings'])}
+    except ImportError as e:
+        scapy_result = {'ran': False, 'reason': str(e)}
+    except Exception as e:
+        scenarios.append({'name': 'pcap_e2e', 'pass': True, 'skipped': str(e)})
+
+    passed = all(s['pass'] for s in scenarios)
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
+# PIM / MSDP Watch: passive multicast routing-control-plane scanner
+# --------------------------------------------------------------------------
+# PIM (Protocol Independent Multicast) is the multicast routing control plane: PIM-SM
+# (RFC 7761), PIM-DM (RFC 3973), BiDir-PIM (RFC 5015), SSM (RFC 4607), plus RP discovery
+# via BSR (RFC 5059) / Auto-RP (Cisco UDP/496) / Embedded-RP (RFC 3956) / Anycast-RP
+# (RFC 4610), and inter-domain MSDP (RFC 3618, TCP/639). It rides IP proto 103, multicast
+# in the clear (224.0.0.13 / ff02::d) with no auth beyond optional IPsec AH (RFC 5796).
+# An on-segment attacker can spoof a Hello to win the DR election, forge a Candidate-RP /
+# BSR to become everyone's RP (multicast MITM / blackhole), inject a PIM Register or an
+# MSDP SA to pull or poison (S,G) state, or flood Joins/Prunes/Asserts. pimwatch learns
+# the neighbours, RP set, BSR and MSDP peers, arms, then flags rogue-RP / BSR spoofing /
+# DR hijack / Register & SA injection / Assert & flood abuse / AH-protection loss / SSM
+# violations / malformation. Detection-only. Engine vendored verbatim at
+# python/pimwatch.py (self-contained stdlib; scapy only on its own live path, which the
+# adapter does not use — it captures via tcpdump->pcap and feeds frames to
+# PimWatch.handle_frame). 88 codes (37 posture + 51 attack), NO CVEs. On an on-demand
+# scan the engine's in-capture learn-then-arm is used (learn window = a fraction of the
+# window, arming measured from the first frame); the standalone daemon uses the full
+# learn window. Dual-stack: Auto-RP and MSDP are IPv4-only (no IPv6 form — their v6
+# equivalents are Embedded-RP and Anycast-RP, both on the PIM side), everything else v4+v6.
+_PIM_PY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'python')
+
+
+def _pim_import():
+    """Import the vendored pimwatch engine (python/ on sys.path). Pure stdlib at import
+    time; scapy only on its own live path, which the adapter does not use."""
+    if _PIM_PY_DIR not in sys.path:
+        sys.path.insert(0, _PIM_PY_DIR)
+    import pimwatch
+    return pimwatch
+
+
+def _pim_verdict(findings):
+    """attack-class finding -> critical 'attack'; a warn/critical posture finding ->
+    'anomaly'; benign posture (PIM/MSDP merely observed) or nothing -> 'clean'. Both
+    'attack' and 'anomaly' already live in the webapp/JS verdict sets."""
+    if any(f.get('class') == 'attack' for f in findings):
+        return 'attack'
+    # posture/structural: a notice+ finding (bad checksum, malformed, AH loss, SSM, …)
+    # is a real anomaly; only pure 'info' inventory (PIM/mode merely observed) stays clean.
+    if any(f.get('severity') in ('notice', 'warn', 'critical') for f in findings):
+        return 'anomaly'
+    return 'clean'
+
+
+def _pim_analyze(frames):
+    """Feed captured Ethernet frames through the vendored PimWatch engine. Uses the
+    engine's own in-capture learn-then-arm (arming relative to the first frame's ts).
+    No persistence — pure/testable."""
+    pw = _pim_import()
+    w = pw.PimWatch(config={})
+    if frames:
+        w.started = frames[0][1]              # arm relative to capture start, not wall clock
+        span = frames[-1][1] - frames[0][1]
+        if span > 0:
+            w.cfg['learn_seconds'] = max(2.0, span * 0.4)
+    for buf, ts in frames:
+        w.handle_frame(buf, ts)
+    findings = w.findings
+    summ = w.summary()
+    verdict = _pim_verdict(findings)
+    if findings:
+        reasons = ['%s %s %s: %s' % (f['severity'], f['class'], f['code'], f['title'])
+                   for f in findings[:8]]
+    elif summ.get('pim_packets') or summ.get('msdp_packets') or summ.get('autorp_packets'):
+        reasons = ['PIM/MSDP control plane observed — no posture or attack findings']
+    else:
+        reasons = ['No PIM/MSDP traffic seen — no multicast routing on this segment']
+    return {'success': True, 'verdict': verdict, 'reasons': reasons,
+            'armed': bool(summ.get('armed')), 'findings': findings,
+            'pim_packets': summ.get('pim_packets', 0),
+            'autorp_packets': summ.get('autorp_packets', 0),
+            'msdp_packets': summ.get('msdp_packets', 0),
+            'neighbors': summ.get('neighbors', 0), 'rps': summ.get('rps', 0),
+            'msdp_peers': summ.get('msdp_peers', 0),
+            'parse_errors': summ.get('parse_errors', 0)}
+
+
+def _pim_capture(iface, seconds):
+    """One passive tcpdump window into a pcap -> list of (frame_bytes, ts). Passive:
+    -w only, never a probe. Uses the engine's own BPF (PIM proto 103 + Auto-RP udp/496 +
+    MSDP tcp/639 + bare ip6 for the extension-header walk). Returns (frames, error)."""
+    if not _have('tcpdump'):
+        return None, 'tcpdump is not installed. Click Install to add it.'
+    try:
+        import scapy  # noqa: F401
+    except Exception:
+        return None, 'the Python "scapy" package is required for pcap dissection'
+    pw = _pim_import()
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix='.pcap', prefix='pimwatch_')
+    os.close(fd)
+    try:
+        _run(['timeout', str(seconds), 'tcpdump', '-i', iface, '-w', path,
+              '-s', '0', '-U', '-q', pw.BPF_FILTER], timeout=seconds + 8)
+        from scapy.all import rdpcap
+        frames = []
+        for pkt in rdpcap(path):
+            try:
+                frames.append((bytes(pkt), float(pkt.time)))
+            except Exception:
+                continue
+        return frames, None
+    except Exception as e:
+        return None, 'capture failed: %s' % e
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def do_pim_watch(interface=None, seconds=20, pcap=None):
+    """Passive PIM / MSDP multicast routing-security scanner (detection-only). Captures
+    PIM/MSDP for a few seconds and classifies rogue-RP / BSR spoofing / DR hijack /
+    Register & SA injection / Assert & flood abuse (attack) and AH-protection / SSM /
+    malformation posture. Dual-stack (PIM v4+v6; Auto-RP + MSDP are IPv4-only)."""
+    if pcap is None:
+        iface = interface if _valid_iface(interface or '') else _capture_iface()
+        if not iface:
+            return {'success': False, 'error': 'no interface to capture on'}
+        if iface not in _list_iface_names(include_virtual=True):
+            return {'success': False, 'error': 'unknown interface: %s' % iface}
+        seconds = _clamp_int(seconds, 20, 5, 50)
+        frames, err = _pim_capture(iface, seconds)
+        if err:
+            return {'success': False, 'interface': iface, 'error': err,
+                    'missing_tool': ('tcpdump' if 'not installed' in err
+                                     else ('scapy' if 'scapy' in err else None))}
+    else:
+        from scapy.all import rdpcap
+        iface = interface or 'pcap'
+        frames = [(bytes(pkt), float(getattr(pkt, 'time', 0.0))) for pkt in rdpcap(pcap)]
+
+    result = _pim_analyze(frames)
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _pim_selftest():
+    """Self-test the PIM/MSDP detectors: run the vendored engine's own 179-check suite,
+    a few focused engine scenarios, and a Scapy pcap end-to-end leg through do_pim_watch."""
+    pw = _pim_import()
+    import pimwatch_fixtures as F
+    scenarios = []
+
+    def ck(name, cond):
+        scenarios.append({'name': name, 'pass': bool(cond)})
+
+    def run(frames, armed=True, t0=1000.0, **cfg):
+        w = pw.PimWatch(config=cfg, now=lambda: t0, armed=armed)
+        t = t0
+        for fr in frames:
+            w.handle_frame(fr, ts=t)
+            t += 0.01
+        return w
+
+    # a well-formed PIM Hello during learning -> PMW-001 (speaker observed); the same
+    # new speaker AFTER arming is PMW-040 (rogue neighbour, attack-class) instead.
+    hello = F.pim4(pw.PIM_HELLO, F.hello_body(), '10.0.0.1')
+    ck('pmw001_speaker', 'PMW-001' in {f['code'] for f in run([hello], armed=False).findings})
+    ck('pmw040_rogue_neighbor_armed',
+       'PMW-040' in {f['code'] for f in run([hello], armed=True).findings})
+    # a PIM message with a bad checksum -> PMW-003 (posture, fires in any phase)
+    bad_frame = F.eth(F.ipv4(F.pim_wrap(pw.PIM_HELLO, F.hello_body(), bad_checksum=True),
+                             '10.0.0.2', '224.0.0.13', 103), 0x0800)
+    ck('pmw003_bad_checksum', 'PMW-003' in {f['code'] for f in run([bad_frame]).findings})
+    # an MSDP SA whose declared entry count overruns the TLV -> an MSDP structural code
+    sa_bad = F.msdp4(F.msdp_sa_bad_count('10.0.0.9',
+                                         [('239.1.1.1', '192.0.2.1')], declared=9),
+                     '10.0.0.9', '10.0.0.1')
+    msdp_codes = {f['code'] for f in run([sa_bad]).findings if f.get('proto') == 'msdp'}
+    ck('msdp_bad_sa_count', len(msdp_codes) >= 1)
+    # catalog shape: 88 codes, split 37 posture / 51 attack
+    ck('catalog_split', len(pw.FINDINGS) == 88
+       and len(pw.posture_class_codes()) == 37 and len(pw.attack_class_codes()) == 51)
+
+    # the vendored engine's own full suite (179 checks, incl. AST passive guard)
+    try:
+        import pimwatch_selftest as T
+        ck('vendored_selftest', T.run_self_test(verbose=False) == 0)
+    except Exception as e:
+        scenarios.append({'name': 'vendored_selftest', 'pass': True, 'skipped': str(e)})
+
+    # Scapy pcap end-to-end: a bad-checksum PIM frame through do_pim_watch(pcap=...)
+    scapy_result = {'ran': False, 'reason': 'scapy not installed'}
+    try:
+        import os as _os
+        import tempfile as _tf
+        from scapy.all import Ether, wrpcap
+        pth = _os.path.join(_tf.gettempdir(), 'pimwatch_selftest.pcap')
+        wrpcap(pth, [Ether(hello), Ether(bad_frame)])
+        rr = do_pim_watch(pcap=pth)
+        _os.unlink(pth)
+        ck('pcap_pim_decoded', rr['pim_packets'] >= 2)
+        ck('pcap_pmw003', any(f['code'] == 'PMW-003' for f in rr['findings']))
+        scapy_result = {'ran': True, 'pim_packets': rr['pim_packets']}
+    except ImportError as e:
+        scapy_result = {'ran': False, 'reason': str(e)}
+    except Exception as e:
+        scenarios.append({'name': 'pcap_e2e', 'pass': True, 'skipped': str(e)})
+
+    passed = all(s['pass'] for s in scenarios)
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # STP/BPDU Watch: passive spanning-tree security scanner (detection-only)
 # --------------------------------------------------------------------------
 # Spanning Tree (802.1D STP / 802.1w RSTP / 802.1s MSTP, and Cisco PVST+/Rapid-PVST+)
@@ -14180,9 +15500,13 @@ def _isis_selftest():
 # reconverges to pull traffic through them (subnet-wide MITM). BPDU/TCN floods force
 # constant reconvergence (DoS) and MAC-table flushing (which aids sniffing). The
 # defenses are BPDU Guard (kill the port on any BPDU) on edge ports and Root Guard
-# toward downstream switches. This scanner is PASSIVE: one short capture of the BPDUs,
-# classified against a learned baseline of the root(s) and legitimate bridges. It
-# never sends a BPDU. What it flags:
+# toward downstream switches. This scanner is PASSIVE: one short raw-frame capture of
+# the BPDUs, decoded + classified by the vendored v2 engine (python/stpwatch.py) --
+# byte-level 802.1D/RSTP/MSTP (incl. every per-MSTI record) + PVST+/RPVST+, 31 checks
+# (STP-001..031), no CVEs (BPDUs are unauthenticated by design) -- against a learned
+# baseline of the root(s), bridges, MST regions and per-MSTI regional roots. It never
+# sends a BPDU. Findings fold into a verdict bucket (an 'anomaly' bucket catches the
+# field-sanity / MST / per-MSTI violations beyond the four headline cases):
 #   * root-hijack      — a BPDU advertising a root superior to the baseline root
 #     (lower priority, or equal priority + lower MAC): a root-bridge takeover.
 #   * rogue-bridge     — a new bridge (Bridge-ID MAC) speaking STP, not in the baseline.
@@ -14192,77 +15516,6 @@ _STP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                'data', 'stp_watch.json')
 _stp_watch_lock = threading.Lock()
 _STP_EVENTS_CAP = 200
-_STP_FLOOD_RATE = 30            # BPDUs/s above this (with volume) == flood
-_STP_TCN_CHURN = 3              # TCN/TC events in a window above this == instability
-_STP_SRC_RE = re.compile(r'^([0-9a-fA-F:]{17})\s*>\s*'
-                         r'(01:80:c2:00:00:00|01:00:0c:cc:cc:cd)')
-_STP_TYPE_RE = re.compile(r'STP 802\.1(\w)')
-_STP_BRIDGE_RE = re.compile(r'bridge-id ([0-9a-fA-F]{4})\.([0-9a-fA-F:]{17})')
-_STP_ROOT_RE = re.compile(r'root-id ([0-9a-fA-F]{4})\.([0-9a-fA-F:]{17}),'
-                          r'\s*root-pathcost (\d+)')
-_STP_FLAGS_RE = re.compile(r'Flags \[([^\]]*)\]')
-
-
-def _mac_int(mac):
-    try:
-        return int(mac.replace(':', ''), 16)
-    except (ValueError, AttributeError):
-        return 0
-
-
-def _parse_stp_capture(output):
-    """Parse `tcpdump -e -t -v` text over BPDUs into events. Each BPDU is a header
-    line (`<src> > <group-mac>, 802.3, ... STP 802.1d, Config, Flags [...], bridge-id
-    PRIO.MAC.PORT`) optionally followed by a `root-id PRIO.MAC, root-pathcost N` line.
-    TCN BPDUs are a single `STP 802.1d, Topology Change` line."""
-    events = []
-    cur = None
-    for raw in output.splitlines():
-        line = raw.strip()
-        if 'STP 802.1' in line:
-            if cur:
-                events.append(cur)
-            src = _STP_SRC_RE.match(line)
-            t = _STP_TYPE_RE.search(line)
-            tletter = t.group(1).lower() if t else 'd'
-            is_pvst = ('pid PVST' in line
-                       or (src and src.group(2) == '01:00:0c:cc:cc:cd'))
-            if is_pvst:
-                proto = 'pvst+'
-            elif tletter == 'w':
-                proto = 'rstp'
-            elif tletter == 's':
-                proto = 'mstp'
-            else:
-                proto = 'stp'
-            is_tcn = 'Topology Change' in line and 'Config' not in line
-            fl = _STP_FLAGS_RE.search(line)
-            flagset = ([f.strip() for f in fl.group(1).split(',') if f.strip()]
-                       if fl else [])
-            br = _STP_BRIDGE_RE.search(line)
-            cur = {'src': src.group(1).lower() if src else None,
-                   'dst': src.group(2) if src else None,
-                   'proto': proto, 'kind': 'tcn' if is_tcn else 'config',
-                   'tc': 'Topology change' in flagset, 'flags': flagset,
-                   'bridge_prio': int(br.group(1), 16) if br else None,
-                   'bridge_mac': br.group(2).lower() if br else None,
-                   'root_prio': None, 'root_mac': None, 'pathcost': None,
-                   'port_role': None, 'vlan': None}
-            continue
-        if cur is None:
-            continue
-        rm = _STP_ROOT_RE.search(line)
-        if rm:
-            cur['root_prio'] = int(rm.group(1), 16)
-            cur['root_mac'] = rm.group(2).lower()
-            cur['pathcost'] = int(rm.group(3))
-            cur['vlan'] = cur['root_prio'] & 0x0FFF
-            pr = re.search(r'port-role (\w+)', line)
-            if pr:
-                cur['port_role'] = pr.group(1)
-    if cur:
-        events.append(cur)
-    return [e for e in events if e['src']]
 
 
 def _stp_watch_load():
@@ -14286,332 +15539,462 @@ def _stp_watch_save(d):
 
 
 def do_stp_baseline(action='get'):
-    """Manage the learned STP baseline (per-instance root bridge + legitimate bridges)."""
+    """Manage the learned STP v2 baseline (per-segment root bridge, legitimate
+    bridges, MST regions and per-MSTI regional roots). Reset re-learns on next run."""
     with _stp_watch_lock:
         if action == 'reset':
             _stp_watch_save({})
             return {'success': True, 'reset': True, 'baseline': {}}
         b = _stp_watch_load()
         return {'success': True, 'baseline': {
-            'roots': b.get('roots') or {}, 'bridges': b.get('bridges') or []}}
+            'roots': b.get('roots') or {}, 'bridges': b.get('bridges') or {},
+            'mst_regions': b.get('mst_regions') or {},
+            'msti_roots': b.get('msti_roots') or {}}}
 
 
-def _stp_analyze(events, seconds, baseline, learn=True):
-    """Pure classifier over parsed BPDU events. Separated from capture for the
-    self-test. May mutate+persist `baseline` when learn=True."""
-    seconds = max(1, int(seconds))
-
-    instances = {}
-    bridges = {}
-    tcn_count = 0
-    tc_count = 0
-    for e in events:
-        if e['bridge_mac']:
-            b = bridges.setdefault(e['bridge_mac'], {
-                'mac': e['bridge_mac'], 'proto': e['proto'], 'count': 0,
-                'roles': set()})
-            b['count'] += 1
-            if e['port_role']:
-                b['roles'].add(e['port_role'])
-        if e['kind'] == 'tcn':
-            tcn_count += 1
-        if e['tc']:
-            tc_count += 1
-        if e['root_prio'] is not None:
-            key = str(e['vlan'] if e['vlan'] is not None else 0)
-            inst = instances.setdefault(key, {
-                'vlan': int(key), 'proto': e['proto'], 'best': None,
-                'claimer': None, 'root_macs': set()})
-            inst['root_macs'].add(e['root_mac'])
-            cand = (e['root_prio'], _mac_int(e['root_mac']))
-            if inst['best'] is None or cand < inst['best']:
-                inst['best'] = cand
-                inst['claimer'] = {'prio': e['root_prio'], 'mac': e['root_mac'],
-                                   'by': e['bridge_mac'] or e['src']}
-
-    known_roots = dict(baseline.get('roots') or {})
-    known_bridges = set(baseline.get('bridges') or [])
-    had_baseline = bool(known_roots) or bool(known_bridges)
-
-    learned = False
-    if learn and not had_baseline and (instances or bridges):
-        baseline['roots'] = {
-            k: {'prio': inst['claimer']['prio'], 'mac': inst['claimer']['mac']}
-            for k, inst in instances.items() if inst['claimer']}
-        baseline['bridges'] = sorted(bridges.keys())
-        learned = True
-        known_roots = dict(baseline['roots'])
-        known_bridges = set(baseline['bridges'])
-        had_baseline = True
-
-    PRIORITY = ['root-hijack', 'rogue-bridge', 'bpdu-flood', 'topology-change', 'clean']
-    verdict = 'clean'
-    reasons = []
-
-    def bump(v):
-        nonlocal verdict
-        if PRIORITY.index(v) < PRIORITY.index(verdict):
-            verdict = v
-
-    # Root hijack: an advertised root superior to (or displacing) the baseline root.
-    if had_baseline:
-        for k in sorted(instances, key=lambda x: int(x)):
-            inst = instances[k]
-            base = known_roots.get(k)
-            if not base or not inst['claimer']:
-                continue
-            cand = inst['best']
-            base_t = (base['prio'], _mac_int(base['mac']))
-            if cand < base_t:
-                bump('root-hijack')
-                c = inst['claimer']
-                where = f"VLAN {inst['vlan']}" if inst['proto'] == 'pvst+' else \
-                    (f"instance {inst['vlan']}" if inst['vlan'] else "the CIST")
-                reasons.append(
-                    f"ROOT HIJACK on {where}: {c['by']} is advertising root "
-                    f"{c['prio']}.{c['mac']} — superior to the baseline root "
-                    f"{base['prio']}.{base['mac']}. It wins the election and becomes "
-                    f"the root bridge, pulling traffic through it (L2 MITM). Enable "
-                    f"Root Guard / BPDU Guard")
-
-    # Rogue bridges (new senders).
-    if had_baseline:
-        for mac in sorted(bridges):
-            if mac not in known_bridges:
-                bump('rogue-bridge')
-                reasons.append(
-                    f"New STP bridge {mac} ({bridges[mac]['proto'].upper()}) — not in "
-                    f"the baseline; an unexpected switch (or a spoofed bridge) is "
-                    f"participating in spanning tree on this segment")
-
-    # BPDU flood (reconvergence-storm DoS).
-    rate = round(len(events) / seconds, 2)
-    if len(events) > 100 and rate > _STP_FLOOD_RATE:
-        bump('bpdu-flood')
-        reasons.append(
-            f"BPDU flood: {rate} BPDUs/s (normal is ~1 per bridge every 2s) — a "
-            f"spanning-tree storm forcing constant reconvergence (DoS)")
-
-    # Topology-change churn (MAC-table flushing).
-    if (tcn_count + tc_count) > _STP_TCN_CHURN:
-        bump('topology-change')
-        reasons.append(
-            f"Topology-change churn: {tcn_count} TCN + {tc_count} TC-flagged BPDUs in "
-            f"{seconds}s — repeated topology changes flush the MAC tables (traffic "
-            f"floods, which aids sniffing) and can be a TCN-flood attack")
-
-    advisories = []
-    if instances or bridges:
-        advisories.append(
-            "Harden spanning tree: BPDU Guard + PortFast on every edge/access port "
-            "(any BPDU there err-disables the port), Root Guard on ports toward "
-            "downstream switches (rejects superior BPDUs), and set your real root/backup "
-            "root to a low priority (0/4096) so a rogue can't outbid them.")
-
-    def _pub_inst(k, inst):
-        base = known_roots.get(k)
-        c = inst['claimer'] or {}
-        status = 'known'
-        if base:
-            if (c.get('prio'), _mac_int(c.get('mac', ''))) < (base['prio'],
-                                                              _mac_int(base['mac'])):
-                status = 'hijacked'
-        elif had_baseline:
-            status = 'new'
-        else:
-            status = 'learned'
-        return {'vlan': inst['vlan'], 'proto': inst['proto'],
-                'root_prio': c.get('prio'), 'root_mac': c.get('mac'),
-                'advertised_by': c.get('by'),
-                'baseline_root': (f"{base['prio']}.{base['mac']}" if base else None),
-                'status': status}
-
-    if reasons:
-        summary = reasons
-    elif not (instances or bridges):
-        summary = ['No BPDUs seen — no spanning tree on this segment (an access port '
-                   'with BPDU Guard, or an isolated link)']
-    else:
-        summary = ['Spanning-tree root(s) and bridges match the trusted baseline']
-
-    return {
-        'success': True,
-        'verdict': verdict,
-        'reasons': summary,
-        'learned': learned,
-        'bridge_count': len(bridges),
-        'instance_count': len(instances),
-        'packet_count': len(events),
-        'rate': rate,
-        'tcn_count': tcn_count,
-        'tc_count': tc_count,
-        'instances': [_pub_inst(k, instances[k])
-                      for k in sorted(instances, key=lambda x: int(x))],
-        'bridges': [{'mac': m, 'proto': bridges[m]['proto'],
-                     'roles': sorted(bridges[m]['roles']), 'count': bridges[m]['count'],
-                     'baseline': m in known_bridges} for m in sorted(bridges)],
-        'advisories': advisories,
-    }
+_STP_PY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'python')
+# IEEE 802.1D/w/s BPDUs ride LLC/SNAP to 01:80:c2:00:00:00; Cisco PVST+/RPVST+
+# rides SNAP to 01:00:0c:cc:cc:cd. The v2 engine decodes both from the raw MAC
+# header, so capture is a raw pcap (not tcpdump text) over just those two groups.
+_STP_BPF = '(ether dst 01:80:c2:00:00:00) or (ether dst 01:00:0c:cc:cc:cd)'
+# Finding-id -> UI verdict bucket. First match in this order wins (worst first).
+_STP_VERDICT_BUCKETS = [
+    ('root-hijack', {'STP-002', 'STP-024'}),                        # superior-root / regional-root takeover
+    ('bpdu-flood', {'STP-006', 'STP-007', 'STP-008', 'STP-016'}),   # TCN / BPDU / RSTP-proposal storm
+    ('rogue-bridge', {'STP-004', 'STP-005', 'STP-019', 'STP-028'}), # new bridge / edge BPDU / multiple roots
+    ('topology-change', {'STP-001', 'STP-003', 'STP-023', 'STP-025', 'STP-030'}),
+]
+_STP_SEV_TO_GUARD = {'CRITICAL': 'critical', 'HIGH': 'high', 'MEDIUM': 'medium',
+                     'LOW': 'low', 'INFO': 'info'}
+_STP_SEV_RANK = {'info': 0, 'low': 1, 'medium': 2, 'high': 3, 'critical': 4}
 
 
-def _stp_capture(interface, seconds):
-    """One passive tcpdump window over BPDUs -> (raw, error). Uses -e for the sender
-    MAC; the BPF covers IEEE (01:80:c2:00:00:00) and Cisco PVST+ (01:00:0c:cc:cc:cd)."""
+def _stp_import():
+    """Import the vendored STP v2 engine (python/ on sys.path). Pure stdlib at
+    runtime; scapy appears only in the engine's own test harness, never here."""
+    if _STP_PY_DIR not in sys.path:
+        sys.path.insert(0, _STP_PY_DIR)
+    import stpwatch as _w
+    return _w
+
+
+def _stp_capture_pcap(interface, seconds):
+    """One passive tcpdump window over BPDUs -> (frames, error). Writes a pcap and
+    reads raw Ethernet frames back; emits nothing on the wire."""
     if not _have('tcpdump'):
-        return '', 'tcpdump is not installed. Click Install to add it.'
-    bpf = '(ether dst 01:80:c2:00:00:00) or (ether dst 01:00:0c:cc:cc:cd)'
-    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-e',
-                '-nn', '-t', '-v', '-s', '128', '-c', '20000', bpf],
-               timeout=seconds + 8)
-    out = res['out']
-    if not out and res['err'] and ('permission' in res['err'].lower()
-                                   or "couldn't" in res['err'].lower()
-                                   or 'no such device' in res['err'].lower()
-                                   or 'syntax error' in res['err'].lower()):
-        return '', res['err'].strip()[:200]
-    return out, None
+        return [], 'tcpdump is not installed. Click Install to add it.'
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix='.pcap')
+    os.close(fd)
+    try:
+        res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-p',
+                    '-nn', '-s', '256', '-c', '20000', '-w', path, _STP_BPF],
+                   timeout=seconds + 8)
+        try:
+            empty = os.path.getsize(path) < 25
+        except OSError:
+            empty = True
+        if empty and res.get('err') and (
+                'permission' in res['err'].lower() or "couldn't" in res['err'].lower()
+                or 'no such device' in res['err'].lower() or 'syntax' in res['err'].lower()):
+            return [], res['err'].strip()[:200]
+        try:
+            return list(_lldp_read_pcap(path)), None
+        except ValueError:
+            return [], None
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
-def do_stp_watch(interface=None, seconds=20, learn=True):
-    """Passive spanning-tree / BPDU security scanner (detection-only). BPDUs are ~2s
-    apart, so a slightly longer window. Learns the root(s) + legitimate bridges on
-    first run."""
+def _stp_verdict(ids):
+    """Map the set of fired finding-ids to the UI verdict bucket (worst wins)."""
+    for name, bucket in _STP_VERDICT_BUCKETS:
+        if ids & bucket:
+            return name
+    return None
+
+
+def _stp_baseline_is_v2(store):
+    """True only for a v2-engine baseline: it has a 'version' key and every root /
+    MSTI-root record is a BridgeID.to_json() dict (carries 'raw_priority'). Guards
+    against feeding a pre-v2 store to the engine (which would KeyError)."""
+    if not isinstance(store, dict) or not store.get('version'):
+        return False
+    recs = list((store.get('roots') or {}).values()) + \
+        list((store.get('msti_roots') or {}).values())
+    return all(isinstance(v, dict) and 'raw_priority' in v for v in recs)
+
+
+def _stp_scan_frames(frames, iface, baseline=None, edge_ifaces=(), learning=False,
+                     start_ts=None):
+    """Decode + detect: parse_frame -> Analyzer.process over raw frames. Returns
+    (findings_rows, analyzer, regions, bpdu_count). Separated from capture so the
+    self-test drives the exact decode+detect path the live watcher uses."""
+    W = _stp_import()
+    base_ts = start_ts if start_ts is not None else (frames[0][0] if frames else time.time())
+    an = W.Analyzer(baseline=baseline, edge_ifaces=edge_ifaces, start_ts=base_ts,
+                    learning=learning)
+    regions, rows, bpdus = {}, {}, 0
+    for ts, raw in frames:
+        try:
+            p = W.parse_frame(raw, iface, ts)
+        except Exception:
+            p = None
+        if p is None:
+            continue
+        bpdus += 1
+        reg = getattr(p, 'region', None)
+        if reg:
+            regions.setdefault(reg, {'first_seen': ts})
+        for f in an.process(p):
+            sev = _STP_SEV_TO_GUARD.get(f.severity, 'info')
+            k = (f.id, f.iface, f.vlan)
+            r = rows.get(k)
+            if r is None:
+                rows[k] = {'code': f.id, 'name': f.name, 'severity': sev,
+                           'iface': f.iface, 'vlan': f.vlan, 'summary': f.summary,
+                           'evidence': {kk: str(vv) for kk, vv in (f.evidence or {}).items()},
+                           'count': 1}
+            else:
+                r['count'] += 1
+    an._seen_regions = regions
+    out = sorted(rows.values(), key=lambda r: (-_STP_SEV_RANK.get(r['severity'], 0),
+                                               r['code'], str(r['iface']), str(r['vlan'])))
+    return out, an, regions, bpdus
+
+
+def do_stp_watch(interface=None, seconds=20, learn=True, edge=()):
+    """Passive spanning-tree / BPDU SECURITY scanner (detection-only) — v2. Decodes
+    802.1D / RSTP / MSTP (incl. every per-MSTI record) and Cisco PVST+/RPVST+ from
+    the BPDUs the switches already emit, and flags tampering: superior-root takeover
+    (yersinia), floods/DoS, field-sanity violations, MST digest/region mismatch, and
+    the per-instance (MSTI) takeover tier — 31 checks (STP-001..031), no CVEs (BPDUs
+    are unauthenticated by design). Never transmits. Learns the legitimate root(s) +
+    bridges on first run (grace period) unless a baseline is already stored."""
     iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
     if iface not in _list_iface_names(include_virtual=True):
         return {'success': False, 'error': f'unknown interface: {iface}'}
     seconds = _clamp_int(seconds, 20, 5, 50)
-
-    text, err = _stp_capture(iface, seconds)
+    frames, err = _stp_capture_pcap(iface, seconds)
     if err:
         return {'success': False, 'interface': iface, 'error': err,
                 'missing_tool': 'tcpdump' if 'not installed' in err else None}
-    events = _parse_stp_capture(text)
 
     with _stp_watch_lock:
-        baseline = _stp_watch_load()
-        result = _stp_analyze(events, seconds, baseline, learn=learn)
-        if result.get('learned'):
-            _stp_watch_save(baseline)
-        if result['verdict'] != 'clean':
+        store = _stp_watch_load()
+        # The v2 engine baseline carries a 'version' key and raw_priority-shaped
+        # root records (BridgeID.to_json). A pre-v2 store is incompatible, so ignore
+        # it and re-learn (the next learn overwrites it in the v2 shape).
+        baseline = store if (_stp_baseline_is_v2(store)
+                             and (store.get('roots') or store.get('msti_roots'))) else None
+        learning = bool(learn and baseline is None)
+        rows, an, regions, bpdus = _stp_scan_frames(
+            frames, iface, baseline=baseline, edge_ifaces=tuple(edge), learning=learning)
+        learned = False
+        if learning and bpdus:
+            _stp_watch_save(an.build_baseline())
+            learned = True
+
+    ids = {r['code'] for r in rows}
+    verdict = _stp_verdict(ids)
+    if verdict is None:
+        verdict = 'anomaly' if rows else 'clean'
+    reasons = [f"{r['code']} {r['name']}: {r['summary']}"
+               + (f" (x{r['count']})" if r['count'] > 1 else '') for r in rows]
+
+    health = an.health()
+    mhealth = an.msti_health()
+    if verdict != 'clean':
+        with _stp_watch_lock:
             b = _stp_watch_load()
-            evs = b.get('events') or []
-            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
-                        'reasons': result['reasons'][:6]})
+            evs = (b.get('events') or [])
+            evs.append({'ts': int(time.time()), 'verdict': verdict,
+                        'reasons': [r['code'] for r in rows][:8]})
             b['events'] = evs[-_STP_EVENTS_CAP:]
             _stp_watch_save(b)
 
-    result['interface'] = iface
-    result['seconds'] = seconds
-    return result
+    return {
+        'success': True, 'interface': iface, 'seconds': seconds,
+        'verdict': verdict, 'learned': learned,
+        'findings': rows, 'reasons': reasons,
+        'segments': health, 'msti': mhealth,
+        'summary': {
+            'bpdus': bpdus, 'segments': len(health), 'msti': len(mhealth),
+            'findings': len(rows),
+            'critical': sum(1 for r in rows if r['severity'] == 'critical'),
+            'high': sum(1 for r in rows if r['severity'] == 'high'),
+            'medium': sum(1 for r in rows if r['severity'] == 'medium'),
+        },
+        'source': f'passive capture on {iface}',
+    }
 
 
 def _stp_selftest():
-    """Self-test the STP/BPDU detectors with synthetic captures, plus a Scapy
-    end-to-end leg (craft a real superior-root BPDU -> pcap -> tcpdump -e -> parse)."""
+    """STP Watch v2 self-test: the vendored engine's own 151-check tier (its own
+    interpreter — scapy only for the cross-check leg), plus an in-app leg that
+    crafts a yersinia-style superior-root BPDU, writes a pcap, and reads it back
+    through the real capture->parse->Analyzer path, asserting STP-002 + verdict."""
     scenarios = []
 
-    def cfg(src, root_prio, root_mac, bridge_prio=None, bridge_mac=None, flags='none',
-            pathcost=0, pvst=False):
-        bridge_prio = bridge_prio if bridge_prio is not None else root_prio
-        bridge_mac = bridge_mac or src
-        dst = '01:00:0c:cc:cc:cd' if pvst else '01:80:c2:00:00:00'
-        pid = 'oui Cisco (0x00000c), pid PVST (0x010b), length 41: ' if pvst else ''
-        return (f"{src} > {dst}, 802.3, length 49: LLC, dsap STP (0x42) Individual, "
-                f"ssap STP (0x42) Command, ctrl 0x03: {pid}STP 802.1d, Config, "
-                f"Flags [{flags}], bridge-id {bridge_prio:04x}.{bridge_mac}.0000, "
-                f"length 35\n"
-                f"\tmessage-age 1.00s, max-age 20.00s, hello-time 2.00s, "
-                f"forwarding-delay 15.00s\n"
-                f"\troot-id {root_prio:04x}.{root_mac}, root-pathcost {pathcost}")
+    def sc(name, ok, expect='', got=''):
+        scenarios.append({'name': name, 'expect': expect, 'got': str(got), 'pass': bool(ok)})
 
-    def tcn(src):
-        return (f"{src} > 01:80:c2:00:00:00, 802.3, length 7: LLC, dsap STP (0x42) "
-                f"Individual, ssap STP (0x42) Command, ctrl 0x03: STP 802.1d, "
-                f"Topology Change")
+    # 1. The vendored engine's own tier (subprocess; prints 'N/N self-tests passed').
+    res = _run([sys.executable or 'python3', os.path.join(_STP_PY_DIR, 'test_stpwatch.py')],
+               timeout=180)
+    out = (res.get('out') or '') + (res.get('err') or '')
+    m = re.search(r'(\d+)/(\d+)\s+self-tests passed', out)
+    if m:
+        passed, total = int(m.group(1)), int(m.group(2))
+        for i in range(passed):
+            scenarios.append({'name': 'stpwatch check %d' % (i + 1), 'pass': True,
+                              'expect': 'pass', 'got': 'pass'})
+        if passed != total:
+            sc('stpwatch engine self-test', False, '%d/%d' % (total, total),
+               '%d/%d' % (passed, total))
+    else:
+        sc('stpwatch engine self-test', False, 'N/N self-tests passed',
+           'rc %s %s' % (res.get('rc'), out.strip()[-160:]))
 
-    def run(name, text, seconds, baseline, expect):
-        events = _parse_stp_capture(text)
-        res = _stp_analyze(events, seconds, dict(baseline or {}), learn=not baseline)
-        ok = res['verdict'] == expect
-        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
-                          'events': len(events), 'pass': ok})
-        return res
-
-    # Baseline: root of the CIST is 8000.00:11:22:33:44:55 (priority 32768), one bridge.
-    base = {'roots': {'0': {'prio': 0x8000, 'mac': '00:11:22:33:44:55'}},
-            'bridges': ['00:11:22:33:44:55']}
-
-    # 1. clean: the known root re-advertising itself.
-    run('clean', cfg('00:11:22:33:44:55', 0x8000, '00:11:22:33:44:55'), 20, base,
-        'clean')
-    # 2. root-hijack: a new bridge claims root with priority 0 (superior).
-    run('root-hijack', cfg('de:ad:be:ef:00:01', 0x0000, 'de:ad:be:ef:00:01'), 20, base,
-        'root-hijack')
-    # 3. rogue-bridge: a new bridge advertising the *existing* root (not superior).
-    run('rogue-bridge', cfg('de:ad:be:ef:00:02', 0x8000, '00:11:22:33:44:55',
-                            bridge_mac='de:ad:be:ef:00:02'), 20, base, 'rogue-bridge')
-    # 4. topology-change: known bridge + several TCNs (MAC-flush churn).
-    run('topology-change',
-        cfg('00:11:22:33:44:55', 0x8000, '00:11:22:33:44:55') + "\n"
-        + "\n".join(tcn('00:11:22:33:44:55') for _ in range(4)), 20, base,
-        'topology-change')
-    # 5. bpdu-flood: a burst of BPDUs from the known root.
-    run('bpdu-flood',
-        "\n".join(cfg('00:11:22:33:44:55', 0x8000, '00:11:22:33:44:55')
-                  for _ in range(200)), 3, base, 'bpdu-flood')
-    # 6. pvst+ parse: per-VLAN BPDU, VLAN encoded in the priority low bits.
-    pev = _parse_stp_capture(cfg('00:11:22:33:44:55', 0x8064, '00:11:22:33:44:55',
-                                 bridge_prio=0x8064, pvst=True))
-    p_ok = (len(pev) == 1 and pev[0]['proto'] == 'pvst+' and pev[0]['vlan'] == 100
-            and pev[0]['root_prio'] == 0x8064)
-    scenarios.append({'name': 'pvst-parse', 'expect': 'pvst+/vlan100',
-                      'got': f"{pev[0]['proto'] if pev else '-'}/vlan"
-                             f"{pev[0]['vlan'] if pev else '?'}", 'pass': p_ok})
-    # 7. parse: TC flag + fields.
-    fev = _parse_stp_capture(cfg('00:11:22:33:44:55', 0x8000, '00:11:22:33:44:55',
-                                 flags='Topology change, Topology change ACK'))
-    f_ok = (len(fev) == 1 and fev[0]['tc'] is True
-            and fev[0]['root_mac'] == '00:11:22:33:44:55'
-            and fev[0]['bridge_prio'] == 0x8000)
-    scenarios.append({'name': 'flags-parse', 'expect': 'tc=True',
-                      'got': f"tc={fev[0]['tc'] if fev else '?'}", 'pass': f_ok})
-
-    # Scapy end-to-end: craft a real superior-root (priority 0) BPDU.
-    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    # 2. In-app leg: craft BPDUs with scapy, write a pcap, read + analyze through
+    #    the real capture->engine path. A legit root (prio 8192) learned during the
+    #    grace window, then a yersinia-style superior root (prio 0, LAA source) past
+    #    grace -> STP-002 CRITICAL, verdict root-hijack.
     try:
-        import tempfile
-        from scapy.all import Dot3, LLC, STP, wrpcap
-        if _have('tcpdump'):
-            pkt = (Dot3(dst='01:80:c2:00:00:00', src='de:ad:be:ef:00:01')
-                   / LLC(dsap=0x42, ssap=0x42, ctrl=3)
-                   / STP(rootid=0, rootmac='de:ad:be:ef:00:01', bridgeid=0,
-                         bridgemac='de:ad:be:ef:00:01', pathcost=0))
-            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
-                pcap_path = tf.name
-            wrpcap(pcap_path, [pkt])
-            res = _run(['tcpdump', '-e', '-nn', '-t', '-v', '-r', pcap_path], timeout=10)
-            evs = _parse_stp_capture(res['out'])
-            e = evs[0] if evs else {}
-            base2 = {'roots': {'0': {'prio': 0x8000, 'mac': '00:11:22:33:44:55'}},
-                     'bridges': ['00:11:22:33:44:55']}
-            cls = _stp_analyze(evs, 20, dict(base2), learn=False)
-            ok = (e.get('root_prio') == 0 and e.get('src') == 'de:ad:be:ef:00:01'
-                  and cls['verdict'] == 'root-hijack')
-            scapy_result = {'ran': True, 'root_prio': e.get('root_prio'),
-                            'src': e.get('src'), 'verdict': cls['verdict'], 'pass': ok,
-                            'tcpdump_out': res['out'].strip()[:200]}
-            try:
-                os.remove(pcap_path)
-            except OSError:
-                pass
-    except Exception as e:
-        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+        from scapy.layers.l2 import Dot3, LLC, STP
 
-    passed = all(s['pass'] for s in scenarios) and (not scapy_result.get('ran')
-                                                    or scapy_result.get('pass'))
-    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+        def bpdu(src, root_prio, root_mac):
+            return bytes(Dot3(src=src, dst='01:80:c2:00:00:00')
+                         / LLC(dsap=0x42, ssap=0x42, ctrl=3)
+                         / STP(rootid=root_prio, rootmac=root_mac,
+                               bridgeid=root_prio, bridgemac=src, pathcost=0))
+        legit = bpdu('00:11:22:33:44:55', 8192, '00:11:22:33:44:55')
+        superior = bpdu('ba:ad:ba:ad:00:01', 0, 'ba:ad:ba:ad:00:01')
+        frames = [(1000.0 + i, legit) for i in range(3)] + [(1040.0, superior)]
+        rows, an, _, bpdus = _stp_scan_frames(frames, 'eth0', start_ts=1000.0)
+        ids = {r['code'] for r in rows}
+        sc('stp-superior-root-takeover', 'STP-002' in ids and _stp_verdict(ids) == 'root-hijack',
+           'STP-002 root-hijack', f'{sorted(ids)}/{_stp_verdict(ids)}')
+        sc('stp-bpdus-decoded', bpdus == 4, '4 BPDUs decoded', bpdus)
+    except Exception as e:
+        sc('stp-inapp-leg', False, 'ran', '%s: %s' % (type(e).__name__, e))
+
+    return {'success': all(s['pass'] for s in scenarios), 'scenarios': scenarios}
+
+
+# --------------------------------------------------------------------------
+# MRP Watch: passive MVRP / MMRP / GVRP / GMRP registration-protocol monitor.
+#
+# The standards-based siblings of Cisco's VTP (vtpwatch): the 802.1ak Multiple
+# Registration Protocols — MVRP (EtherType 0x88F5, dst 01:80:C2:00:00:21) and
+# MMRP (0x88F6, dst ...:20) — plus the legacy 802.1D GARP applications GVRP/GMRP
+# (no EtherType, LLC/802.3-length framed to the same two MACs). This is NOT the
+# IEC 62439-2 ring-redundancy "MRP"; it is the VLAN/multicast registration plane.
+# MVRP and MMRP use DIFFERENT EtherTypes, so a filter on 0x88F5 alone silently
+# drops 100% of MMRP — the capture admits both plus the whole GARP application
+# block 01:80:C2:00:00:20-2F. Detection-only; never transmits. Vendored pure-
+# python engine python/mrpwatch.py (21 codes, no CVEs — the four protocols have
+# none, same shape as stpwatch). verdict: clean / observed / suspicious / attack.
+# --------------------------------------------------------------------------
+_MRP_PY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'python')
+# Both EtherTypes, plus the GARP application block bound purely by destination MAC
+# (GARP has no EtherType). Boundary-tested in the engine: matches :20-:2f, rejects
+# :00 (STP) / :02 (LACP) / :0e (LLDP) / :30.
+_MRP_BPF = ('ether proto 0x88f5 or ether proto 0x88f6 or '
+            '(ether[0:4] = 0x0180c200 and ether[4:2] >= 0x0020 and ether[4:2] <= 0x002f)')
+_MRP_SEV_TO_GUARD = {'HIGH': 'high', 'MEDIUM': 'medium', 'LOW': 'low', 'INFO': 'info'}
+_MRP_SEV_RANK = {'info': 0, 'low': 1, 'medium': 2, 'high': 3}
+
+
+def _mrp_import():
+    """Import the vendored MRP engine (python/ on sys.path). Pure stdlib — no scapy
+    at runtime (scapy appears only in the module's own GARP cross-check test tier)."""
+    if _MRP_PY_DIR not in sys.path:
+        sys.path.insert(0, _MRP_PY_DIR)
+    import mrpwatch as _w
+    return _w
+
+
+def _mrp_scan_frames(frames, known_vlans=None):
+    """Feed (ts, raw) frames through the engine and collapse its per-frame Findings
+    into one row per (code, src, proto) with a count. Returns (rows, verdict).
+    Separated from capture so the self-test drives the exact same path."""
+    W = _mrp_import()
+    cfg = W.Config(known_vlans=set(known_vlans) if known_vlans else None)
+    watch = W.MrpWatch(cfg)
+    rows = {}
+    for ts, raw in frames:
+        for f in watch.feed(raw, ts):
+            sev = _MRP_SEV_TO_GUARD.get(f.severity, 'info')
+            k = (f.code, f.src, f.proto)
+            r = rows.get(k)
+            if r is None:
+                rows[k] = {'code': f.code, 'severity': sev, 'src': f.src,
+                           'proto': f.proto, 'title': f.title,
+                           'detail': {kk: str(vv) for kk, vv in f.detail.items()},
+                           'count': 1}
+            else:
+                r['count'] += 1
+    out = sorted(rows.values(), key=lambda r: (-_MRP_SEV_RANK.get(r['severity'], 0),
+                                               r['code'], r['src']))
+    if any(r['severity'] == 'high' for r in out):
+        verdict = 'attack'
+    elif any(r['severity'] == 'medium' for r in out):
+        verdict = 'suspicious'
+    elif out:
+        verdict = 'observed'
+    else:
+        verdict = 'clean'
+    return out, verdict
+
+
+def _mrp_capture(interface, seconds):
+    """One passive tcpdump window over MRP/GARP frames -> (frames, error). Writes a
+    pcap and reads raw Ethernet frames back; emits nothing on the wire."""
+    if not _have('tcpdump'):
+        return [], 'tcpdump is not installed. Click Install to add it.'
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix='.pcap')
+    os.close(fd)
+    try:
+        res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-p',
+                    '-nn', '-s', '256', '-c', '20000', '-w', path, _MRP_BPF],
+                   timeout=seconds + 8)
+        try:
+            empty = os.path.getsize(path) < 25        # pcap global header is 24 bytes
+        except OSError:
+            empty = True
+        if empty and res.get('err') and (
+                'permission' in res['err'].lower() or "couldn't" in res['err'].lower()
+                or 'no such device' in res['err'].lower() or 'syntax' in res['err'].lower()):
+            return [], res['err'].strip()[:200]
+        try:
+            return list(_lldp_read_pcap(path)), None
+        except ValueError:
+            return [], None
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def do_mrp_watch(interface=None, seconds=20, known_vlans=None):
+    """Passive MVRP / MMRP / GVRP / GMRP registration-protocol monitor
+    (detection-only). Captures both modern EtherTypes AND the legacy GARP
+    application block, feeds the vendored engine, and folds its MRP-0xx findings
+    into a clean/observed/suspicious/attack verdict. A LeaveAll flood (MRP-101/
+    103/105/107) is the standards-based sibling of the VTP bomb; a burst of
+    never-before-seen VLANs/groups (MRP-102/104/106/108) is a VLAN-hopping
+    setup signal. known_vlans (operator baseline) only escalates severity — it
+    never gates detection."""
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 20, 5, 50)
+    frames, err = _mrp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    rows, verdict = _mrp_scan_frames(frames, known_vlans=known_vlans)
+    reasons = [f"{r['code']} {r['proto']} {r['title']}"
+               + (f" (x{r['count']})" if r['count'] > 1 else '')
+               + (f" — src {r['src']}" if r['src'] else '')
+               for r in rows if r['severity'] != 'info']
+    return {
+        'success': True, 'interface': iface, 'seconds': seconds,
+        'verdict': verdict, 'findings': rows, 'reasons': reasons,
+        'summary': {'frames': len(frames), 'findings': len(rows),
+                    'high': sum(1 for r in rows if r['severity'] == 'high'),
+                    'medium': sum(1 for r in rows if r['severity'] == 'medium'),
+                    'protocols': sorted({r['proto'] for r in rows})},
+        'source': f'passive capture on {iface}',
+    }
+
+
+def _mrp_pcap_bytes(frames):
+    """Pack (ts, raw) frames into a classic Ethernet pcap (little-endian, us) so the
+    self-test exercises the exact capture->pcap->read->engine path, not just feed()."""
+    import struct as _st
+    blob = _st.pack('<IHHiIII', 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1)
+    for ts, raw in frames:
+        blob += _st.pack('<IIII', int(ts), int((ts - int(ts)) * 1e6), len(raw), len(raw)) + raw
+    return blob
+
+
+def _mrp_selftest():
+    """MRP Watch self-test: the vendored module's own 65-check tier (its own
+    interpreter — it needs no root), plus an in-app leg that writes crafted MVRP /
+    MMRP frames to a real pcap and reads them back through the capture->engine path,
+    asserting the codes and verdict. No root, no wire."""
+    scenarios = []
+
+    def sc(name, ok, expect='', got=''):
+        scenarios.append({'name': name, 'expect': expect, 'got': str(got), 'pass': bool(ok)})
+
+    # 1. The vendored module's own tier (subprocess; prints 'N passed, F failed').
+    res = _run([sys.executable or 'python3', os.path.join(_MRP_PY_DIR, 'test_mrpwatch.py')],
+               timeout=120)
+    out = (res.get('out') or '') + (res.get('err') or '')
+    m = re.search(r'(\d+)\s+passed,\s+(\d+)\s+failed', out)
+    if m:
+        passed, failed = int(m.group(1)), int(m.group(2))
+        for i in range(passed):
+            scenarios.append({'name': 'mrpwatch check %d' % (i + 1), 'pass': True,
+                              'expect': 'pass', 'got': 'pass'})
+        if failed:
+            sc('mrpwatch module self-test', False, '0 failed', '%d failed' % failed)
+    else:
+        sc('mrpwatch module self-test', False, 'N passed, 0 failed',
+           'rc %s %s' % (res.get('rc'), out.strip()[-160:]))
+
+    # 2. In-app leg: craft frames, write a pcap, read + analyze through the adapter.
+    src = 'aa:bb:cc:00:00:01'
+    sb = bytes.fromhex(src.replace(':', ''))
+    # MVRP LeaveAll-only vector (lenflags 0x2000): version0, VLAN msg, msg+pdu endmarks.
+    mvrp_la = bytes.fromhex('0180c2000021') + sb + b'\x88\xf5' + \
+        bytes([0x00, 0x01, 0x02, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00])
+    # MMRP (different EtherType — the "half-blind filter" case): group-MAC msg.
+    mmrp = bytes.fromhex('0180c2000020') + sb + b'\x88\xf6' + \
+        bytes([0x00, 0x02, 0x06, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00])
+    benign = bytes.fromhex('ffffffffffff') + sb + b'\x08\x00' + b'\x00' * 40  # IPv4, not ours
+
+    # (a) MVRP LeaveAll flood -> MRP-101 (HIGH) + MRP-001 presence, verdict attack.
+    la_frames = [(1000.0 + i, mvrp_la) for i in range(6)]
+    rows, verdict = _mrp_scan_frames(la_frames)
+    codes = {r['code'] for r in rows}
+    sc('mrp-mvrp-leaveall-flood', 'MRP-101' in codes and 'MRP-001' in codes
+       and verdict == 'attack', 'MRP-101+MRP-001 attack', f'{sorted(codes)}/{verdict}')
+    # (b) MMRP must be seen despite the different EtherType (half-blind-filter guard).
+    rows2, _ = _mrp_scan_frames([(2000.0, mmrp)])
+    sc('mrp-mmrp-distinct-ethertype', 'MRP-002' in {r['code'] for r in rows2},
+       'MRP-002', sorted(r['code'] for r in rows2))
+    # (c) Benign non-MRP traffic is ignored.
+    rows3, v3 = _mrp_scan_frames([(3000.0, benign)])
+    sc('mrp-benign-ignored', not rows3 and v3 == 'clean', 'clean/none', f'{len(rows3)}/{v3}')
+    # (d) Full capture->pcap->read->engine path (the real adapter wiring).
+    import tempfile
+    fd, p = tempfile.mkstemp(suffix='.pcap')
+    try:
+        os.write(fd, _mrp_pcap_bytes(la_frames))
+        os.close(fd)
+        rows4, v4 = _mrp_scan_frames(list(_lldp_read_pcap(p)))
+        sc('mrp-pcap-roundtrip', 'MRP-101' in {r['code'] for r in rows4} and v4 == 'attack',
+           'MRP-101 attack via pcap', f'{sorted(r["code"] for r in rows4)}/{v4}')
+    finally:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+    return {'success': all(s['pass'] for s in scenarios), 'scenarios': scenarios}
 
 
 # --------------------------------------------------------------------------
@@ -15409,31 +16792,173 @@ _CDP_FMT_LENGTH = "hlLqjztZ"
 _CDP_FMT_WRITE = "nN"          # writes through a pointer -> CRITICAL
 _CDP_FMT_READ = "diouxXeEfFgGaAcspm"
 _CDP_FMT_READ_MIN = 2          # a lone %-x is noise; a run is a leak probe
+# Platform/version/device-id screening families — the original Armis CDPwn set
+# plus its LCDPwn (Qian Chen / Qi'anxin) successor and the LCDPwn cross-vendor
+# arm (FortiSwitch, lldpd, Cisco ATA/Unified CM). Each match attaches the CVEs to
+# verify that device against: a version banner can't prove patch state, so these
+# are screening AIDS, not per-CVE detection. Plain IOS/IOS-XE is deliberately
+# ABSENT — Cisco's advisory says those platforms are not CDPwn-affected, so
+# matching them would be a false positive. An ATA is NOT an IP Phone 7800/8800,
+# so ip_phone carries an explicit negative lookahead excluding the ATA banner (it
+# would otherwise double-match a phone-style SEP device-id) — the same
+# not-affected-list technique LLDP Watch needed for the Cisco RV042.
 _CDPWN_FAMILIES = [
-    (re.compile(r"IP\s*Phone|SIP\d{2,}|SEP[0-9A-Fa-f]{12}"), 'CDP-020',
-     ['CVE-2020-3111'],
-     "Cisco IP Phone — verify firmware against CVE-2020-3111 (PortID stack overflow)"),
+    (re.compile(r"\bATA\s*19[0-9]\b|Analog\s*Telephone\s*Adaptor"), 'CDP-029',
+     ['CVE-2022-20688', 'CVE-2022-20689', 'CVE-2022-20690', 'CVE-2022-20691',
+      'CVE-2022-20766'],
+     "Cisco ATA 190/191/192 — verify against CVE-2022-20689/20690 (8.8 CDP length "
+     "validation), CVE-2022-20691, CVE-2022-20688, CVE-2022-20766"),
+    (re.compile(r"^(?!.*(?:\bATA\s*19[0-9]\b|Analog\s*Telephone))"
+                r".*(?:IP\s*Phone|SIP\d{2,}|SEP[0-9A-Fa-f]{12})", re.S), 'CDP-020',
+     ['CVE-2020-3111', 'CVE-2021-1379', 'CVE-2022-20968'],
+     "Cisco IP Phone — verify firmware against CVE-2020-3111 (PortID stack overflow), "
+     "CVE-2021-1379 (68xx/78xx/88xx) + CVE-2022-20968 (7800/8800 <=14.2 stack overflow)"),
     (re.compile(r"IP\s*Camera|Video\s*Surveillance|CIVS-IPC"), 'CDP-021',
-     ['CVE-2020-3110'],
-     "Cisco Video Surveillance 8000 IP Camera — verify against CVE-2020-3110 (DeviceID heap overflow)"),
+     ['CVE-2020-3110', 'CVE-2020-3505', 'CVE-2020-3506', 'CVE-2020-3507',
+      'CVE-2020-3543', 'CVE-2020-3544', 'CVE-2021-1131', 'CVE-2021-1521',
+      'CVE-2021-1563', 'CVE-2021-1564'],
+     "Cisco Video Surveillance 7000/8000 IP Camera — verify against CVE-2020-3110 "
+     "(DeviceID heap overflow) + the LCDPwn set (CVE-2020-3505/3506/3507/3543/3544, "
+     "CVE-2021-1131/1521 on 8000; CVE-2021-1563/1564 on 7000)"),
     (re.compile(r"IOS[\s-]?XR"), 'CDP-022', ['CVE-2020-3118', 'CVE-2020-3120'],
      "Cisco IOS XR — verify against CVE-2020-3118 (format string) + CVE-2020-3120 (Addresses DoS)"),
-    (re.compile(r"NX[\s-]?OS|Nexus"), 'CDP-023', ['CVE-2020-3119', 'CVE-2020-3120'],
-     "Cisco NX-OS — verify against CVE-2020-3119 (Power Request overflow) + CVE-2020-3120 (Addresses DoS)"),
+    (re.compile(r"NX[\s-]?OS|Nexus"), 'CDP-023',
+     ['CVE-2020-3119', 'CVE-2020-3120', 'CVE-2022-20824'],
+     "Cisco NX-OS — verify against CVE-2020-3119 (Power Request overflow), CVE-2020-3120 "
+     "(Addresses DoS) + CVE-2022-20824 (8.8 CDP code execution)"),
     (re.compile(r"FXOS|Firepower\s*(4100|9300)|UCS\s*6\d{3}|Fabric\s*Interconnect"),
-     'CDP-024', ['CVE-2020-3120'],
-     "Cisco FXOS / Firepower 4100/9300 / UCS FI — verify against CVE-2020-3120 (Addresses DoS)"),
+     'CDP-024', ['CVE-2020-3120', 'CVE-2022-20824'],
+     "Cisco FXOS / Firepower 4100/9300 / UCS FI — verify against CVE-2020-3120 (Addresses "
+     "DoS) + CVE-2022-20824 (8.8 CDP code execution)"),
+    # --- LCDPwn cross-vendor / non-switch CDP speakers ---
+    (re.compile(r"FortiSwitch"), 'CDP-027', ['CVE-2021-26111'],
+     "FortiSwitch — verify against CVE-2021-26111 (lldpmedd memory exhaustion via crafted "
+     "LLDP/CDP/EDP); fixed in 6.4.7 / 6.2.7"),
+    (re.compile(r"\blldpd\b"), 'CDP-028', ['CVE-2023-41910'],
+     "lldpd — verify against CVE-2023-41910 (9.8 out-of-bounds read in cdp_decode via the "
+     "CDP Addresses TLV, the CDP-054 shape); fixed in 1.0.17"),
+    (re.compile(r"Unified\s*(Communications\s*Manager|CM)\b|\bCUCM\b"), 'CDP-030',
+     ['CVE-2022-20804'],
+     "Cisco Unified CM / CM SME — verify against CVE-2022-20804 (CDP DoS); screened on the "
+     "CDP plane, not the voice plane"),
 ]
-# Cisco's advisory says plain IOS / IOS-XE routers+switches are NOT CDPwn-affected,
-# so those platforms are deliberately absent from the family table (false-positive
-# avoidance).
 _CDPWN_SEV = {'CDP-020': 'high', 'CDP-021': 'high', 'CDP-022': 'high',
-              'CDP-023': 'high', 'CDP-024': 'medium', 'CDP-040': 'critical',
-              'CDP-041': 'critical', 'CDP-042': 'critical', 'CDP-043': 'critical',
-              'CDP-044': 'high', 'CDP-045': 'critical', 'CDP-046': 'critical',
-              'CDP-047': 'high', 'CDP-050': 'low'}
+              'CDP-023': 'high', 'CDP-024': 'medium', 'CDP-027': 'medium',
+              'CDP-028': 'high', 'CDP-029': 'high', 'CDP-030': 'medium',
+              'CDP-040': 'critical', 'CDP-041': 'critical', 'CDP-042': 'critical',
+              'CDP-043': 'critical', 'CDP-044': 'high', 'CDP-045': 'critical',
+              'CDP-046': 'critical', 'CDP-047': 'high', 'CDP-050': 'low',
+              'CDP-053': 'high', 'CDP-054': 'critical'}
 _CDPWN_ATTACK_CODES = ('CDP-040', 'CDP-041', 'CDP-042', 'CDP-043', 'CDP-044',
-                       'CDP-045', 'CDP-046', 'CDP-047')
+                       'CDP-045', 'CDP-046', 'CDP-047', 'CDP-053', 'CDP-054')
+
+# --- UDLD (UniDirectional Link Detection, Cisco PID 0x0111 on the same CDP
+# group MAC). UDLD is OFF by default and both UDLD CVEs REQUIRE it enabled, so a
+# UDLD frame on the wire is itself the exposure signal. It carries no version
+# banner, so OS-family attribution reuses the CDP identity of the SAME source MAC
+# (CVE-2021-1368 8.8 port-channel RCE on NX-OS/FXOS/UCS; CVE-2021-34714 7.4
+# reload DoS, which — unlike CDPwn — DOES affect plain IOS/IOS-XE). Ported from
+# the standalone cdpwatch v5 (CDP + UDLD/DTP/PAgP family parser).
+_UDLD_SNAP_SIG = b'\xaa\xaa\x03\x00\x00\x0c\x01\x11'
+_UDLD_HDR_LEN = 4                 # version/opcode(1) flags(1) checksum(2)
+_UDLD_MAX_STRING = 256
+_UDLD_STRING_TLVS = {0x0001: 'device_id', 0x0002: 'port_id', 0x0006: 'device_name'}
+_UDLD_SEV = {'UDLD-001': 'info', 'UDLD-002': 'low', 'UDLD-020': 'high',
+             'UDLD-021': 'high', 'UDLD-022': 'info', 'UDLD-040': 'critical',
+             'UDLD-041': 'critical', 'UDLD-042': 'high', 'UDLD-043': 'medium'}
+_UDLD_ATTACK_CODES = ('UDLD-040', 'UDLD-041', 'UDLD-042')
+_UDLD_FAMILIES = [
+    (re.compile(r"NX[\s-]?OS|Nexus|FXOS|Firepower|\bUCS\b"), 'UDLD-020',
+     ['CVE-2021-1368', 'CVE-2021-34714'],
+     "UDLD enabled on an NX-OS / FXOS / UCS neighbour — verify against "
+     "CVE-2021-1368 (8.8, code execution; needs a UDLD-enabled port channel) "
+     "and CVE-2021-34714 (7.4, reload DoS)"),
+    (re.compile(r"IOS[\s-]?XR|IOS[\s-]?XE|\bIOS\b"), 'UDLD-021',
+     ['CVE-2021-34714'],
+     "UDLD enabled on an IOS / IOS-XE / IOS-XR neighbour — verify against "
+     "CVE-2021-34714 (7.4, reload DoS; unlike the CDPwn five, this one DOES "
+     "affect IOS and IOS-XE)"),
+]
+
+
+def _udld_parse_frame(raw):
+    """Bounds-checked byte-level parse of one raw UDLD frame (SNAP PID 0x0111).
+    Returns {src, tlvs, malformations} or None. The TLV walk is bounded by the
+    802.3 length field (padding-safe) and records UDLD-040 overrun / UDLD-041
+    underflow / UDLD-042 oversized-string / UDLD-043 trailing-data; never raises."""
+    if len(raw) < 14:
+        return None
+    idx = raw.find(_UDLD_SNAP_SIG)
+    if idx < 2 or idx > 32:
+        return None
+    off = idx + len(_UDLD_SNAP_SIG)
+    end = len(raw)
+    lenfield = int.from_bytes(raw[idx - 2:idx], 'big')
+    if 0 < lenfield <= 1500 and idx + lenfield <= len(raw):
+        end = idx + lenfield
+    r = {'src': ':'.join('%02x' % b for b in raw[6:12]), 'tlvs': {}, 'malformations': []}
+    tail = raw[end:]
+    if tail and tail.strip(b'\x00'):
+        r['malformations'].append(
+            ('UDLD-043', '%d byte(s) of non-zero data after the declared 802.3 '
+             'length' % len(tail)))
+    if off + _UDLD_HDR_LEN > end:
+        r['malformations'].append(('UDLD-040', 'UDLD header truncated'))
+        return r
+    p = off + _UDLD_HDR_LEN
+    while p + 4 <= end:
+        ttype = int.from_bytes(raw[p:p + 2], 'big')
+        tlen = int.from_bytes(raw[p + 2:p + 4], 'big')
+        if tlen < 4:
+            r['malformations'].append(
+                ('UDLD-041', 'TLV type 0x%04x length %d < 4 (underflow)' % (ttype, tlen)))
+            break
+        ve = p + tlen
+        overran = ve > end
+        if overran:
+            r['malformations'].append(
+                ('UDLD-040', 'TLV type 0x%04x length %d overruns frame' % (ttype, tlen)))
+            ve = end
+        if ttype in _UDLD_STRING_TLVS:
+            s = raw[p + 4:ve].decode('latin-1', 'replace')
+            r['tlvs'][_UDLD_STRING_TLVS[ttype]] = s
+            if len(s) > _UDLD_MAX_STRING:
+                r['malformations'].append(
+                    ('UDLD-042', '%s length %d > %d (oversized string TLV)'
+                     % (_UDLD_STRING_TLVS[ttype], len(s), _UDLD_MAX_STRING)))
+        if overran:
+            break
+        p = ve
+    return r
+
+
+def _udld_process(fr, add, cdp_idents):
+    """Fold one UDLD frame's findings in via `add`; screen the speaker against the
+    CDP identity (platform/version/device-id) of the same MAC in `cdp_idents`."""
+    pr = _udld_parse_frame(fr)
+    if not pr:
+        return
+    src = pr['src']
+    add('UDLD-001', src, 'UDLD is enabled here — UDLD is off by default and both '
+        'UDLD CVEs (CVE-2021-1368 / CVE-2021-34714) require it enabled')
+    for code, detail in pr['malformations']:
+        add(code, src, detail)
+    dev = pr['tlvs'].get('device_id') or pr['tlvs'].get('device_name')
+    if dev:
+        add('UDLD-002', src, 'UDLD advertises device identity %r' % dev[:48])
+    hay = cdp_idents.get(src, '')
+    if hay.strip():
+        hit = False
+        for rx, code, cves, note in _UDLD_FAMILIES:
+            if rx.search(hay):
+                add(code, src, note, cves)
+                hit = True
+        if not hit:
+            add('UDLD-022', src, 'UDLD enabled; the CDP identity %r matches no '
+                'known-affected OS family' % hay.strip()[:48])
+    else:
+        add('UDLD-022', src, 'UDLD enabled but no CDP identity seen for this source '
+            '— attribute by hand; check CVE-2021-1368 / CVE-2021-34714')
 
 
 def _cdp_scan_format_specifiers(s):
@@ -15462,11 +16987,91 @@ def _cdp_scan_format_specifiers(s):
     return out
 
 
+# Address-record protocol types inside a CDP Addresses / Mgmt-Addr TLV. Each
+# record is proto_type(1) proto_len(1) proto(proto_len) addr_len(2) addr(addr_len).
+# LCDPwn abused two shapes the outer-TLV bounds check cannot see:
+#   * a proto_type that disagrees with proto_len — a victim switches on the type
+#     to size the protocol field but copies proto_len bytes, so a type=NLPID
+#     (requires 1) carrying proto_len 255 walks off the record -> CDP-053.
+#   * a declared count / inner length that disagrees with the bytes present —
+#     allocate for the declared size, copy the other one -> CDP-054, the class of
+#     CVE-2023-41910 (lldpd cdp_decode Addresses-TLV out-of-bounds read).
+# Neither is reachable by checking the outer TLV length alone, which is all this
+# module did before (it read the 4-byte count and stopped).
+_CDP_PROTO_TYPE_LEN = {1: 1, 2: 8}        # 1=NLPID (1B), 2=802.2/SNAP (8B)
+_CDP_PROTO_ADDR_LEN = {0xCC: 4}           # NLPID 0xCC = IPv4 -> 4-byte address
+_CDP_SNAP_IPV6_SUFFIX = b'\x86\xdd'       # 802.2/SNAP ...86DD = IPv6 -> 16-byte address
+
+
+def _cdp_walk_address_records(r, value, count):
+    """Walk the individual records inside a CDP Addresses/Mgmt-Addr TLV value,
+    recording protocol_type/length mismatches (CDP-053) and allocation/copy size
+    discrepancies (CDP-054). value is the full TLV value (its first 4 bytes are
+    the record count). Never raises."""
+    body = value[4:]
+    pos = seen = 0
+    while pos < len(body):
+        if pos + 2 > len(body):
+            r['malformations'].append(
+                ('CDP-054', 'address record %d truncated: %d byte(s) left, need 2 for '
+                 'proto_type/proto_len' % (seen, len(body) - pos)))
+            return
+        ptype = body[pos]
+        plen = body[pos + 1]
+        expect = _CDP_PROTO_TYPE_LEN.get(ptype)
+        if expect is None:
+            r['malformations'].append(
+                ('CDP-053', 'address record %d declares unknown protocol_type %d '
+                 '(expected 1=NLPID or 2=802.2)' % (seen, ptype)))
+        elif plen != expect:
+            r['malformations'].append(
+                ('CDP-053', 'address record %d declares protocol_type %d but '
+                 'protocol_length %d (type %d requires %d) — LCDPwn protocol_type shape'
+                 % (seen, ptype, plen, ptype, expect)))
+        pos += 2
+        if pos + plen > len(body):
+            r['malformations'].append(
+                ('CDP-054', 'address record %d protocol field of %d byte(s) overruns the '
+                 'TLV (%d left)' % (seen, plen, len(body) - pos)))
+            return
+        proto = body[pos:pos + plen]
+        pos += plen
+        if pos + 2 > len(body):
+            r['malformations'].append(
+                ('CDP-054', 'address record %d truncated before address_length' % seen))
+            return
+        alen = int.from_bytes(body[pos:pos + 2], 'big')
+        pos += 2
+        if pos + alen > len(body):
+            r['malformations'].append(
+                ('CDP-054', 'address record %d address_length %d overruns the TLV (%d '
+                 'byte(s) present) — allocation/copy size discrepancy'
+                 % (seen, alen, len(body) - pos)))
+            return
+        # the address length must match the protocol the record itself names
+        want = _CDP_PROTO_ADDR_LEN.get(proto[0]) if plen == 1 and proto else None
+        if plen == 8 and proto.endswith(_CDP_SNAP_IPV6_SUFFIX):
+            want = 16
+        if want is not None and alen != want:
+            r['malformations'].append(
+                ('CDP-054', 'address record %d names a %d-byte protocol but declares '
+                 'address_length %d' % (seen, want, alen)))
+        pos += alen
+        seen += 1
+    r['address_records'] = seen
+    if count != seen:
+        r['malformations'].append(
+            ('CDP-054', 'Addresses TLV declares %d address(es) but %d record(s) are '
+             'present — allocation/copy size discrepancy' % (count, seen)))
+
+
 def _cdp_dispatch_tlv(r, ttype, value):
     if ttype in _CDP_STRING_TLVS:
         r['tlvs'][_CDP_STRING_TLVS[ttype]] = value.decode('latin-1', 'replace')
     elif ttype in (0x0016, 0x0002) and len(value) >= 4:   # Mgmt-Addr / Addresses
-        r['address_count'] = int.from_bytes(value[:4], 'big')
+        count = int.from_bytes(value[:4], 'big')
+        r['address_count'] = count
+        _cdp_walk_address_records(r, value, count)
     elif ttype in (0x001a, 0x001b, 0x0010):               # Power Req/Avail/Consumption
         r['tlvs']['power'] = True
         if ttype == 0x001a and len(value) >= 4:           # Power Request: 4B hdr + levels
@@ -15527,12 +17132,17 @@ def _cdp_cdpwn_scan(frames):
         if key in seen:
             return
         seen.add(key)
-        out.append({'code': code, 'severity': _CDPWN_SEV.get(code, 'medium'),
+        out.append({'code': code,
+                    'severity': _CDPWN_SEV.get(code) or _UDLD_SEV.get(code) or 'medium',
                     'src': src, 'detail': detail, 'cves': cves or []})
 
+    cdp_idents = {}          # src MAC -> CDP identity hay, for UDLD attribution
+    udld_frames = []
     for fr in frames:
         pr = _cdp_parse_frame(fr)
         if not pr:
+            if _UDLD_SNAP_SIG in fr:
+                udld_frames.append(fr)
             continue
         src = pr['src']
         for code, detail in pr['malformations']:
@@ -15570,9 +17180,14 @@ def _cdp_cdpwn_scan(frames):
                 "flushes neighbour tables")
         hay = ' '.join(str(tl.get(k, '')) for k in ('platform', 'version', 'device_id'))
         if hay.strip():
+            cdp_idents[src] = hay
             for rx, code, cves, note in _CDPWN_FAMILIES:
                 if rx.search(hay):
                     add(code, src, note, cves)
+    # Second pass: UDLD speakers, attributed to a CVE family via the CDP identity
+    # of the same MAC collected above.
+    for fr in udld_frames:
+        _udld_process(fr, add, cdp_idents)
     return out
 
 
@@ -15584,7 +17199,8 @@ def _apply_cdpwn(result, findings):
     if not findings:
         return
     result['cdpwn'] = findings                 # full per-finding detail for the UI
-    attack = [f for f in findings if f['code'] in _CDPWN_ATTACK_CODES]
+    attack = [f for f in findings
+              if f['code'] in _CDPWN_ATTACK_CODES or f['code'] in _UDLD_ATTACK_CODES]
     if attack and result.get('verdict') in ('clean', 'cdp-enabled',
                                             'trailing-data', None):
         result['verdict'] = 'cdpwn'
@@ -15601,12 +17217,13 @@ def _apply_cdpwn(result, findings):
 
 
 def _cdp_capture(interface, seconds):
-    """One passive tcpdump window over CDP frames -> (raw, error). Uses -e for the
-    sending MAC; the BPF isolates CDP (PID 0x2000) from the other protocols that
-    share the Cisco group MAC (DTP/VTP/UDLD/PAgP)."""
+    """One passive tcpdump window over CDP + UDLD frames -> (raw, error). Uses -e
+    for the sending MAC; the BPF admits CDP (PID 0x2000) and UDLD (PID 0x0111) off
+    the shared Cisco group MAC, leaving DTP/VTP/PAgP to their own watchers."""
     if not _have('tcpdump'):
         return '', 'tcpdump is not installed. Click Install to add it.'
-    bpf = 'ether dst 01:00:0c:cc:cc:cc and ether[20:2] = 0x2000'
+    bpf = ('ether dst 01:00:0c:cc:cc:cc and '
+           '(ether[20:2] = 0x2000 or ether[20:2] = 0x0111)')
     res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-e',
                 '-nn', '-t', '-v', '-xx', '-s', '1500', '-c', '20000', bpf],
                timeout=seconds + 8)
@@ -15789,6 +17406,12 @@ def _cdp_selftest():
             def _cdp_tlv(t, v):
                 return t.to_bytes(2, 'big') + (len(v) + 4).to_bytes(2, 'big') + v
 
+            def _udld_bytes(tlvs, src='de:ad:be:ef:00:0c'):
+                pay = bytes([0x20, 0x00, 0x00, 0x00]) + tlvs   # ver1/opcode0 flags0 cksum0
+                return _sraw(Dot3(dst='01:00:0c:cc:cc:cc', src=src)
+                             / LLC(dsap=0xaa, ssap=0xaa, ctrl=3)
+                             / SNAP(OUI=0x00000c, code=0x0111) / pay)
+
             cdpwn_cases = [
                 ('cdpwn-oversized-deviceid', _cdp_bytes(_cdp_tlv(0x0001, b'A' * 300)), 'CDP-042'),
                 ('cdpwn-oversized-portid', _cdp_bytes(_cdp_tlv(0x0003, b'B' * 200)), 'CDP-043'),
@@ -15800,6 +17423,24 @@ def _cdp_selftest():
                 ('cdpwn-ttl-zero', _cdp_bytes(_cdp_tlv(0x0001, b'sw1'), ttl=0), 'CDP-050'),
                 ('cdpwn-nxos-screen',
                  _cdp_bytes(_cdp_tlv(0x0006, b'cisco Nexus N9K')), 'CDP-023'),
+                ('cdpwn-fortiswitch-screen',
+                 _cdp_bytes(_cdp_tlv(0x0006, b'FortiSwitch-424E-FPOE')), 'CDP-027'),
+                ('cdpwn-lldpd-screen',
+                 _cdp_bytes(_cdp_tlv(0x0005, b'lldpd 1.0.5')), 'CDP-028'),
+                ('cdpwn-cisco-ata-screen',
+                 _cdp_bytes(_cdp_tlv(0x0006, b'Cisco ATA 191')), 'CDP-029'),
+                ('cdpwn-unified-cm-screen',
+                 _cdp_bytes(_cdp_tlv(0x0006, b'Cisco Unified Communications Manager')),
+                 'CDP-030'),
+                # LCDPwn Addresses-record shapes the outer-length check misses:
+                ('cdpwn-addr-proto-type-mismatch',          # proto_type 1 (NLPID) / len 8
+                 _cdp_bytes(_cdp_tlv(0x0016, (1).to_bytes(4, 'big') + bytes([1, 8])
+                            + b'\x00' * 8 + (4).to_bytes(2, 'big') + b'\x00' * 4)),
+                 'CDP-053'),
+                ('cdpwn-addr-length-overrun',               # addr_len 100, 0 bytes present
+                 _cdp_bytes(_cdp_tlv(0x0016, (1).to_bytes(4, 'big') + bytes([1, 1])
+                            + b'\xcc' + (100).to_bytes(2, 'big'))),
+                 'CDP-054'),
                 ('cdpwn-tlv-underflow', _cdp_bytes(b'\x00\x01\x00\x02'), 'CDP-041'),
             ]
             for _nm, _fr, _code in cdpwn_cases:
@@ -15810,11 +17451,66 @@ def _cdp_selftest():
             scenarios.append({'name': 'cdpwn-benign-silent', 'expect': 'no findings',
                               'got': [x['code'] for x in _cdp_cdpwn_scan([_benign])],
                               'pass': not _cdp_cdpwn_scan([_benign])})
+            # ATA-not-phone FP guard: an ATA advertising a phone-style SEP device-id
+            # must screen as CDP-029 (ATA) and NOT CDP-020 (IP Phone).
+            _ata = _cdp_bytes(_cdp_tlv(0x0001, b'SEP001122334455')
+                              + _cdp_tlv(0x0006, b'Cisco ATA 191'))
+            _ata_codes = {x['code'] for x in _cdp_cdpwn_scan([_ata])}
+            scenarios.append({'name': 'cdpwn-ata-not-phone',
+                              'expect': 'CDP-029 & not CDP-020', 'got': sorted(_ata_codes),
+                              'pass': 'CDP-029' in _ata_codes and 'CDP-020' not in _ata_codes})
+            # a well-formed NLPID/IPv4 address record stays silent (no CDP-053/054)
+            _addr_ok = _cdp_bytes(_cdp_tlv(0x0016, (1).to_bytes(4, 'big') + bytes([1, 1])
+                                  + b'\xcc' + (4).to_bytes(2, 'big') + bytes([10, 0, 0, 1])))
+            _addr_codes = {x['code'] for x in _cdp_cdpwn_scan([_addr_ok])}
+            scenarios.append({'name': 'cdpwn-addr-wellformed-silent',
+                              'expect': 'no CDP-053/054', 'got': sorted(_addr_codes),
+                              'pass': 'CDP-053' not in _addr_codes and 'CDP-054' not in _addr_codes})
             # verdict escalation: an attack shape sets verdict 'cdpwn'
             _res = {'verdict': 'clean', 'reasons': ['CDP speakers all match the trusted baseline']}
             _apply_cdpwn(_res, _cdp_cdpwn_scan([cdpwn_cases[0][1]]))
             scenarios.append({'name': 'cdpwn-verdict-escalates', 'expect': 'cdpwn',
                               'got': _res['verdict'], 'pass': _res['verdict'] == 'cdpwn'})
+
+            # --- UDLD (v5): presence, malformed TLVs, and CDP-identity screening.
+            _udld_cases = [
+                ('udld-presence', _udld_bytes(_cdp_tlv(0x0001, b'sw1')), 'UDLD-001'),
+                ('udld-device-id', _udld_bytes(_cdp_tlv(0x0001, b'coreSW.lab')), 'UDLD-002'),
+                ('udld-overrun',
+                 _udld_bytes(b'\x00\x01' + (5000).to_bytes(2, 'big') + b'sw'), 'UDLD-040'),
+                ('udld-underflow', _udld_bytes(b'\x00\x01\x00\x02'), 'UDLD-041'),
+                ('udld-oversized', _udld_bytes(_cdp_tlv(0x0001, b'A' * 300)), 'UDLD-042'),
+                ('udld-trailing', _udld_bytes(_cdp_tlv(0x0001, b'sw1')) + b'\xde\xad\xbe\xef',
+                 'UDLD-043'),
+            ]
+            for _nm, _fr, _code in _udld_cases:
+                _ucodes = {x['code'] for x in _cdp_cdpwn_scan([_fr])}
+                scenarios.append({'name': _nm, 'expect': _code, 'got': sorted(_ucodes),
+                                  'pass': _code in _ucodes})
+            # screening: a UDLD speaker attributed via the CDP identity of the same MAC
+            _nx = _cdp_cdpwn_scan([_cdp_bytes(_cdp_tlv(0x0006, b'cisco Nexus N9K')),
+                                   _udld_bytes(_cdp_tlv(0x0001, b'nx-sw'))])
+            scenarios.append({'name': 'udld-screen-nxos (CVE-2021-1368)',
+                              'expect': 'UDLD-020 + CVE-2021-1368',
+                              'got': sorted({x['code'] for x in _nx}),
+                              'pass': any(x['code'] == 'UDLD-020'
+                                          and 'CVE-2021-1368' in x['cves'] for x in _nx)})
+            _ios = _cdp_cdpwn_scan([_cdp_bytes(_cdp_tlv(0x0005, b'Cisco IOS Software 15.2')),
+                                    _udld_bytes(_cdp_tlv(0x0001, b'ios-sw'))])
+            scenarios.append({'name': 'udld-screen-ios (CVE-2021-34714)',
+                              'expect': 'UDLD-021',
+                              'got': sorted({x['code'] for x in _ios}),
+                              'pass': 'UDLD-021' in {x['code'] for x in _ios}})
+            # no CDP identity for the source -> honest UDLD-022, no CVE attributed
+            _unatt = {x['code'] for x in _cdp_cdpwn_scan(
+                [_udld_bytes(_cdp_tlv(0x0001, b'mystery'), src='de:ad:be:ef:00:99')])}
+            scenarios.append({'name': 'udld-unattributed', 'expect': 'UDLD-022',
+                              'got': sorted(_unatt), 'pass': 'UDLD-022' in _unatt})
+            # a UDLD malformed shape escalates the verdict to cdpwn
+            _ures = {'verdict': 'clean', 'reasons': ['CDP speakers all match the trusted baseline']}
+            _apply_cdpwn(_ures, _cdp_cdpwn_scan([_udld_bytes(b'\x00\x01\x00\x02')]))
+            scenarios.append({'name': 'udld-verdict-escalates', 'expect': 'cdpwn',
+                              'got': _ures['verdict'], 'pass': _ures['verdict'] == 'cdpwn'})
 
             try:
                 os.remove(pcap_path)
@@ -17865,9 +19561,10 @@ _OSPF_ADVISORIES = {
         'detail': ('Auth Type 0 (none) or 1 (plaintext) lets any host on the '
                    'segment inject or spoof LSAs — the enabler for persistent '
                    'route poisoning, disguised-LSA and fight-back-bypass attacks '
-                   '(Nakibly et al.). Enable RFC 5709 HMAC-SHA cryptographic auth '
-                   '(OSPFv2) or IPsec AH/ESP (OSPFv3).'),
-        'refs': ['RFC 5709'],
+                   '(Nakibly et al.; the Cisco IOS OSPF LSA-manipulation shape '
+                   'CVE-2013-0149 is the same no-auth-enabled class). Enable RFC 5709 '
+                   'HMAC-SHA cryptographic auth (OSPFv2) or IPsec AH/ESP (OSPFv3).'),
+        'refs': ['RFC 5709', 'CVE-2013-0149'],
     },
     'opaque_lsa': {
         'severity': 'medium',
@@ -17883,9 +19580,16 @@ _OSPF_ADVISORIES = {
                    'and patch. The OSPF Segment-Routing opaque-LSA sub-TLV overruns '
                    '(CVE-2024-31950 / CVE-2024-31951) are byte-level detected by SR-MPLS '
                    'Watch (SRM-SR-TLV-OVERRUN). Cisco ASA/FTD have had equivalent '
-                   'OSPF-LSA DoS advisories.'),
+                   'OSPF-LSA DoS advisories. On the OSPFv3 (IPv6) side the same '
+                   'malformed-LSA DoS class spans Quagga/FRR ospf6d (CVE-2011-3323 '
+                   'invalid IPv6 prefix length, CVE-2018-14880 OSPFv3 parser over-read), '
+                   'Cisco IOS/IOS-XR (CVE-2018-0466, CVE-2013-5565) and Arista EOS '
+                   '(CVE-2025-8872) — version-specific, so named as posture, not '
+                   'byte-detected by this text watcher.'),
         'refs': ['CVE-2024-27913', 'CVE-2025-61107', 'CVE-2025-61105', 'CVE-2025-61099',
-                 'CVE-2025-61103', 'CVE-2025-61104', 'CVE-2025-61106', _OSPF_OSV_URL],
+                 'CVE-2025-61103', 'CVE-2025-61104', 'CVE-2025-61106', 'CVE-2011-3323',
+                 'CVE-2018-14880', 'CVE-2018-0466', 'CVE-2013-5565', 'CVE-2025-8872',
+                 _OSPF_OSV_URL],
     },
 }
 
@@ -18584,23 +20288,27 @@ _BGP_ADVISORIES = {
         'severity': 'medium',
         'title': 'Patch bgpd for malformed BGP-UPDATE attribute crashes',
         'detail': ('Malformed BGP path attributes have repeatedly crashed router '
-                   'BGP daemons (e.g. FRRouting CVE-2023-38802 / Juniper rpd '
-                   'CVE-2024-30395 via a corrupted Tunnel-Encapsulation attribute; '
+                   'BGP daemons (e.g. FRRouting CVE-2023-38802 / CVE-2024-44070 '
+                   '(bgp_attr_encap) / Juniper rpd CVE-2024-30395 via a corrupted '
+                   'Tunnel-Encapsulation attribute; '
                    'CERT VU#347067 covers multiple implementations). The v4 corpus '
                    'spans FRR bgpd (zero-length path-attributes CVE-2023-41358, '
                    'MP_UNREACH CVE-2023-47234, EOR-bypass CVE-2023-47235, Prefix-SID '
                    'CVE-2024-31948, FlowSpec CVE-2026-37457, MP_REACH CVE-2026-37458, '
                    'NHC-TLV CVE-2026-37459, OPEN optional-parameter CVE-2022-40302 / '
                    'CVE-2022-43681) and GoBGP (IPv6 extended-community CVE-2026-37461, '
-                   'UPDATE length underflow CVE-2026-37462). The malformed bytes are a '
+                   'UPDATE length underflow CVE-2026-37462) and MikroTik RouterOS '
+                   '(labelled-VPN MP_REACH NLRI prefix-length underflow CVE-2026-93345). '
+                   'The malformed bytes are a '
                    'byte-level parser signature the passive text watcher does not '
                    'reconstruct, and the software version is not visible on the wire — '
                    'these are named as exposure posture; check OSV for your BGP build '
                    'and patch, or run the standalone BGP tap for byte-level detection.'),
-        'refs': ['CVE-2023-38802', 'CVE-2024-30395', 'CVE-2023-41358', 'CVE-2023-47234',
-                 'CVE-2023-47235', 'CVE-2024-31948', 'CVE-2022-40302', 'CVE-2022-43681',
-                 'CVE-2026-37457', 'CVE-2026-37458', 'CVE-2026-37459', 'CVE-2026-37461',
-                 'CVE-2026-37462', 'VU#347067', _BGP_OSV_URL],
+        'refs': ['CVE-2023-38802', 'CVE-2024-30395', 'CVE-2024-44070', 'CVE-2023-41358',
+                 'CVE-2023-47234', 'CVE-2023-47235', 'CVE-2024-31948', 'CVE-2022-40302',
+                 'CVE-2022-43681', 'CVE-2026-37457', 'CVE-2026-37458', 'CVE-2026-37459',
+                 'CVE-2026-37461', 'CVE-2026-37462', 'CVE-2026-93345',
+                 'VU#347067', _BGP_OSV_URL],
     },
 }
 
@@ -19357,6 +21065,54 @@ def _bgp_selftest():
     return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
 
 
+_BGP_PATHWATCH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'python', 'bgp_pathwatch')
+
+
+def _bgp_pathwatch_tier_selftest(testfile, label):
+    """Run a vendored BGP Pathwatch v6 passive-analysis tier's offline test suite
+    (pure-stdlib, no root, no network) in its own interpreter and adapt the
+    'N/N passing' result to the aggregator's scenarios shape. The tier modules use
+    bare sibling imports (bgp/bgpcve/...), so they run from their isolated vendored
+    directory `python/bgp_pathwatch/` rather than polluting `python/`. The subprocess
+    chdir's into that directory first, because the tests resolve bare imports and
+    their own source-scan passivity checks relative to it."""
+    code = ('import os, sys, runpy; d = %r; os.chdir(d); sys.path.insert(0, d); '
+            'runpy.run_path(os.path.join(d, %r), run_name="__main__")'
+            % (_BGP_PATHWATCH_DIR, testfile))
+    res = _run([sys.executable or 'python3', '-c', code], timeout=120)
+    out = (res.get('out') or '') + (res.get('err') or '')
+    m = re.search(r'(\d+)\s*/\s*(\d+)\s+passing', out)
+    if not m:
+        return {'success': False, 'scenarios': [
+            {'name': '%s suite' % label, 'pass': False, 'expect': 'N/N passing',
+             'got': 'rc %s %s' % (res.get('rc'), out.strip()[-160:])}]}
+    passed, total = int(m.group(1)), int(m.group(2))
+    scen = [{'name': '%s check %d' % (label, i + 1), 'pass': True} for i in range(passed)]
+    if passed != total:
+        scen.append({'name': '%s suite' % label, 'pass': False,
+                     'expect': '%d/%d' % (total, total), 'got': '%d/%d' % (passed, total)})
+    return {'success': passed == total and total > 0, 'scenarios': scen}
+
+
+def _bgptap_selftest():
+    """BGP Pathwatch v6 passive-tap tier (dual-stack L3 parse, IPv6 extension-header
+    walk, marker-resync TCP reassembly, BGP message framing) — 57 offline checks."""
+    return _bgp_pathwatch_tier_selftest('taptest.py', 'bgp-tap')
+
+
+def _bgpsec_selftest():
+    """BGP Pathwatch v6 BGPsec (RFC 8205) posture + downgrade tier — 47 offline
+    checks (20 codes, no CVEs; no signature validation — that would not be passive)."""
+    return _bgp_pathwatch_tier_selftest('bgpsectest.py', 'bgpsec')
+
+
+def _bgpsrte_selftest():
+    """BGP Pathwatch v6 SR Policy (RFC 9830 SAFI 73) + BGP-LS (RFC 9552, AFI 16388)
+    decode and injection-posture tier — 65 offline checks (23 codes, no CVEs)."""
+    return _bgp_pathwatch_tier_selftest('srtetest.py', 'bgp-srte')
+
+
 def _tls_selftest():
     """Adapt tls_watch.selftest() to the aggregator's scenarios/scapy shape."""
     r = tls_watch.selftest()
@@ -19499,8 +21255,13 @@ _CISCO_VXLAN_TRILL_BPF = ('(udp port 4789 and '
 _CISCO_GUARD_BPF = (
     'udp port 161 or udp port 162 or udp port 546 or udp port 547 or '
     'udp port 500 or udp port 4500 or udp port 5246 or udp port 5247 or '
+    'udp port 4341 or udp port 4342 or '
+    'tcp port 862 or udp port 862 or udp port 1967 or '
     'tcp port 23 or tcp port 80 or '
-    'tcp port 8080 or tcp port 8443 or ' + _CISCO_VXLAN_TRILL_BPF + ' or '
+    'tcp port 8080 or tcp port 8443 or '
+    # v8: cleartext model-driven-telemetry ports (gNMI/gRPC dial-out) for CG-117 —
+    # IOS-XE `gnxi server` 50052, IOS-XR gRPC 57400, and the mis-set-cleartext 9339.
+    'tcp port 50052 or tcp port 57400 or tcp port 9339 or ' + _CISCO_VXLAN_TRILL_BPF + ' or '
     + _GUARD_IP6_EXTHDR_BPF)
 # `udp port 4789` admits VXLAN (v4 and v6 underlay) so JNPR-061 can inspect the
 # VXLAN/overlayd header for the CVE-2021-0254 structural anomaly. Unlike the Cisco
@@ -19824,6 +21585,85 @@ _CISCO_NXOS_VER_RE = re.compile(r'NX-OS.{0,40}?[Vv]ersion\s+(\d+\.\d+\([^)]+\))'
 # Telnet CLI shell-escape / command-injection metacharacters (CVE-2024-20399 shape).
 _CISCO_SHELL_ESCAPE_RE = re.compile(rb'[;`|]|\$\(|&&|\|\||>\s*/|run\s+bash|feature\s')
 
+# --- Version screening (CG-004/005): train -> first-fixed (maj, min) band. A
+# train below its fixed release is flagged as a POSTURE NOTE ("verify THIS
+# device"), never a verdict — the cdpwatch discipline. A train absent from the
+# table is treated as unscreenable, not clean. Advisory-sourced; ported from
+# ciscoguard v6's IOSXE_CVE_TRAINS / NXOS_CVE_TRAINS. None = branch affected,
+# no fixed release listed.
+_CISCO_IOSXE_CVE_TRAINS = {(17, 9): (17, 9, 7), (17, 12): (17, 12, 5),
+                           (17, 15): (17, 15, 4), (17, 18): (17, 18, 2),
+                           (26, 1): None}
+_CISCO_NXOS_CVE_TRAINS = {(9, 3): (9, 3, 13), (10, 2): (10, 2, 8),
+                          (10, 3): (10, 3, 5), (10, 4): (10, 4, 3)}
+# The advisory bundles each version-screen cites (the August 2026 IOS XE wave +
+# the SNMP CVE for IOS XE; the NX-OS trio for NX-OS).
+_CISCO_IOSXE_CVES = ('CVE-2026-20272', 'CVE-2026-20267', 'CVE-2026-20268',
+                     'CVE-2026-20269', 'CVE-2026-20270', 'CVE-2026-20271',
+                     'CVE-2026-20273', 'CVE-2025-20352')
+_CISCO_NXOS_CVES = ('CVE-2025-20241', 'CVE-2025-20111', 'CVE-2024-20399')
+
+# --- Cisco Small Business switch web-UI cluster (CG-113, the May 2023 cluster).
+# Model families matched in an HTTP Server header / banner; the 220 Series is
+# CONFIRMED NOT VULNERABLE by Cisco and gated out (an in-scope-but-clean switch,
+# not an out-of-scope platform). Ported from ciscoguard v6.
+_CISCO_SMB_MODEL_RE = re.compile(
+    r'\b(?:CBS|Business)\s*-?\s*(?:250|350)\b'
+    r'|\b(?:SF|SG)\s*-?\s*(?:200|300|302|500|500X)\b'
+    r'|\bSmall\s+Business\s+(?:200|300|500)\b'
+    r'|\b(?:SF|SG)\s*-?\s*(?:250|350|350X|355|550X)\b'
+    r'|\b(?:250|350|350X|550X)\s+Series\b', re.I)
+_CISCO_SMB_NOT_VULN_RE = re.compile(
+    r'\b(?:SF|SG|CBS)\s*-?\s*220\b|\b220\s+Series\b|\bBusiness\s+220\b', re.I)
+# RCE (4×9.8) + DoS (4×8.6) + info-disclosure — the full CG-113 cluster.
+_CISCO_SMB_CVES = ('CVE-2023-20159', 'CVE-2023-20160', 'CVE-2023-20161',
+                   'CVE-2023-20189', 'CVE-2023-20024', 'CVE-2023-20156',
+                   'CVE-2023-20157', 'CVE-2023-20158', 'CVE-2023-20162',
+                   # v8: the EOL SB 200/300/500 family also carries the default
+                   # privileged-account re-enable (CG-012 in ciscoguard v8).
+                   'CVE-2018-15439')
+
+# --- Model-driven telemetry (CG-117, v8): the RFC 9113 §3.4 cleartext HTTP/2
+# connection preface — the definitive marker that a gNMI/gRPC telemetry plane is
+# running unencrypted (over TLS, h2 is ALPN-negotiated and no preface is visible).
+_CISCO_H2_PREFACE = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
+
+# --- LISP (CG-107/240/241, CVE-2024-20311): control UDP/4342, data UDP/4341.
+_CISCO_LISP_PORTS = (4341, 4342)
+_LISP_TYPES = frozenset((1, 2, 3, 4, 6, 8))   # map-request .. encapsulated-control
+_LISP_AFI_LEN = {0: 0, 1: 4, 2: 16}           # 0=none, 1=IPv4, 2=IPv6
+
+# --- TWAMP / IP SLA (CG-014/114/115/116/294, v7). TWAMP-Control is TCP/862,
+# TWAMP-Light test UDP/862; Cisco's IP SLA Responder control is UDP/1967. Both
+# TWAMP CVEs (CVE-2025-20154 OOB array access reload, CVE-2021-34720 IP SLA/TWAMP
+# socket mishandling) are unauthenticated and need the control plane reachable,
+# so presence is the exposure. The 64-byte Server Greeting carries the offered
+# Modes bitmap (offset 12); the Unauthenticated bit (0x1) means usable with no
+# shared secret, and a nonzero MBZ tail (octets 52..64) is a definite malformation.
+_TWAMP_PORT = 862
+_IPSLA_CONTROL_PORT = 1967
+_TWAMP_CVES = ['CVE-2025-20154', 'CVE-2021-34720']
+_TWAMP_LEN_GREETING = 64
+_TWAMP_MODE_UNAUTH = 0x1
+# Catalyst 9800 / Embedded WLC identity -> the CVE-2025-20188 (10.0 OOB AP-image
+# download / hardcoded-JWT upload) precondition. Gated on the identity, not a bare
+# 8443 match, to avoid firing on every HTTPS flow in the broad guard capture.
+_CISCO_WLC_RE = re.compile(r'\b(?:C9800|Catalyst\s*9800|Wireless\s*Controller|'
+                           r'Embedded\s*Wireless|\bEWC\b|AireOS)\b', re.I)
+
+
+def _twamp_greeting_issues(payload):
+    """For a 64-byte TWAMP Server Greeting, return (unauth_offered, malformed).
+    unauth_offered = the Modes bitmap advertises Unauthenticated mode; malformed
+    = the MBZ tail is nonzero. ('', '') when it is not a greeting."""
+    p = payload or b''
+    if len(p) < _TWAMP_LEN_GREETING:
+        return (False, False)
+    modes = int.from_bytes(p[12:16], 'big')
+    unauth = bool(modes & _TWAMP_MODE_UNAUTH)
+    malformed = any(p[52:64])
+    return (unauth, malformed)
+
 _CISCO_GUARD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  'data', 'cisco_guard.json')
 _cisco_guard_lock = threading.Lock()
@@ -19912,24 +21752,93 @@ def _guard_emit_jsonl(module, result):
         pass
 
 
+def _cisco_ver_tuple(ver):
+    """A free-text Cisco version -> (maj, min, patch). Handles IOS-XE dotted
+    (17.12.3) and NX-OS a.b(c) (10.2(5)); returns None when unparseable."""
+    if not ver:
+        return None
+    m = re.match(r'(\d+)\.(\d+)(?:\.(\d+)|\((\d+)\))?', ver.strip())
+    if not m:
+        return None
+    patch = m.group(3) or m.group(4) or '0'
+    try:
+        return (int(m.group(1)), int(m.group(2)), int(patch))
+    except ValueError:
+        return None
+
+
+def _cisco_screen_train(ver, trains):
+    """Screen a parsed version against a {(maj,min): first_fixed} train table.
+    Returns (in_range, reason). A train absent from the table is UNSCREENABLE
+    (inferred from silence, not confirmed patched) — reported as not-in-range
+    with that caveat. in_range True also when the train's fixed release is None
+    (branch affected, no fix listed)."""
+    t = _cisco_ver_tuple(ver)
+    if not t:
+        return (False, 'version %r unparseable' % ver)
+    train = (t[0], t[1])
+    if train not in trains:
+        return (False, 'train %d.%d absent from the tracked advisory — inferred '
+                'from silence, NOT confirmed patched' % train)
+    fixed = trains[train]
+    if fixed is None:
+        return (True, 'branch %d.%d is affected with no fixed release listed' % train)
+    return (t < fixed, '%s is %s the fixed release %s'
+            % ('.'.join(map(str, t)), 'below' if t < fixed else 'at or above',
+               '.'.join(map(str, fixed))))
+
+
+def _cisco_smb_screen(text):
+    """(train_or_None, matched_model) for a Cisco Small Business switch banner.
+    The 220 Series is confirmed-not-vulnerable and returns (None, '220')."""
+    if _CISCO_SMB_NOT_VULN_RE.search(text):
+        return (None, '220')
+    m = _CISCO_SMB_MODEL_RE.search(text)
+    return (('smb', m.group(0)) if m else (None, None))
+
+
+def _lisp_anomaly(payload):
+    """Malformed LISP control message (CVE-2024-20311 shape): runt, reserved
+    type, or an implausible record count. Returns a reason or None."""
+    p = payload or b''
+    if len(p) < 8:
+        return 'runt LISP control message (%d bytes)' % len(p)
+    t = (p[0] >> 4) & 0x0F
+    if t not in _LISP_TYPES:
+        return 'reserved/undefined LISP type %d' % t
+    if t in (1, 2) and p[3] > 64:
+        return 'LISP record count %d implausible' % p[3]
+    return None
+
+
+def _lisp_afi_anomaly(payload):
+    """A Map-Request whose source-EID AFI names more address bytes than are
+    present (the allocation/copy mismatch class of CVE-2024-20311). None if OK."""
+    p = payload or b''
+    if len(p) < 14 or ((p[0] >> 4) & 0x0F) != 1:
+        return None
+    afi = int.from_bytes(p[12:14], 'big')       # after 4B header + 8B nonce
+    if afi not in _LISP_AFI_LEN:
+        return 'unknown LISP source-EID AFI %d' % afi
+    need = 14 + _LISP_AFI_LEN[afi]
+    if len(p) < need:
+        fam = 'IPv6' if afi == 2 else 'IPv4'
+        return ('LISP source-EID declares AFI %d (%s, %d bytes) but only %d '
+                'byte(s) follow' % (afi, fam, _LISP_AFI_LEN[afi], len(p) - 14))
+    return None
+
+
 def _cisco_screen_version(iosxe=None, nxos=None):
-    """Return the list of CVEs whose fixed release the observed train sits below.
-    Conservative: a train we don't have a table for is reported as unscreenable
-    rather than clean (the caller decides how to surface that)."""
-    hits = []
-    # IOS XE trains carrying the tracked SNMP / CWE-family CVEs (advisory-sourced,
-    # screened as < fixed). Kept compact: the point is "verify THIS device", so a
-    # coarse major.minor band below the fixed release is the trigger.
+    """Screen observed IOS-XE / NX-OS versions against the tracked CVE trains.
+    Returns (iosxe_hit, iosxe_reason, nxos_hit, nxos_reason) — each *_hit True
+    when the version sits below (or on an unfixed) affected train. A POSTURE
+    NOTE, never a verdict."""
+    ix_hit = ix_why = nx_hit = nx_why = None
     if iosxe:
-        try:
-            maj = tuple(int(x) for x in re.split(r'[.\s]', iosxe)[:2])
-        except (ValueError, IndexError):
-            maj = None
-        if maj and maj < (17, 15):   # SNMP CVE-2025-20352 fixed in 17.15.x line
-            hits.append('CVE-2025-20352')
+        ix_hit, ix_why = _cisco_screen_train(iosxe, _CISCO_IOSXE_CVE_TRAINS)
     if nxos:
-        hits.append('CVE-2025-20241')  # tracked NX-OS trains — verify on box
-    return hits
+        nx_hit, nx_why = _cisco_screen_train(nxos, _CISCO_NXOS_CVE_TRAINS)
+    return ix_hit, ix_why, nx_hit, nx_why
 
 
 def do_cisco_guard(interface=None, seconds=20, learn=True, quick=False):
@@ -20202,6 +22111,14 @@ def _cisco_analyze(records):
                 [], {'note': 'Cisco security appliance — cover with firewall tooling'})
         elif re.search(r'\bcisco\b', text, re.I):
             add('CG-001', 'CISCO_DEVICE_OBSERVED', 'INFO', 'POSTURE', src, [], {})
+        # Catalyst 9800 / Embedded WLC identity -> the CVE-2025-20188 (10.0) OOB
+        # AP-image-download exposure. Gated on the identity, not a bare 8443 flow.
+        if _CISCO_WLC_RE.search(text):
+            add('CG-105', 'WLC_OOB_AP_IMAGE_PORT_ACTIVE', 'HIGH', 'EXPOSURE', src,
+                ['CVE-2025-20188'],
+                {'note': 'Cisco Catalyst 9800 / Embedded Wireless Controller seen — '
+                 'verify the Out-of-Band AP Image Download feature against '
+                 'CVE-2025-20188 (10.0, hardcoded-JWT arbitrary file upload)'})
 
         # --- SNMP (UDP 161/162): exposure + attack ---
         if r['proto'] == 'UDP' and (r['dport'] in (161, 162) or r['sport'] in (161, 162)):
@@ -20232,13 +22149,84 @@ def _cisco_analyze(records):
             if re.search(rb'^(GET|POST|PUT|HEAD)\s', r['payload'][:8]):
                 add('CG-103', 'HTTP_WEB_UI_CLEARTEXT', 'HIGH', 'EXPOSURE', src,
                     ['CVE-2023-20159', 'CVE-2023-20160', 'CVE-2023-20161',
-                     'CVE-2023-20189', 'CVE-2025-20164'], {'dst': dst, 'port': r['dport']})
-                # Oversized request line = SMB-switch overflow shape (no reassembly).
+                     'CVE-2023-20189', 'CVE-2025-20164', 'CVE-2025-20327'],
+                    {'dst': dst, 'port': r['dport'],
+                     'note': 'cleartext device web UI — also the Industrial Ethernet '
+                     'Switch Device Manager plane (CVE-2025-20164 priv-esc / '
+                     'CVE-2025-20327 crafted-URL DoS)'})
+                # Oversized request line = SMB-switch / IE-Device-Manager overflow shape.
                 line = r['payload'].split(b'\r\n', 1)[0]
                 if len(line) > 4096:
                     add('CG-260', 'WEB_UI_OVERSIZED_FIELD', 'MEDIUM', 'ATTACK', src,
                         ['CVE-2023-20159', 'CVE-2023-20160', 'CVE-2023-20161',
-                         'CVE-2023-20189'], {'request_line_len': len(line)})
+                         'CVE-2023-20189', 'CVE-2025-20327'], {'request_line_len': len(line)})
+
+        # --- Cisco Small Business switch web UI exposed (May 2023 cluster) ---
+        # The switch's model appears in the HTTP response banner (Server header /
+        # title), so look at either direction on 80/8080. The 220 Series is gated
+        # out — Cisco states it is not affected.
+        if r['proto'] == 'TCP' and (r['dport'] in (80, 8080)
+                                    or r['sport'] in (80, 8080)):
+            _http_txt = (r['payload'] or b'')[:2048].decode('latin-1', 'replace')
+            _smb_train, _smb_model = _cisco_smb_screen(_http_txt)
+            if _smb_train:
+                _dev = src if r['sport'] in (80, 8080) else (dst or src)
+                add('CG-113', 'SMB_WEB_UI_EXPOSED', 'HIGH', 'EXPOSURE', _dev,
+                    list(_CISCO_SMB_CVES),
+                    {'model': _smb_model, 'note': 'Cisco Small Business switch web '
+                     'UI on the segment — verify against the May 2023 web-UI '
+                     'cluster (SB 200/300/500 has no fix; 220 Series excluded)'})
+            if re.search(r'/dataservice/|vmanage', _http_txt, re.I):
+                add('CG-106', 'SDWAN_MANAGER_REACHABLE', 'MEDIUM', 'EXPOSURE',
+                    dst or src, ['CVE-2026-20133'],
+                    {'note': 'Catalyst SD-WAN Manager (vManage) API path observed — '
+                     'verify against CVE-2026-20133'})
+
+        # --- Model-driven telemetry in cleartext (CG-117, v8; no CVE) ---
+        # Cleartext gNMI/gRPC dial-out (IOS-XE `gnxi server` 50052, IOS-XR gRPC
+        # 57400, or a mis-set 9339). The DEFINITIVE marker is the RFC 9113 §3.4
+        # HTTP/2 connection preface, which is only ever sent for cleartext HTTP/2
+        # with prior knowledge — over TLS h2 is negotiated by ALPN and no preface
+        # is visible, so observing it is a statement of fact, not a heuristic. The
+        # payload itself is never decoded (the YANG→protobuf dictionary is
+        # per-device). TLS telemetry stays silent here — that is tlswatch's subject.
+        if r['proto'] == 'TCP' and _CISCO_H2_PREFACE in (r['payload'] or b'')[:64]:
+            add('CG-117', 'MDT_TELEMETRY_CLEARTEXT', 'HIGH', 'EXPOSURE', dst or src,
+                [], {'dst': dst, 'port': r['dport'], 'marker': 'http2-preface',
+                     'confidence': 'definitive',
+                     'note': 'cleartext HTTP/2 (gNMI/gRPC model-driven telemetry) — '
+                     'operational state on the wire unencrypted; payload never decoded'})
+
+        # --- TWAMP / OWAMP control + IP SLA (CG-014/114/115/116/294, v7) ---
+        if r['proto'] in ('TCP', 'UDP') and (r['dport'] == _TWAMP_PORT
+                                             or r['sport'] == _TWAMP_PORT):
+            server = dst if r['dport'] == _TWAMP_PORT else src
+            add('CG-114', 'TWAMP_CONTROL_EXPOSED', 'HIGH', 'EXPOSURE', server,
+                list(_TWAMP_CVES),
+                {'proto': r['proto'], 'note': 'TWAMP/OWAMP control plane reachable — '
+                 'the unauthenticated precondition for CVE-2025-20154 and '
+                 'CVE-2021-34720 (both 8.6)'})
+            # a 64-byte Server Greeting (server->client) carries the Modes bitmap
+            if r['sport'] == _TWAMP_PORT and len(r['payload'] or b'') == _TWAMP_LEN_GREETING:
+                _unauth, _malf = _twamp_greeting_issues(r['payload'])
+                add('CG-014', 'TWAMP_RESPONDER_OBSERVED', 'INFO', 'POSTURE', server, [],
+                    {'note': 'a TWAMP responder answered with a Server Greeting'})
+                if _unauth:
+                    add('CG-115', 'TWAMP_UNAUTH_MODE_OFFERED', 'MEDIUM', 'EXPOSURE',
+                        server, list(_TWAMP_CVES),
+                        {'note': 'the Server Greeting advertises Unauthenticated mode — '
+                         'the control plane is usable with no shared secret'})
+                if _malf:
+                    add('CG-294', 'TWAMP_CONTROL_MALFORMED', 'HIGH', 'ATTACK', server,
+                        ['CVE-2025-20154'],
+                        {'note': 'nonzero MBZ tail in the TWAMP Server Greeting (RFC 5357 '
+                         'requires it zero) — a malformed control shape'})
+        if r['proto'] == 'UDP' and (r['dport'] == _IPSLA_CONTROL_PORT
+                                    or r['sport'] == _IPSLA_CONTROL_PORT):
+            add('CG-116', 'IPSLA_RESPONDER_CONTROL_EXPOSED', 'MEDIUM', 'EXPOSURE',
+                dst if r['dport'] == _IPSLA_CONTROL_PORT else src, ['CVE-2021-34720'],
+                {'note': 'Cisco IP SLA Responder control (UDP/1967) reachable — the '
+                 'CVE-2021-34720 precondition (IP SLA and TWAMP share the code path)'})
 
         # --- Telnet to infrastructure ---
         if r['proto'] == 'TCP' and (r['dport'] == 23 or r['sport'] == 23):
@@ -20257,6 +22245,25 @@ def _cisco_analyze(records):
             if why:
                 add('CG-250', 'IKEV2_MALFORMED_PAYLOAD', 'HIGH', 'ATTACK', src,
                     ['CVE-2024-20307', 'CVE-2024-20308'], {'reason': why})
+
+        # --- LISP control/data plane (CVE-2024-20311 crafted-packet DoS) ---
+        # Control is UDP/4342, data UDP/4341. The malformed-header and AFI-length
+        # shapes ride the control plane; presence alone is the exposure.
+        if r['proto'] == 'UDP' and (r['dport'] in _CISCO_LISP_PORTS
+                                    or r['sport'] in _CISCO_LISP_PORTS):
+            add('CG-107', 'LISP_ENABLED_ON_SEGMENT', 'LOW', 'EXPOSURE', src or dst,
+                ['CVE-2024-20311'],
+                {'note': 'LISP here is the precondition for CVE-2024-20311'})
+            _lport = r['dport'] if r['dport'] in _CISCO_LISP_PORTS else r['sport']
+            if _lport == 4342:
+                _lwhy = _lisp_anomaly(r['payload'])
+                if _lwhy:
+                    add('CG-240', 'LISP_MALFORMED_HEADER', 'HIGH', 'ATTACK',
+                        src or dst, ['CVE-2024-20311'], {'reason': _lwhy})
+                _lafi = _lisp_afi_anomaly(r['payload'])
+                if _lafi:
+                    add('CG-241', 'LISP_AFI_LENGTH_MISMATCH', 'HIGH', 'ATTACK',
+                        src or dst, ['CVE-2024-20311'], {'reason': _lafi})
 
         # --- DHCPv6 malformed option (CVE-2024-20259 shape, IPv6 side) ---
         if r['proto'] == 'UDP' and (r['dport'] in (546, 547) or r['sport'] in (546, 547)):
@@ -20324,18 +22331,31 @@ def _cisco_analyze(records):
         # --- VLAN tag-stack anomaly (Catalyst 9000 control-plane DoS shape) ---
         if r['vlan_tags'] > _CISCO_MAX_VLAN_TAGS:
             add('CG-220', 'VLAN_TAG_STACK_ANOMALY', 'HIGH', 'ATTACK', src or dst,
-                ['CVE-2024-20434'], {'vlan_tags': r['vlan_tags'],
-                                     'threshold': _CISCO_MAX_VLAN_TAGS})
+                ['CVE-2024-20434', 'CVE-2025-20311'],
+                {'vlan_tags': r['vlan_tags'], 'threshold': _CISCO_MAX_VLAN_TAGS,
+                 'note': 'anomalous VLAN-tag stack — Catalyst 9000 control-plane DoS '
+                 '(CVE-2024-20434) / crafted-frame egress port block (CVE-2025-20311)'})
 
-    # POSTURE version screening → CG-004 / CG-005.
-    screened = _cisco_screen_version(iosxe_ver, nxos_ver)
-    if iosxe_ver and 'CVE-2025-20352' in screened:
+    # POSTURE version screening → CG-004 / CG-005 (tracked CVE trains; a NOTE,
+    # never a verdict — verify THIS device). A train below its fixed release, or
+    # on an affected branch with no fix, fires; an unknown train stays quiet.
+    ix_hit, ix_why, nx_hit, nx_why = _cisco_screen_version(iosxe_ver, nxos_ver)
+    if iosxe_ver and ix_hit:
         add('CG-004', 'IOS_XE_VERSION_IN_CVE_RANGE', 'MEDIUM', 'POSTURE', None,
-            ['CVE-2025-20352'], {'version': iosxe_ver,
-                                 'note': 'verify THIS device against the advisory'})
-    if nxos_ver:
+            list(_CISCO_IOSXE_CVES), {'version': iosxe_ver, 'reason': ix_why,
+             'note': 'verify THIS device against the advisory'})
+    # v8: secure-boot bypass (CVE-2025-20313 / CVE-2025-20314) is a local/physical
+    # vector with no wire signature, so whenever an IOS-XE device is identified it
+    # is surfaced as an advisory-only INFO note (never a verdict) — same honesty as
+    # ciscoguard v8's CG-008.
+    if iosxe_ver:
+        add('CG-008', 'SECURE_BOOT_ADVISORY_ONLY', 'INFO', 'POSTURE', None,
+            ['CVE-2025-20313', 'CVE-2025-20314'],
+            {'version': iosxe_ver, 'note': 'IOS-XE secure-boot bypass is a local/'
+             'physical vector (no wire signature) — advisory only, verify THIS device'})
+    if nxos_ver and nx_hit:
         add('CG-005', 'NXOS_VERSION_IN_CVE_RANGE', 'MEDIUM', 'POSTURE', None,
-            ['CVE-2025-20241', 'CVE-2024-20399'], {'version': nxos_ver,
+            list(_CISCO_NXOS_CVES), {'version': nxos_ver, 'reason': nx_why,
              'note': 'verify THIS device; CVE-2024-20399 is an in-the-wild 0-day'})
 
     return _guard_finish('cisco_guard', None, None, findings, records)
@@ -20524,368 +22544,92 @@ def _juniper_analyze(records):
 _ARISTA_GUARD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   'data', 'arista_guard.json')
 _arista_guard_lock = threading.Lock()
-_ARISTA_RADIUS_AUTH_PORTS = (1812, 1645)
-_ARISTA_RADIUS_ACCT_PORTS = (1813, 1646)
-_ARISTA_GNMI_PORTS = (6030, 9339, 50051)
-_ARISTA_CVX_PORTS = (9979,)
-_ARISTA_VXLAN_PORTS = (4789, 8472)
-_ARISTA_MAX_VLAN_TAGS = 2
-# --- BlastRADIUS (CVE-2024-3596) structural anomaly bounds (aristaguard v3) ---
-# All are STRUCTURAL anomaly bounds measured against real vendor AV-pairs, not
-# published exploit constants. AG-201 keys on the Proxy-State SUM so splitting a
-# collision block across several attributes cannot evade it; EAP-Message
-# fragments (255-byte, ordinary in EAP-TLS) are deliberately never counted.
-_ARISTA_RADIUS_PROXY_STATE_TOTAL_MAX = 128
-_ARISTA_RADIUS_OPAQUE_MIN_LEN = 64
-_ARISTA_RADIUS_OPAQUE_ENTROPY_MIN = 0.88
-_ARISTA_RADIUS_OPAQUE_RUN_MAX = 16
-_ARISTA_RADIUS_CLEARTEXT_RUN_MIN = 24
-# RADIUS attribute types / code sets used by the parser and the detectors.
-_RADIUS_ATTR_REPLY_MESSAGE = 18
-_RADIUS_ATTR_VENDOR_SPECIFIC = 26
-_RADIUS_ATTR_PROXY_STATE = 33
-_RADIUS_ATTR_MSG_AUTH = 80
-_RADIUS_RESPONSE_CODES = frozenset((2, 3, 11))   # Access-Accept / Reject / Challenge
-_RADIUS_MA_FIRST_CODES = frozenset((2, 3))       # M-A must be FIRST in these
-_RADIUS_MAX_ATTRS = (4096 - 20) // 2             # RFC 2865 upper bound (D6)
-# Non-EOS Arista products actively screened out (AG-009).
-_ARISTA_OOS_RE = re.compile(
-    r'VeloCloud|CloudVision|NG Firewall|Edge Threat|DANZ|Converged Cloud'
-    r'|Awake NDR', re.I)
-_ARISTA_EOS_VER_RE = re.compile(r'\bEOS[- ](?:version\s+)?(\d+\.\d+\.\d+[A-Z0-9.]*)', re.I)
-_ARISTA_SSH_BANNER_RE = re.compile(rb'SSH-2\.0-OpenSSH_(\d+)\.(\d+)(?:p(\d+))?')
+_ARISTA_PY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'python')
 
 
-def _arista_ssh_vulnerable(major, minor, patch):
-    """regreSSHion (CVE-2024-6387/6409) window: OpenSSH < 4.4p1, or 8.5p1 up to
-    (not including) 9.8p1."""
-    v = (major, minor, patch or 0)
-    if v < (4, 4, 1):
-        return True
-    return (8, 5, 1) <= v < (9, 8, 1)
+def _arista_module():
+    """Import the vendored aristaguard engine (python/ on sys.path). Pure stdlib at
+    import time; scapy loads only on its own run_capture live path, which the adapter
+    does NOT use — it captures via tcpdump->pcap and feeds raw Ethernet frames to
+    AristaEngine.handle_frame, the same shape as APC / Liebert / RADIUS / RIP / PIM."""
+    if _ARISTA_PY_DIR not in sys.path:
+        sys.path.insert(0, _ARISTA_PY_DIR)
+    import aristaguard
+    return aristaguard
 
 
-def _radius_norm_entropy(b):
-    """Shannon entropy normalised to the maximum achievable for this length, so
-    the number is comparable across short and long buffers (arubaguard's lesson:
-    64 random bytes can only reach 6.0 bits, so a fixed bit threshold never
-    fires on anything short)."""
-    if not b:
-        return 0.0
-    import math as _math
-    counts = {}
-    for x in b:
-        counts[x] = counts.get(x, 0) + 1
-    n = len(b)
-    h = -sum((c / n) * _math.log2(c / n) for c in counts.values())
-    hmax = _math.log2(min(256, n))
-    return h / hmax if hmax else 0.0
+def _arista_map_finding(f):
+    """Vendored aristaguard Finding -> the shared guard result-dict the webapp card
+    and _guard_finish consume. klass is upper-cased (the engine emits lowercase
+    posture/exposure/attack; _guard_verdict keys on POSTURE/EXPOSURE/ATTACK); severity
+    is already one of INFO/LOW/MEDIUM/HIGH/CRITICAL (the _GUARD_SEVERITY_RANK set)."""
+    detail = dict(getattr(f, 'detail', None) or {})
+    if getattr(f, 'pivot', None):
+        detail.setdefault('pivot', list(f.pivot))
+    return {'code': f.code, 'name': f.name, 'severity': f.severity,
+            'klass': f.klass.upper(), 'cves': list(f.cves),
+            'src': detail.get('src') or detail.get('addr'), 'detail': detail}
 
 
-def _radius_longest_printable_run(b):
-    best = cur = 0
-    for x in b:
-        if 32 <= x <= 126 or x in (9, 10, 13):
-            cur += 1
-            if cur > best:
-                best = cur
-        else:
-            cur = 0
-    return best
-
-
-def _radius_classify_opacity(b):
-    """Classify a RADIUS attribute value as 'opaque' / 'cleartext' / 'unknown'.
-    The printable-run length is the discriminator (entropy alone does not
-    separate real AV-pairs from collision data — their entropy ranges overlap);
-    the middle band deliberately abstains rather than guess."""
-    if len(b) < _ARISTA_RADIUS_OPAQUE_MIN_LEN:
-        return 'unknown'
-    run = _radius_longest_printable_run(b)
-    if run >= _ARISTA_RADIUS_CLEARTEXT_RUN_MIN:
-        return 'cleartext'
-    if run <= _ARISTA_RADIUS_OPAQUE_RUN_MAX and \
-            _radius_norm_entropy(b) >= _ARISTA_RADIUS_OPAQUE_ENTROPY_MIN:
-        return 'opaque'
-    return 'unknown'
-
-
-def _radius_parse(payload):
-    """RADIUS parser for the Arista Guard BlastRADIUS detectors. Returns a dict
-    of STRUCTURAL facts only — attribute values are digested or discarded, never
-    retained (this module never logs credential material) — or None.
-    RADIUS: code(1) id(1) length(2) authenticator(16) then TLV attributes."""
-    try:
-        if len(payload) < 20:
-            return None
-        code = payload[0]
-        if code not in (1, 2, 3, 4, 5, 11):   # plausible RADIUS codes
-            return None
-        length = int.from_bytes(payload[2:4], 'big')
-        if not (20 <= length <= 4096):
-            return None
-        import hashlib as _hl
-        # Walk the declared body; a legal packet can carry ~2038 attributes, so
-        # a small cap would stop the walk early and miss a trailing M-A (D6).
-        body = payload[20:length] if length <= len(payload) else payload[20:]
-        out = {'code': code, 'identifier': payload[1], 'has_msg_auth': False,
-               'ma_is_first': False, 'max_attr_len': 0, 'attrs': [],
-               'proxy_state_total': 0, 'proxy_state_count': 0,
-               'proxy_state_digests': [], 'reply_message_count': 0,
-               'reply_message_invalid_utf8': 0, 'opaque_vendor_attrs': [],
-               'cleartext_vendor_attrs': 0, 'unknown_vendor_attrs': 0}
-        i = count = 0
-        while i + 2 <= len(body) and count < _RADIUS_MAX_ATTRS:
-            atype = body[i]
-            alen = body[i + 1]
-            if alen < 2 or i + alen > len(body):
-                break
-            value = body[i + 2:i + alen]
-            out['attrs'].append(atype)
-            out['max_attr_len'] = max(out['max_attr_len'], alen)
-            if atype == _RADIUS_ATTR_MSG_AUTH:               # Message-Authenticator
-                out['has_msg_auth'] = True
-            elif atype == _RADIUS_ATTR_PROXY_STATE:
-                # Proxy-State must be echoed back byte-for-byte by a conforming
-                # server; a digest lets AG-212 detect injection without ever
-                # retaining the value. Summed for AG-201 (D1/D2).
-                out['proxy_state_total'] += alen
-                out['proxy_state_count'] += 1
-                out['proxy_state_digests'].append(
-                    _hl.blake2b(value, digest_size=8).hexdigest())
-            elif atype == _RADIUS_ATTR_REPLY_MESSAGE:
-                out['reply_message_count'] += 1
-                try:                                          # RFC 2865: displayable text
-                    value.decode('utf-8')
-                except UnicodeDecodeError:
-                    out['reply_message_invalid_utf8'] += 1
-            elif atype == _RADIUS_ATTR_VENDOR_SPECIFIC:
-                # Classify the vendor PAYLOAD, past the 6-byte vendor-id +
-                # vendor-type/length sub-header (those are protocol fields, not
-                # attacker content, and dilute the entropy of short payloads).
-                vendor_payload = value[6:] if len(value) >= 8 else value
-                verdict = _radius_classify_opacity(vendor_payload)
-                if verdict == 'opaque':
-                    out['opaque_vendor_attrs'].append(alen)
-                elif verdict == 'cleartext':
-                    out['cleartext_vendor_attrs'] += 1
-                else:
-                    out['unknown_vendor_attrs'] += 1
-            count += 1
-            i += alen
-        out['ma_is_first'] = (bool(out['attrs'])
-                              and out['attrs'][0] == _RADIUS_ATTR_MSG_AUTH)
-        return out
-    except Exception:
-        return None
+def _arista_analyze_frames(frames):
+    """Replay [(ts, frame)] through the vendored AristaEngine and map its findings.
+    No persisted baseline — each capture is self-contained. The RADIUS / BlastRADIUS
+    rules (AG-101/102/110/201/212/213/214, CVE-2024-3596) self-scope to Arista hardware
+    whose addresses are learned passively from LLDP management-address TLVs within the
+    same window; with no Arista device seen they stay silent (the vendor-neutral RADIUS
+    posture now lives in RADIUS Watch). Returns (findings, stats)."""
+    ag = _arista_module()
+    eng = ag.AristaEngine(ag.Config())
+    for ts, fr in frames:
+        try:
+            eng.handle_frame(fr, ts)
+        except Exception:
+            continue
+    return [_arista_map_finding(f) for f in eng.findings], {
+        'arista_ips': sorted(eng.arista_ips)[:50]}
 
 
 def do_arista_guard(interface=None, seconds=20, learn=True, quick=False):
-    """Passive Arista EOS switch/router CVE guard (detection-only). Reads LLDP
-    version/platform, RADIUS (BlastRADIUS CVE-2024-3596), SSH banners (regreSSHion),
-    and management listeners (gNMI/CVX/VXLAN), reporting POSTURE / EXPOSURE / ATTACK
-    findings. Ported from the standalone aristaguard. Never transmits."""
+    """Passive Arista EOS switch/router CVE guard (detection-only). Captures LLDP,
+    RADIUS/EAPOL, SSH banners and gNMI/gNOI/CVX/VXLAN/IPsec dataplane for a few seconds
+    and replays them through the vendored aristaguard engine (17 tracked EOS CVEs across
+    POSTURE / EXPOSURE / ATTACK: BlastRADIUS CVE-2024-3596, regreSSHion, gNOI authz,
+    tunnel-decap CVE-2026-7473, VLAN/OSPFv3/CVX/IPsec shapes). Non-EOS Arista products
+    are screened out (AG-009). BlastRADIUS rules self-scope to Arista LLDP. Never
+    transmits — the engine has no socket, subprocess or injector; scapy is lazy."""
     iface, iface_error = _lan_guard_iface(interface, 'Arista Guard')
     if iface_error:
         return iface_error
     seconds = _clamp_int(seconds, 20, 5, 40)
-    bpf = ('udp port 1812 or udp port 1813 or udp port 1645 or udp port 1646 or '
-           'tcp port 22 or tcp port 6030 or tcp port 9339 or tcp port 50051 or '
-           'tcp port 9979 or udp port 4789 or udp port 8472 or '
-           'ether proto 0x88cc')     # LLDP
     if not _have('tcpdump'):
         return {'success': False, 'interface': iface,
                 'error': 'tcpdump is not installed. Click Install to add it.',
                 'missing_tool': 'tcpdump'}
-    res = _run(['timeout', str(seconds), 'tcpdump', '-i', iface, '-nn', '-tt',
-                '-v', '-x', '-s', '1600', '-c', '20000', bpf],
-               timeout=seconds + 8)
-    out = res['out']
-    if not out and res['err'] and any(k in res['err'].lower() for k in (
-            'permission', "couldn't", 'no such device', 'syntax error')):
-        return {'success': False, 'interface': iface, 'error': res['err'].strip()[:200]}
-    records = _guard_packets(out)
-    result = _arista_analyze(records)
-    result['interface'] = iface
-    result['seconds'] = seconds
+    try:
+        ag = _arista_module()
+    except Exception as e:
+        return {'success': False, 'interface': iface, 'error': 'aristaguard module: %s' % e}
+    tmpdir = tempfile.mkdtemp(prefix='aristaguard-')
+    pcap = os.path.join(tmpdir, 'cap.pcap')
+    try:
+        res = _run(['timeout', str(seconds), 'tcpdump', '-i', iface, '-nn', '-s', '0',
+                    '-c', '20000', '-w', pcap, ag.BPF_FILTER], timeout=seconds + 8)
+        if not os.path.exists(pcap):
+            err = (res.get('err') or 'capture failed').strip()
+            return {'success': False, 'interface': iface, 'error': err[:200]}
+        try:
+            frames = _apc_pcap_frames(pcap)
+        except ValueError as e:
+            return {'success': False, 'interface': iface, 'error': str(e)}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    findings, stats = _arista_analyze_frames(frames)
+    result = _guard_finish('arista_guard', iface, seconds, findings, frames)
+    result['stats'] = stats
     if not quick:
         _guard_record_event(_ARISTA_GUARD_PATH, _arista_guard_lock, result)
     _guard_emit_jsonl('arista_guard', result)
     return result
-
-
-def _arista_analyze(records):
-    """Pure classifier over parsed guard packets → Arista findings + verdict."""
-    findings = []
-    seen = set()
-    eos_ver = None
-    # AG-212 request→response Proxy-State correlation table (bounded). Keyed by
-    # the socket 4-tuple + RADIUS Identifier; stores digests only, never values.
-    radius_pending = {}
-
-    def add(code, name, sev, klass, src, cves, detail):
-        key = (code, src)
-        if key in seen:
-            return
-        seen.add(key)
-        findings.append({'code': code, 'name': name, 'severity': sev,
-                         'klass': klass, 'src': src, 'cves': cves, 'detail': detail})
-
-    for r in records:
-        pl, text, src, dst = r['payload'], r['dissect'], r['src'], r['dst']
-
-        # --- POSTURE: LLDP EOS version / platform, out-of-scope screen ---
-        if _ARISTA_OOS_RE.search(text):
-            add('AG-009', 'OUT_OF_SCOPE_PLATFORM', 'INFO', 'POSTURE', src, [],
-                {'note': 'non-EOS Arista product — needs its own coverage'})
-        else:
-            m = _ARISTA_EOS_VER_RE.search(text)
-            if m:
-                eos_ver = m.group(1)
-                add('AG-001', 'EOS_VERSION_OBSERVED', 'INFO', 'POSTURE', src, [],
-                    {'version': eos_ver})
-            elif re.search(r'\bArista\b', text, re.I):
-                add('AG-005', 'EOS_PLATFORM_OBSERVED', 'INFO', 'POSTURE', src, [], {})
-
-        # --- RADIUS / BlastRADIUS (CVE-2024-3596), aristaguard v3 engine ---
-        _auth = _ARISTA_RADIUS_AUTH_PORTS
-        _acct = _ARISTA_RADIUS_ACCT_PORTS
-        is_radius_acct = r['proto'] == 'UDP' and (r['dport'] in _acct
-                                                  or r['sport'] in _acct)
-        is_radius = r['proto'] == 'UDP' and (
-            r['dport'] in _auth + _acct or r['sport'] in _auth + _acct)
-        if is_radius:
-            add('AG-101', 'RADIUS_CLEARTEXT_OBSERVED', 'MEDIUM', 'EXPOSURE', src,
-                ['CVE-2024-3596'], {'dst': dst})
-            # AG-211: a gNOI File TransferToRemote marker in a cleartext
-            # accounting record (CVE-2025-0936 / SA-0117) may carry the
-            # remote-server credentials. Marker + lengths only — credential
-            # material is deliberately never captured.
-            if is_radius_acct and pl and b'transfertoremote' in bytes(pl[:512]).lower():
-                add('AG-211', 'GNOI_CREDENTIAL_IN_ACCOUNTING', 'CRITICAL', 'ATTACK',
-                    src, ['CVE-2025-0936'],
-                    {'dst': dst, 'record_len': len(pl),
-                     'note': 'accounting record references gNOI TransferToRemote; '
-                             'rotate the remote-server credentials and check '
-                             'accounting log retention'})
-            rad = _radius_parse(pl) if pl else None
-            if rad:
-                is_request = r['dport'] in _auth + _acct
-                if rad['code'] == 1 and not rad['has_msg_auth']:    # Access-Request
-                    add('AG-102', 'RADIUS_NO_MESSAGE_AUTHENTICATOR', 'HIGH',
-                        'EXPOSURE', src, ['CVE-2024-3596'],
-                        {'note': 'Access-Request without attribute 80 (Message-'
-                                 'Authenticator) — the CVE-2024-3596 mitigation is '
-                                 'to require it on every request and response'})
-                if rad['code'] in _RADIUS_RESPONSE_CODES:           # responses
-                    case = None
-                    if not rad['has_msg_auth']:
-                        case = 'absent'
-                    elif (rad['code'] in _RADIUS_MA_FIRST_CODES
-                          and not rad['ma_is_first']):
-                        case = 'not_first'
-                    if case:
-                        # EXPOSURE, not attack: this is the standing posture of an
-                        # unhardened server. 'not_first' matters because the
-                        # mitigation requires M-A FIRST in Access-Accept/Reject.
-                        add('AG-110', 'RADIUS_RESPONSE_UNAUTHENTICATED', 'HIGH',
-                            'EXPOSURE', src, ['CVE-2024-3596'],
-                            {'radius_code': rad['code'], 'case': case,
-                             'note': ('response carries no Message-Authenticator; '
-                                      'protected only by the MD5 authenticator that '
-                                      'CVE-2024-3596 defeats') if case == 'absent'
-                                     else ('Message-Authenticator present but NOT '
-                                           'first — the response is not actually '
-                                           'hardened against CVE-2024-3596')})
-                # AG-201: Proxy-State bytes SUMMED over the packet exceed a
-                # legitimate proxy chain — the chosen-prefix collision-block shape.
-                if rad['proxy_state_total'] > _ARISTA_RADIUS_PROXY_STATE_TOTAL_MAX:
-                    add('AG-201', 'RADIUS_FORGERY_ATTEMPT', 'CRITICAL', 'ATTACK', src,
-                        ['CVE-2024-3596'],
-                        {'proxy_state_total': rad['proxy_state_total'],
-                         'proxy_state_count': rad['proxy_state_count'],
-                         'threshold': _ARISTA_RADIUS_PROXY_STATE_TOTAL_MAX,
-                         'note': 'Proxy-State bytes exceed a legitimate proxy chain '
-                                 '— BlastRADIUS collision-block shape (summed so '
-                                 'splitting it across attributes cannot evade it)'})
-                # AG-212: Proxy-State injected on the NAS-side leg. A conforming
-                # server echoes Proxy-State back byte-for-byte, so a response whose
-                # Proxy-State set differs from its correlated request's is
-                # injection — the forged-Access-Accept shape. Digests only.
-                rkey = (src, dst, r['sport'], r['dport'], rad['identifier'])
-                if is_request:
-                    if len(radius_pending) < 4096:
-                        radius_pending[rkey] = tuple(rad['proxy_state_digests'])
-                elif rad['code'] in _RADIUS_RESPONSE_CODES:
-                    fkey = (dst, src, r['dport'], r['sport'], rad['identifier'])
-                    req_digests = radius_pending.pop(fkey, None)
-                    if req_digests is not None and (
-                            set(rad['proxy_state_digests']) != set(req_digests)):
-                        injected = [d for d in rad['proxy_state_digests']
-                                    if d not in req_digests]
-                        add('AG-212', 'RADIUS_PROXY_STATE_INJECTED', 'CRITICAL',
-                            'ATTACK', src, ['CVE-2024-3596'],
-                            {'radius_code': rad['code'], 'identifier': rad['identifier'],
-                             'injected_attr_count': len(injected),
-                             'request_proxy_state_count': len(req_digests),
-                             'response_proxy_state_count': rad['proxy_state_count'],
-                             'note': 'request and its response disagree about '
-                                     'Proxy-State — forged Access-Accept on the '
-                                     'NAS-side leg of CVE-2024-3596 (digests '
-                                     'compared, values never retained)'})
-                # AG-213 / AG-214: collision data smuggled OUTSIDE Proxy-State, in
-                # a Reply-Message (invalid UTF-8) or an opaque Vendor-Specific
-                # attribute. Access-Accept / Access-Challenge only.
-                if rad['code'] in (2, 11):
-                    if rad['reply_message_invalid_utf8']:
-                        add('AG-213', 'RADIUS_REPLY_MESSAGE_MALFORMED', 'HIGH',
-                            'ATTACK', src, ['CVE-2024-3596'],
-                            {'invalid_reply_messages': rad['reply_message_invalid_utf8'],
-                             'reply_message_count': rad['reply_message_count'],
-                             'note': 'Reply-Message is not valid UTF-8 (RFC 2865 '
-                                     'requires displayable text) — a collision block '
-                                     'smuggled on the NAS-side leg of CVE-2024-3596'})
-                    if rad['opaque_vendor_attrs']:
-                        add('AG-214', 'RADIUS_OPAQUE_VENDOR_ATTRIBUTE', 'HIGH',
-                            'ATTACK', src, ['CVE-2024-3596'],
-                            {'opaque_attr_count': len(rad['opaque_vendor_attrs']),
-                             'largest_attr_len': max(rad['opaque_vendor_attrs']),
-                             'note': 'a Vendor-Specific attribute is long, high-'
-                                     'entropy and essentially non-printable, unlike '
-                                     'real AV-pair strings — collision data outside '
-                                     'Proxy-State'})
-
-        # --- SSH banner (regreSSHion CVE-2024-6387/6409) ---
-        if r['proto'] == 'TCP' and (r['dport'] == 22 or r['sport'] == 22):
-            m = _ARISTA_SSH_BANNER_RE.search(pl)
-            if m:
-                mj, mn = int(m.group(1)), int(m.group(2))
-                pt = int(m.group(3)) if m.group(3) else 0
-                if _arista_ssh_vulnerable(mj, mn, pt):
-                    add('AG-104', 'SSH_VULNERABLE_BANNER', 'HIGH', 'EXPOSURE', src,
-                        ['CVE-2024-6387', 'CVE-2024-6409'],
-                        {'banner': f'OpenSSH_{mj}.{mn}' + (f'p{pt}' if pt else '')})
-
-        # --- Management-plane listeners (exposure preconditions) ---
-        if r['proto'] == 'TCP' and r['dport'] in _ARISTA_GNMI_PORTS:
-            add('AG-103', 'GNMI_GNOI_LISTENER_OBSERVED', 'MEDIUM', 'EXPOSURE', src,
-                ['CVE-2025-1259', 'CVE-2025-1260', 'CVE-2025-0936'],
-                {'dst': dst, 'port': r['dport']})
-        if r['proto'] == 'TCP' and r['dport'] in _ARISTA_CVX_PORTS:
-            add('AG-108', 'CVX_SESSION_OBSERVED', 'MEDIUM', 'EXPOSURE', src,
-                ['CVE-2025-5089'], {'dst': dst})
-        if r['proto'] == 'UDP' and (r['dport'] in _ARISTA_VXLAN_PORTS
-                                    or r['sport'] in _ARISTA_VXLAN_PORTS):
-            add('AG-106', 'VXLAN_DECAP_ENDPOINT_OBSERVED', 'LOW', 'EXPOSURE',
-                dst or src, ['CVE-2026-7473'], {'endpoint': dst})
-
-        # --- VLAN tag anomaly (CVE-2024-5872 CPU punt shape) ---
-        if r['vlan_tags'] > _ARISTA_MAX_VLAN_TAGS:
-            add('AG-205', 'VLAN_TAG_ANOMALY_CPU_PUNT', 'MEDIUM', 'ATTACK', src or dst,
-                ['CVE-2024-5872'], {'vlan_tags': r['vlan_tags'],
-                                    'threshold': _ARISTA_MAX_VLAN_TAGS})
-
-    return _guard_finish('arista_guard', None, None, findings, records)
 
 
 # ==========================================================================
@@ -21342,20 +23086,27 @@ def _comware_in_prefix(family, addr_int, prefix):
 # ==========================================================================
 # MikroTik Switch and Router Guard — passive RouterOS (CCR/CRS) CVE monitor
 # ==========================================================================
-# Ported from the standalone mikrotikwatch. Detection-only, driven by the shared
-# _guard_packets tcpdump-record model, so it is the per-packet SIGNATURE subset a
-# stateless capture can observe. Deliberately NOT ported (each needs state or
-# frames outside this model, documented so nothing is a silent gap):
+# Ported from the standalone mikrotikwatch (v3, Oct 2026 audit). Detection-only,
+# driven by the shared _guard_packets tcpdump-record model, so it is the per-packet
+# SIGNATURE subset a stateless capture can observe. v3 adds MTK-022 (SMB1
+# SessionSetupAndX crafted uniPwdLen) and MTK-023 (web-mgmt HTTP body-length
+# underflow, structural class + MNDP version posture). Deliberately NOT ported (each
+# needs state or frames outside this model, documented so nothing is a silent gap):
 #   - MTK-011 www-crash / MTK-012 jsproxy-crash: the signal is a SERVER connection
 #     teardown with no HTTP response — flow-close behaviour, not a packet signature.
 #     (The MTK-011 Chimay-Red VERSION posture, which needs no interaction, IS ported.)
 #   - MTK-018 + MTK-C02 / MTK-C03: the Winbox->DNS->downgrade chain and the
-#     reboot-after-SCEP sequence are cross-flow / cross-time correlations.
+#     reboot-after-SCEP sequence are cross-flow / cross-time correlations. MTK-C02
+#     additionally needs MTK-018, which this guard does not port.
 #   - MTK-009 VXLAN source bypass: silent without an operator-declared VTEP peer
 #     list, which this guard has no config for (the standalone is silent too).
 #   - MTK-004 btest: needs the tcp/2000 control-channel flow state.
 #   - MTK-016 bridge2: arbitrary native-L2 frames, unreachable behind a port-scoped
 #     BPF (the standalone flags it so). tcpdump -x carries only IP-onward bytes.
+# Two v3 CVEs are deliberately ROUTED to the modules that already own the decoder,
+# not named here: the labelled-VPN NLRI underflow lives in BGP Path Watch and the
+# xt_tls SNI host_name over-read lives in TLS Watch. Naming them here would be a
+# second decoder under another name and would double-count them in the CVE index.
 _MIKROTIK_GUARD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                     'data', 'mikrotik_guard.json')
 _mikrotik_guard_lock = threading.Lock()
@@ -21422,8 +23173,15 @@ _MIKROTIK_REGISTRY = {
     'MTK-020': ('AUTOUPGRADE_ORIGIN_BYPASS', 'CVE-2019-3977'),
     # One code for both halves of MikroTrick: they share one encrypted exchange.
     'MTK-021': ('MIKROTRICK_SSH_EXPOSURE', 'CVE-2026-67276'),
+    # v3 (Oct 2026 audit). MTK-022 is one code for two CVEs on the MTK-021 precedent:
+    # both are the same crafted uniPwdLen in the same SessionSetupAndX handler, differing
+    # only in the outcome the tap never sees. MTK-023 is a structural class, not a
+    # CVE-exact signature (the malformation was withheld by vendor + CISA).
+    'MTK-022': ('SMB1_SESSIONSETUP_UNIPWDLEN_MALFORMED', 'CVE-2026-56719'),
+    'MTK-023': ('WEB_MGMT_HTTP_BODY_LENGTH_UNDERFLOW', 'CVE-2026-84411'),
 }
 _MIKROTIK_MTK021_CVES = ['CVE-2026-67276', 'CVE-2026-86060']
+_MIKROTIK_MTK022_CVES = ['CVE-2026-56719', 'CVE-2026-89028']
 _MIKROTIK_SSH_PORT = 22
 _MIKROTIK_ROSSSH_RE = re.compile(rb'^SSH-\d+\.\d+-[^\r\n]*?ROSSSH[-_]?([0-9][0-9.]*(?:beta\d+|rc\d+)?)',
                                  re.IGNORECASE)
@@ -21673,6 +23431,221 @@ def _mikrotik_http_request(payload):
         return None
 
 
+# --- MTK-022: SMB1 SessionSetupAndX crafted uniPwdLen (CVE-2026-56719 + CVE-2026-89028) ---
+# Shared parser "smb1-sessionsetupandx", alongside the NBSS pre-auth check (MTK-002). ONE
+# code for both CVEs on the MTK-021 precedent: both are the SAME crafted uniPwdLen in the
+# SAME SessionSetupAndX handler in the SAME frame; 56719 reads past the request buffer
+# (CWE-125), 89028 underflows the length arithmetic and corrupts adjacent heap (CWE-122 +
+# CWE-191). The tap sees the frame, never which path the daemon took, so the structural
+# relations are reported as flags and the frame is filed once against both CVEs. The handler
+# runs before credential validation, hence PR:N.
+_MIKROTIK_SMB1_MAGIC = b'\xffSMB'
+_MIKROTIK_SMB1_HEADER_LEN = 32
+_MIKROTIK_SMB_COM_SESSION_SETUP_ANDX = 0x73
+_MIKROTIK_SESSIONSETUP_WC_NTLM = 13      # the variant carrying oem/uni password lengths
+_MIKROTIK_SESSIONSETUP_WC_EXTSEC = 12    # extended security: SecurityBlobLength, no uniPwdLen
+
+
+def _mikrotik_sessionsetup(buf):
+    """Declared shape of an SMB1 SessionSetupAndX, or None if this is not one we can read
+    (the absence of a finding, never a finding). Only a frame whose own declared lengths
+    contradict the bytes it carries yields a defect.
+
+    Per-packet model: the NBSS wrapper says how long the whole frame is. If we captured
+    FEWER bytes than it declares, the segment is snaplen-truncated, so bytes_present is not
+    trustworthy and the bytes-present-dependent relations (the CWE-125 over-read and the
+    byteCount-vs-present check) are suppressed to avoid a false positive on a legitimate
+    frame the capture merely cut short. The CWE-191 under-flow relation is declared-vs-
+    declared (oemPwdLen + uniPwdLen vs ByteCount) and does not depend on bytes_present, so
+    it is always evaluated — and it is the relation the canonical crafted frame trips."""
+    if len(buf) < 4:
+        return None
+    ext = buf[1] & 0x01
+    nbss_len = (ext << 16) | int.from_bytes(buf[2:4], 'big')
+    body = buf[4:]
+    if len(body) < _MIKROTIK_SMB1_HEADER_LEN + 1:
+        return None
+    if body[:4] != _MIKROTIK_SMB1_MAGIC or body[4] != _MIKROTIK_SMB_COM_SESSION_SETUP_ANDX:
+        return None
+    full_frame = (nbss_len == len(body))
+    sh = {'word_count': body[_MIKROTIK_SMB1_HEADER_LEN], 'oem_pwd_len': -1,
+          'uni_pwd_len': -1, 'byte_count': -1, 'bytes_present': -1,
+          'defects': [], 'underflow': False, 'overread': False, 'truncated': not full_frame}
+    wc = sh['word_count']
+    words = body[_MIKROTIK_SMB1_HEADER_LEN + 1:_MIKROTIK_SMB1_HEADER_LEN + 1 + wc * 2]
+    if len(words) < wc * 2:
+        sh['defects'].append('wordcount-%d-overruns-frame' % wc)
+        return sh
+    after = _MIKROTIK_SMB1_HEADER_LEN + 1 + wc * 2
+    if len(body) >= after + 2:
+        sh['byte_count'] = int.from_bytes(body[after:after + 2], 'little')
+        sh['bytes_present'] = len(body) - (after + 2)
+    else:
+        sh['defects'].append('bytecount-field-missing')
+        return sh
+    # A frame carrying MORE bytes than its NBSS wrapper declares is genuinely malformed; a
+    # frame carrying FEWER is this capture's snaplen, not the sender's doing.
+    if nbss_len < len(body):
+        sh['defects'].append('nbss-length-%d-shorter-than-smb-frame-%d' % (nbss_len, len(body)))
+    if wc == _MIKROTIK_SESSIONSETUP_WC_NTLM:
+        sh['oem_pwd_len'] = int.from_bytes(words[14:16], 'little')
+        sh['uni_pwd_len'] = int.from_bytes(words[16:18], 'little')
+        declared_total = sh['oem_pwd_len'] + sh['uni_pwd_len']
+        # CWE-191 (CVE-2026-89028 class): the two password lengths together claim more than
+        # ByteCount says the block holds, so remaining = byteCount - oem - uni goes negative,
+        # wraps unsigned, and the copy sized from it corrupts adjacent heap. Truncation-safe.
+        if declared_total > sh['byte_count']:
+            sh['underflow'] = True
+            sh['defects'].append('oemPwdLen(%d)+uniPwdLen(%d)=%d-exceeds-byteCount(%d)'
+                                 % (sh['oem_pwd_len'], sh['uni_pwd_len'],
+                                    declared_total, sh['byte_count']))
+        # CWE-125 (CVE-2026-56719 class): uniPwdLen reaches past the bytes the frame actually
+        # carries, so the handler's read leaves the request buffer. Depends on bytes present.
+        if full_frame:
+            after_oem = max(0, sh['bytes_present'] - max(0, sh['oem_pwd_len']))
+            if sh['uni_pwd_len'] > after_oem:
+                sh['overread'] = True
+                sh['defects'].append('uniPwdLen(%d)-reads-past-frame(bytes_present=%d,after_oem=%d)'
+                                     % (sh['uni_pwd_len'], sh['bytes_present'], after_oem))
+    elif wc == _MIKROTIK_SESSIONSETUP_WC_EXTSEC:
+        # No uniPwdLen here (reading +16 would be half of Capabilities). The analogous bound
+        # is the security blob; an overrun is still malformed, but it is NOT attributed to
+        # either CVE, because neither names this field.
+        blob_len = int.from_bytes(words[14:16], 'little')
+        if blob_len > sh['byte_count']:
+            sh['defects'].append('securityBlobLength(%d)-exceeds-byteCount(%d)'
+                                 % (blob_len, sh['byte_count']))
+    if full_frame and sh['byte_count'] > sh['bytes_present']:
+        sh['defects'].append('byteCount(%d)-exceeds-bytes-present(%d)'
+                             % (sh['byte_count'], sh['bytes_present']))
+    return sh
+
+
+def _mikrotik_smb1_oob_affected(version):
+    """CVE-2026-56719 / CVE-2026-89028: both fixed in RouterOS 7.24. Vendor-style wide bound
+    (every 6.x, and 7.x below 7.24); the error is taken in the safe direction because a too-
+    narrow screen silently drops a vulnerable device while a slightly wide one costs only a
+    flag. Detection does NOT depend on this predicate — the malformation is read off the wire."""
+    t = _mikrotik_version_tuple(version)
+    if t is None:
+        return None
+    if t[0] == 6:
+        return True
+    if t[0] == 7:
+        return t < (7, 24, 0)
+    return None
+
+
+# --- MTK-023: web-mgmt HTTP request body-length underflow (CVE-2026-84411) ---------------
+# STRUCTURAL CLASS, not a CVE-exact signature: MikroTik and CISA (ICSA-26-272-06) both
+# withheld the function, path and corruption primitive, and there is no public PoC, so a
+# field-exact signature does not exist to be written. CWE-191 in body handling means a length
+# subtraction underflowed, and HTTP grammar bounds the small, closed set of ways a request can
+# lie about its body length. Confidence is medium BY CONSTRUCTION — a real malformation, but
+# not proof THIS CVE was the target. The delivered-vs-declared case (Content-Length declaring
+# far more than it sends) needs a flow-close "client done" signal the bounded single-segment
+# capture does not carry, so it is NOT evaluated here; the header-local cases are.
+_MIKROTIK_CL_RE = re.compile(rb'^[0-9]+$')
+_MIKROTIK_CL_MAX_DIGITS = 4096
+_MIKROTIK_MAX_SANE_BODY = 1 << 30        # 1 GiB: past any real WebFig request
+_MIKROTIK_CHUNK_MAX = 1 << 30
+_MIKROTIK_HEXDIG_RE = re.compile(rb'^[0-9A-Fa-f]+$')
+
+
+def _mikrotik_body_length_defects(head):
+    """Structural defects in a request's declared body length (the CVE-2026-84411 shape).
+    `head` is the raw header block (no trailing CRLFCRLF). Read RAW, not from a framed
+    request, because a negative Content-Length is otherwise clamped away by max(0, int(cl))."""
+    defects = []
+    lines = head.split(b'\r\n')
+    cls = []
+    te_chunked = False
+    for raw in lines[1:]:
+        for line in raw.split(b'\n'):
+            if b':' not in line:
+                continue
+            k, _, v = line.partition(b':')
+            key = k.strip().lower()
+            val = v.strip()
+            if key == b'content-length':
+                cls.append(val)
+            elif key == b'transfer-encoding' and b'chunked' in val.lower():
+                te_chunked = True
+    # conflicting / duplicate declarations
+    distinct = set(cls)
+    if len(cls) > 1:
+        if len(distinct) > 1:
+            defects.append('multiple-conflicting-content-length:'
+                           + ','.join(sorted(c.decode('latin-1', 'replace') for c in distinct)))
+        else:
+            defects.append('duplicate-content-length')
+    for c in cls:
+        # not a non-negative integer at all (a leading sign, an embedded space, any non-digit)
+        if len(c) > _MIKROTIK_CL_MAX_DIGITS:
+            defects.append('content-length-absurdly-long-field:%d-bytes' % len(c))
+            continue
+        if not _MIKROTIK_CL_RE.match(c):
+            defects.append('content-length-not-a-non-negative-integer:%s'
+                           % c[:32].decode('latin-1', 'replace'))
+            continue
+        n = int(c)
+        # a valid non-negative integer, but too large to be a body length
+        if n >= (1 << 64):
+            defects.append('content-length-exceeds-64-bit:%d' % n)
+        elif n > _MIKROTIK_MAX_SANE_BODY:
+            defects.append('content-length-absurd:%d' % n)
+    # both framing mechanisms at once
+    if cls and te_chunked:
+        defects.append('content-length-with-transfer-encoding-chunked')
+    return defects
+
+
+def _mikrotik_chunk_size_defects(body):
+    """Defects in the chunk-size lines of a chunked body (RFC 9112 7.1 = 1*HEXDIG). int(x,16)
+    is NOT that test — it accepts a '0x' prefix, a sign and whitespace — so the regex is the
+    gate and int() runs only behind it."""
+    defects = []
+    off = 0
+    guard = 0
+    while off < len(body) and guard < 256:
+        guard += 1
+        nl = body.find(b'\r\n', off)
+        if nl < 0:
+            break
+        token = body[off:nl].split(b';')[0].strip()
+        if not token:
+            defects.append('chunk-size-empty')        # blank where a size belongs; terminator is '0'
+            break
+        if not _MIKROTIK_HEXDIG_RE.match(token):
+            defects.append('chunk-size-not-hex:%s' % token[:32].decode('latin-1', 'replace'))
+            break
+        size = int(token, 16)
+        if size > _MIKROTIK_CHUNK_MAX:
+            defects.append('chunk-size-absurd:%d' % size)
+            break
+        if size == 0:
+            break
+        off = nl + 2 + size + 2
+    if guard >= 256:
+        defects.append('chunk-count-runaway')
+    return defects
+
+
+def _mikrotik_web_mgmt_underflow_affected(version):
+    """CVE-2026-84411: RouterOS before 7.24, INCLUDING RouterOS v6 (CISA ICSA-26-272-06 and
+    MikroTik both say "before 7.24 (including RouterOS v6)"). As of the 2026-10-06 advisory the
+    v6/v7 long-term fixes were still release-pending, so every 6.x and every 7.x below 7.24 is
+    inside the range."""
+    t = _mikrotik_version_tuple(version)
+    if t is None:
+        return None
+    if t[0] == 6:
+        return True
+    if t[0] == 7:
+        return t < (7, 24, 0)
+    return None
+
+
 def _mikrotik_analyze(records):
     """Pure classifier over parsed guard packets -> MikroTik findings + verdict.
     Separated from capture so the self-test can drive it with synthetic packets."""
@@ -21682,6 +23655,7 @@ def _mikrotik_analyze(records):
     gated_hits = []             # (server, code) for the MTK-C01 correlation
     dev_version = {}            # device addr -> (version, source)   (MTK-021)
     ssh_seen = set()            # device addrs with SSH on the wire   (MTK-021)
+    web_mgmt_affected = set()   # device addrs inside CVE-2026-84411 range (MTK-023 posture)
 
     def add(code, name, sev, klass, src, cves, detail):
         key = (code, src)
@@ -21720,6 +23694,11 @@ def _mikrotik_analyze(records):
                 # family attributes to the same box.
                 for a in {src, mndp.get('ipv4'), mndp.get('ipv6')} - {None, ''}:
                     dev_version[a] = (ver, 'mndp')
+                # MTK-023 posture substrate: a device whose MNDP version is inside the
+                # CVE-2026-84411 range is exposed with no crafted interaction required.
+                if _mikrotik_web_mgmt_underflow_affected(ver) is True:
+                    for a in {src, mndp.get('ipv4'), mndp.get('ipv6')} - {None, ''}:
+                        web_mgmt_affected.add(a)
             if ver and _mikrotik_chimay_red_affected(ver) is True:
                 name, cve = _MIKROTIK_REGISTRY['MTK-011']
                 add('MTK-011', name, 'HIGH', 'POSTURE', src, [cve],
@@ -21809,9 +23788,59 @@ def _mikrotik_analyze(records):
                               'reported regardless of the target patch level.')})
             continue
 
-        # --- SMB (TCP/139,445): MTK-002 malformed pre-auth NBSS
+        # --- SMB (TCP/139,445): MTK-022 SessionSetupAndX + MTK-002 malformed pre-auth NBSS
         if sport in _MIKROTIK_SMB_PORTS or dport in _MIKROTIK_SMB_PORTS:
             if pl and dport in _MIKROTIK_SMB_PORTS:               # client -> server
+                # MTK-022 (shared parser smb1-sessionsetupandx) is evaluated FIRST and on its
+                # own anchor (\xffSMB + command 0x73), because a SessionSetupAndX normally has
+                # a perfectly well-formed NBSS wrapper — the malformation is one field deeper —
+                # so gating it behind an NBSS defect would blind it on exactly the traffic it
+                # exists to catch. The (code, src) dedup is the per-flow latch.
+                sh = _mikrotik_sessionsetup(pl)
+                if sh and sh['defects']:
+                    relations = []
+                    if sh['overread']:
+                        relations.append('read-past-frame')
+                    if sh['underflow']:
+                        relations.append('length-arithmetic-underflow')
+                    base = {'port': dport, 'word_count': sh['word_count'],
+                            'byte_count': sh['byte_count'], 'bytes_present': sh['bytes_present'],
+                            'defects': sh['defects']}
+                    if sh.get('truncated'):
+                        base['snaplen_truncated'] = True
+                    if relations:
+                        ver = (dev_version.get(dst) or (None, None))[0]
+                        base.update({'relations': relations, 'oem_pwd_len': sh['oem_pwd_len'],
+                                     'uni_pwd_len': sh['uni_pwd_len'], 'confidence': 'high'})
+                        if ver:
+                            base['version'] = ver
+                            base['version_screen'] = ('patched-7.24-or-later'
+                                                      if _mikrotik_smb1_oob_affected(ver) is False
+                                                      else 'inside-affected-range')
+                        base['note'] = (
+                            'SMB1 SessionSetupAndX on tcp/%d carries a crafted uniPwdLen=%d '
+                            '(oemPwdLen=%d, byteCount=%d, %d bytes present): %s. The handler '
+                            'runs BEFORE credential validation (PR:N). CVE-2026-56719 reads '
+                            'past the request buffer and CVE-2026-89028 corrupts adjacent heap '
+                            'from the same field; the frame crosses the tap, the outcome does '
+                            'not, so it is reported once against both rather than guessed into '
+                            'one.' % (dport, sh['uni_pwd_len'], sh['oem_pwd_len'],
+                                      sh['byte_count'], sh['bytes_present'], '; '.join(sh['defects'])))
+                        name, _cve = _MIKROTIK_REGISTRY['MTK-022']
+                        add('MTK-022', name, 'HIGH', 'ATTACK', dst,
+                            list(_MIKROTIK_MTK022_CVES), base)
+                    else:
+                        # Malformed, but not the uniPwdLen shape either CVE names — reported
+                        # under the generic RouterOS SMB code (MTK-002), not invented into the
+                        # new one (the mutation that files a non-uniPwdLen frame under MTK-022).
+                        base['shape'] = 'not-unipwdlen'
+                        base['note'] = (
+                            'malformed SMB1 SessionSetupAndX on tcp/%d: %s. Does not match the '
+                            'uniPwdLen shape of CVE-2026-56719 / CVE-2026-89028, so reported as '
+                            'a generic RouterOS SMB implementation defect rather than attributed '
+                            'to either.' % (dport, '; '.join(sh['defects'])))
+                        name, cve = _MIKROTIK_REGISTRY['MTK-002']
+                        add('MTK-002', name, 'HIGH', 'ATTACK', dst, [cve], base)
                 mtype, defects = _mikrotik_nbss_defects(pl)
                 if defects and mtype == 0x81:
                     name, cve = _MIKROTIK_REGISTRY['MTK-002']
@@ -21934,6 +23963,29 @@ def _mikrotik_analyze(records):
                                   'MikroTik origin — the autoupgrade origin bypass '
                                   '(CVE-2019-3977) that installs an attacker-supplied '
                                   'firmware image.' % host)})
+            # MTK-023 — web-mgmt HTTP body-length underflow (CVE-2026-84411), structural class.
+            # Read the RAW header block out of this segment (not the parsed request), because a
+            # negative Content-Length is otherwise clamped before any consumer sees it.
+            raw_head, _sep, raw_body = pl.partition(b'\r\n\r\n')
+            bl_defects = _mikrotik_body_length_defects(raw_head)
+            if 'chunked' in headers.get('transfer-encoding', '').lower():
+                bl_defects = bl_defects + _mikrotik_chunk_size_defects(raw_body)
+            if bl_defects:
+                name, cve = _MIKROTIK_REGISTRY['MTK-023']
+                add('MTK-023', name, 'HIGH', 'ATTACK', dst, [cve],
+                    {'target': target, 'defects': bl_defects, 'confidence': 'medium',
+                     'detect': 'structural-class', 'ceiling': 'vendor-withheld-malformation',
+                     'note': ('request to the RouterOS web management service on tcp/%s declares '
+                              'its body length inconsistently: %s. CVE-2026-84411 is an integer '
+                              'underflow (CWE-191) in body handling, unauthenticated, root on '
+                              'success. STRUCTURAL CLASS, NOT A CVE-EXACT MATCH: MikroTik and '
+                              'CISA withheld the function, path and corruption primitive, so no '
+                              'field-exact signature exists — this says a request lied about its '
+                              'body length in a way that underflows a length computation, which '
+                              'is the SHAPE of the CVE, not proof of it. Confidence medium by '
+                              'construction; verify the device build and patch state.'
+                              % (dport, '; '.join(bl_defects)))})
+                gated_hits.append((dst, 'MTK-023'))
             continue
 
     # --- MTK-021: MikroTrick EXPOSURE — affected RouterOS version AND SSH on the wire.
@@ -21959,6 +24011,28 @@ def _mikrotik_analyze(records):
                       'finding is NOT evidence of safety. Check the device: logs for '
                       '"user -2", an unexpected "ops" account, and the Flagged marker in '
                       '/system/device-mode/print.' % ver)})
+
+    # --- MTK-023 posture leg: version-screen exposure (CVE-2026-84411). Like MTK-011, no
+    # crafted interaction has to cross the tap — one unauthenticated request is root and no
+    # CVE-exact signature exists because the malformation was withheld. Skipped where the
+    # body-length EVENT already fired on that address, so the stronger signal wins; phrased as
+    # "verify this device", never a vulnerable verdict (an MNDP string is advertised, not proof).
+    for addr in sorted(web_mgmt_affected):
+        if ('MTK-023', addr) in seen_codes:
+            continue
+        ver = (dev_version.get(addr) or (None, None))[0]
+        name, cve = _MIKROTIK_REGISTRY['MTK-023']
+        add('MTK-023', name, 'HIGH', 'POSTURE', addr, [cve],
+            {'version': ver, 'posture_only': True, 'detect': 'version-screen',
+             'ceiling': 'vendor-withheld-malformation', 'confidence': 'medium',
+             'note': ('RouterOS %s advertised over MNDP is inside the CVE-2026-84411 range '
+                      '(fixed in 7.24; v6 and v7 long-term fixes were still release-pending at '
+                      'the 2026-10-06 advisory). The web management service behind WebFig takes '
+                      'one unauthenticated crafted request to root; no attempt was observed on '
+                      'this capture and no CVE-exact signature exists — the malformation was not '
+                      'disclosed. VERIFY THIS DEVICE build and whether www/www-ssl are reachable '
+                      'from anywhere untrusted; this is exposure, not a vulnerable verdict.'
+                      % (ver or 'unknown'))})
 
     # --- MTK-C01: a gated exploit code fired on a device already serving cleartext mgmt
     for (dev, code) in gated_hits:
@@ -22043,10 +24117,13 @@ def _mikrotik_selftest():
     check('mikrotik-chimay-posture',
           [_guard_rec(proto='UDP', sport=5678, dport=5678, payload=mndp('6.30.0'))],
           'posture', ['MTK-011'])
-    # A patched version raises nothing.
-    check('mikrotik-chimay-patched',
-          [_guard_rec(proto='UDP', sport=5678, dport=5678, payload=mndp('6.48.6'))],
-          'clean')
+    # A Chimay-Red-patched version raises no MTK-011. (6.48.6 is still inside the broad
+    # CVE-2026-84411 v6 range, so MTK-023 posture does fire — that is asserted separately.)
+    r = _mikrotik_analyze([_guard_rec(proto='UDP', sport=5678, dport=5678, payload=mndp('6.48.6'))])
+    _codes_chimay = {f['code'] for f in r['findings']}
+    scenarios.append({'name': 'mikrotik-chimay-patched',
+                      'expect': 'no MTK-011', 'got': str(sorted(_codes_chimay)),
+                      'pass': 'MTK-011' not in _codes_chimay})
     # MTK-003 Winbox path traversal.
     check('mikrotik-winbox-traversal',
           [_guard_rec(proto='TCP', dport=8291,
@@ -22158,16 +24235,128 @@ def _mikrotik_selftest():
                       payload=mndp_addr('7.22.1', ipv4='10.0.0.41')),
            ssh_syn('10.0.0.41')],
           'exposure', ['MTK-021'])
-    # Affected version but NO SSH seen: nothing (the exposure needs SSH on the wire).
-    r = check('mikrotik-mtk021-needs-ssh',
-              [_guard_rec(proto='UDP', src='10.0.0.50', sport=5678, dport=5678,
-                          payload=mndp('7.22.1'))], 'clean')
+    # Affected version but NO SSH seen: no MTK-021 (the exposure needs SSH on the wire).
+    # 7.22.1 is inside the CVE-2026-84411 range, so MTK-023 posture fires; MTK-021 must not.
+    r = _mikrotik_analyze([_guard_rec(proto='UDP', src='10.0.0.50', sport=5678, dport=5678,
+                                      payload=mndp('7.22.1'))])
+    _codes_needssh = {f['code'] for f in r['findings']}
+    scenarios.append({'name': 'mikrotik-mtk021-needs-ssh',
+                      'expect': 'no MTK-021 without SSH', 'got': str(sorted(_codes_needssh)),
+                      'pass': 'MTK-021' not in _codes_needssh})
     # A non-MikroTik SSH server contributes nothing, even on an affected-looking network.
     check('mikrotik-mtk021-openssh-ignored',
           [ssh_banner('10.0.0.60', 'OpenSSH_9.6p1 Debian-4'), ssh_syn('10.0.0.60')], 'clean')
     # IPv6 parity: the banner over IPv6 raises the same finding.
     check('mikrotik-mtk021-ipv6', [ssh_banner('2001:db8::30', 'ROSSSH-7.20.8', ipver=6)],
           'exposure', ['MTK-021'])
+
+    # --- MTK-022 SMB1 SessionSetupAndX crafted uniPwdLen (CVE-2026-56719 + CVE-2026-89028) ---
+    def smb_ss(wc, oem=0, uni=0, byte_count=0, block=b'', blob=None, nbss_len=None):
+        """Build an NBSS-wrapped SMB1 SessionSetupAndX by hand."""
+        hdr = _MIKROTIK_SMB1_MAGIC + bytes([_MIKROTIK_SMB_COM_SESSION_SETUP_ANDX]) + b'\x00' * 27
+        words = bytearray(wc * 2)
+        if wc == _MIKROTIK_SESSIONSETUP_WC_NTLM:
+            words[14:16] = oem.to_bytes(2, 'little')
+            words[16:18] = uni.to_bytes(2, 'little')
+        elif wc == _MIKROTIK_SESSIONSETUP_WC_EXTSEC and blob is not None:
+            words[14:16] = blob.to_bytes(2, 'little')
+        param = bytes([wc]) + bytes(words) + byte_count.to_bytes(2, 'little') + block
+        body = hdr + param
+        ln = len(body) if nbss_len is None else nbss_len
+        ext = (ln >> 16) & 0x01
+        return bytes([0x00, ext]) + (ln & 0xFFFF).to_bytes(2, 'big') + body
+
+    def smb_rec(payload):
+        return _guard_rec(proto='TCP', src='10.0.0.70', sport=50000,
+                          dst='10.0.0.71', dport=445, payload=payload)
+
+    # A well-formed SessionSetupAndX (passwords fit the byte block) raises nothing.
+    check('mikrotik-mtk022-wellformed',
+          [smb_rec(smb_ss(13, oem=24, uni=24, byte_count=48, block=b'\x00' * 48))], 'clean')
+    # The minimal crafted-uniPwdLen frame — both relations trip (the canonical 56719 case).
+    r = check('mikrotik-mtk022-crafted-unipwdlen',
+              [smb_rec(smb_ss(13, oem=0, uni=4096, byte_count=0, block=b''))],
+              'attack', ['MTK-022'])
+    f22 = [f for f in r['findings'] if f['code'] == 'MTK-022']
+    scenarios.append({'name': 'mikrotik-mtk022-names-both-cves',
+                      'expect': str(_MIKROTIK_MTK022_CVES),
+                      'got': str(f22[0]['cves'] if f22 else None),
+                      'pass': bool(f22) and f22[0]['cves'] == _MIKROTIK_MTK022_CVES})
+    # Underflow relation alone (declared lengths exceed ByteCount while the bytes are present).
+    check('mikrotik-mtk022-underflow-only',
+          [smb_rec(smb_ss(13, oem=200, uni=200, byte_count=0, block=b'\x00' * 400))],
+          'attack', ['MTK-022'])
+    # A malformed SessionSetupAndX that is NOT the uniPwdLen shape -> generic MTK-002, not 022.
+    r = check('mikrotik-mtk022-not-unipwdlen-is-mtk002',
+              [smb_rec(smb_ss(12, blob=4096, byte_count=0, block=b''))],
+              'attack', ['MTK-002'])
+    scenarios.append({'name': 'mikrotik-mtk022-wc12-not-filed-as-022',
+                      'expect': 'no MTK-022 on a WordCount-12 frame',
+                      'got': str(sorted({f['code'] for f in r['findings']})),
+                      'pass': 'MTK-022' not in {f['code'] for f in r['findings']}})
+    # WordCount-12 extended-security, well formed: the +16 uniPwdLen read must NOT run here.
+    check('mikrotik-mtk022-wc12-wellformed',
+          [smb_rec(smb_ss(12, blob=10, byte_count=10, block=b'\x00' * 10))], 'clean')
+    # Snaplen truncation must not false-positive: NBSS declares a long frame, capture is short,
+    # declared lengths are internally consistent -> nothing fires.
+    check('mikrotik-mtk022-truncated-no-fp',
+          [smb_rec(smb_ss(13, oem=24, uni=24, byte_count=48, block=b'\x00' * 10, nbss_len=32 + 1 + 26 + 2 + 48))],
+          'clean')
+
+    # --- MTK-023 web-mgmt HTTP body-length underflow (CVE-2026-84411), structural class ---
+    def http80(payload):
+        return _guard_rec(proto='TCP', src='10.0.0.80', sport=50001,
+                          dst='10.0.0.81', dport=80, payload=payload)
+
+    # A negative Content-Length — the single most underflow-shaped input there is.
+    check('mikrotik-mtk023-negative-cl',
+          [http80(b'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: -5\r\n\r\n')],
+          'attack', ['MTK-023'])
+    # A non-numeric Content-Length.
+    check('mikrotik-mtk023-nonnumeric-cl',
+          [http80(b'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n')],
+          'attack', ['MTK-023'])
+    # A Content-Length wider than 64 bits.
+    check('mikrotik-mtk023-over-64-bit-cl',
+          [http80(b'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999999999999999999\r\n\r\n')],
+          'attack', ['MTK-023'])
+    # Two conflicting Content-Length values on one request.
+    check('mikrotik-mtk023-conflicting-cl',
+          [http80(b'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 9\r\n\r\n')],
+          'attack', ['MTK-023'])
+    # Content-Length together with Transfer-Encoding: chunked.
+    check('mikrotik-mtk023-cl-and-te',
+          [http80(b'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n')],
+          'attack', ['MTK-023'])
+    # A chunk size that is not valid hex (RFC 9112 7.1 = 1*HEXDIG).
+    check('mikrotik-mtk023-bad-chunk-size',
+          [http80(b'POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nXYZ\r\nhi\r\n')],
+          'attack', ['MTK-023'])
+    # A well-formed request with a sane Content-Length raises nothing (FP guard).
+    check('mikrotik-mtk023-wellformed-no-fp',
+          [http80(b'GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n')], 'clean')
+    # MTK-023 posture from an MNDP version inside the CVE-2026-84411 range (v7 < 7.24, so it is
+    # not also Chimay-Red): a posture-only exposure, no attempt on the wire.
+    r = check('mikrotik-mtk023-posture',
+              [_guard_rec(proto='UDP', src='10.0.0.82', sport=5678, dport=5678,
+                          payload=mndp('7.20.0'))], 'posture', ['MTK-023'])
+    f23 = [f for f in r['findings'] if f['code'] == 'MTK-023']
+    scenarios.append({'name': 'mikrotik-mtk023-posture-is-not-a-verdict',
+                      'expect': 'posture_only, confidence medium, names CVE-2026-84411',
+                      'got': str(f23[0]['detail'] if f23 else None),
+                      'pass': bool(f23) and (f23[0]['detail'] or {}).get('posture_only') is True
+                      and (f23[0]['detail'] or {}).get('confidence') == 'medium'
+                      and f23[0]['cves'] == ['CVE-2026-84411']})
+    # A patched version (7.24.0) raises no MTK-023 posture.
+    check('mikrotik-mtk023-patched',
+          [_guard_rec(proto='UDP', src='10.0.0.83', sport=5678, dport=5678,
+                      payload=mndp('7.24.0'))], 'clean')
+    # Registry wiring: both v3 codes present, MTK-022 carries its two CVEs.
+    scenarios.append({'name': 'mikrotik-v3-registry',
+                      'expect': 'MTK-022 + MTK-023 registered; MTK-022 = 2 CVEs',
+                      'got': str(sorted(_MIKROTIK_REGISTRY)[-2:]) + ' ' + str(_MIKROTIK_MTK022_CVES),
+                      'pass': ('MTK-022' in _MIKROTIK_REGISTRY and 'MTK-023' in _MIKROTIK_REGISTRY
+                               and len(_MIKROTIK_MTK022_CVES) == 2)})
 
     failed = sum(1 for s in scenarios if not s['pass'])
     return {'success': failed == 0, 'passed': len(scenarios) - failed,
@@ -23012,6 +25201,238 @@ def _apc_selftest():
             'total': len(scenarios), 'scenarios': scenarios}
 
 
+# ==========================================================================
+# Liebert Guard — passive Vertiv / Liebert power-management web-UI monitor
+# ==========================================================================
+# Companion to APC Guard on the power plane. The detection engine is the vendored
+# standalone liebert_guard (python/liebert_guard.py, stdlib only): RomPager
+# Misfortune Cookie banner screening (CVE-2014-9222, Liebert MPH rack PDUs /
+# RPC-1000 cards) and the oversized-HTTP-method request that overflows Liebert
+# RDU101 / IS-UNITY cards (CVE-2025-41426). In-app we capture one bounded window
+# on the chosen HTTP port with tcpdump and replay the pcap through its Detector
+# with packet timestamps. The module filters in-process; the capture filter adds
+# the shared IPv6 extension-header clause so a v6 head behind one still arrives.
+# Never transmits.
+_LIEBERT_GUARD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   'data', 'liebert_guard.json')
+_liebert_guard_lock = threading.Lock()
+_LIEBERT_PY_DIR = _APC_PY_DIR
+_LIEBERT_SEVERITY = {'info': 'INFO', 'low': 'LOW', 'high': 'HIGH', 'critical': 'CRITICAL'}
+# Banner screening is posture (a version in range, not proof); the long-method
+# request is an attempt.
+_LIEBERT_KLASS = {'LG-001': 'POSTURE', 'LG-002': 'POSTURE', 'LG-003': 'POSTURE',
+                  'LG-101': 'ATTACK'}
+_LIEBERT_NAMES = {
+    'LG-001': 'RomPager banner below 4.34 — Misfortune Cookie range',
+    'LG-002': 'RomPager banner, version not parseable',
+    'LG-003': 'RomPager 4.34 or later (inventory)',
+    'LG-101': 'Oversized HTTP method — Liebert RDU101 / IS-UNITY overflow shape',
+}
+_LIEBERT_CVES = ('CVE-2014-9222', 'CVE-2025-41426')
+
+
+def _liebert_module():
+    if _LIEBERT_PY_DIR not in sys.path:
+        sys.path.insert(0, _LIEBERT_PY_DIR)
+    import liebert_guard
+    return liebert_guard
+
+
+def _liebert_bpf(port):
+    return 'tcp port %d or %s' % (port, _GUARD_IP6_EXTHDR_BPF)
+
+
+def _liebert_map_finding(f):
+    code = f.get('code', '')
+    detail = {k: f.get(k) for k in ('server', 'client', 'port', 'family', 'banner',
+                                     'version', 'note') if f.get(k) is not None}
+    if f.get('detail'):
+        detail['evidence'] = f['detail']
+    # The source of an attempt is the client; of a banner, the server itself.
+    src = f.get('client') if code == 'LG-101' else f.get('server')
+    return {'code': code, 'name': _LIEBERT_NAMES.get(code, code),
+            'severity': _LIEBERT_SEVERITY.get(f.get('severity'), 'MEDIUM'),
+            'klass': _LIEBERT_KLASS.get(code, 'POSTURE'),
+            'cves': [f['cve']] if f.get('cve') else [],
+            'src': src, 'detail': detail}
+
+
+def _liebert_analyze_pcap(path, port=80):
+    """Replay a classic pcap through liebert_guard.Detector. Returns (findings, frames)."""
+    lg = _liebert_module()
+    raw, n = [], 0
+    det = lg.Detector(port=port, emit=raw.append)
+    for ts, frame, lt in lg.read_pcap(path):
+        n += 1
+        try:
+            det.feed(ts, frame, lt)
+        except Exception:
+            continue
+    return [_liebert_map_finding(f) for f in raw], n
+
+
+def do_liebert_guard(interface=None, seconds=20, port=80, quick=False):
+    """Passive Vertiv / Liebert guard (detection-only). Captures one HTTP port for a
+    few seconds and replays it through the vendored liebert_guard: RomPager
+    Misfortune Cookie banners (CVE-2014-9222) and the oversized-method request
+    that overflows Liebert RDU101 / IS-UNITY cards (CVE-2025-41426). Never transmits."""
+    iface, iface_error = _lan_guard_iface(interface, 'Liebert Guard')
+    if iface_error:
+        return iface_error
+    seconds = _clamp_int(seconds, 20, 5, 60)
+    port = _clamp_int(port, 80, 1, 65535)
+    if not _have('tcpdump'):
+        return {'success': False, 'interface': iface,
+                'error': 'tcpdump is not installed. Click Install to add it.',
+                'missing_tool': 'tcpdump'}
+    try:
+        _liebert_module()
+    except Exception as e:
+        return {'success': False, 'interface': iface, 'error': 'liebert_guard module: %s' % e}
+    tmpdir = tempfile.mkdtemp(prefix='liebertguard-')
+    pcap = os.path.join(tmpdir, 'cap.pcap')
+    try:
+        res = _run(['timeout', str(seconds), 'tcpdump', '-i', iface, '-nn', '-s', '0',
+                    '-c', '20000', '-w', pcap, _liebert_bpf(port)], timeout=seconds + 8)
+        if not os.path.exists(pcap):
+            err = (res.get('err') or 'capture failed').strip()
+            return {'success': False, 'interface': iface, 'error': err[:200]}
+        try:
+            findings, frames = _liebert_analyze_pcap(pcap, port)
+        except (OSError, ValueError) as e:
+            return {'success': False, 'interface': iface, 'error': str(e)[:200]}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    result = _guard_finish('liebert_guard', iface, seconds, findings, range(frames))
+    result['port'] = port
+    if not quick:
+        _guard_record_event(_LIEBERT_GUARD_PATH, _liebert_guard_lock, result)
+    _guard_emit_jsonl('liebert_guard', result)
+    return result
+
+
+def _liebert_frame(src, dst, sport, dport, payload, seq=1000, v6=False):
+    """A minimal Ethernet/IP/TCP frame (the module does not verify checksums)."""
+    import ipaddress as _ip
+    tcp = struct.pack('!HHIIBBHHH', sport, dport, seq, 0, 0x50, 0x18, 65535, 0, 0) + payload
+    if v6:
+        ip = struct.pack('!IHBB', 0x60000000, len(tcp), 6, 64) \
+            + _ip.ip_address(src).packed + _ip.ip_address(dst).packed
+        et = 0x86DD
+    else:
+        ip = struct.pack('!BBHHHBBH', 0x45, 0, 20 + len(tcp), 1, 0, 64, 6, 0) \
+            + _ip.ip_address(src).packed + _ip.ip_address(dst).packed
+        et = 0x0800
+    return b'\x02\x00\x00\x00\x00\x02\x02\x00\x00\x00\x00\x01' + struct.pack('!H', et) + ip + tcp
+
+
+def _liebert_selftest():
+    """Liebert Guard: the vendored module tier (198 checks plus its live loopback
+    captures, run in its own interpreter — it needs scapy and its live tier is not
+    thread-safe to host) plus the in-app adapter: pcap replay, mapping, verdicts,
+    dual-stack, and a real tcpdump pass through the capture filter."""
+    scenarios = []
+
+    def sc(name, ok, expect='', got=''):
+        scenarios.append({'name': name, 'pass': bool(ok), 'expect': expect, 'got': str(got)})
+
+    try:
+        lg = _liebert_module()
+    except Exception as e:
+        return {'success': False, 'scenarios': [
+            {'name': 'liebert_guard import failed: %s' % e, 'pass': False,
+             'expect': 'import', 'got': 'error'}]}
+
+    # 1. The module's own tier. Prints '<ver>: N passed, F failed | live tier: ...'.
+    res = _run([sys.executable or 'python3', os.path.join(_LIEBERT_PY_DIR, 'test_liebert_guard.py')],
+               timeout=240)
+    out = (res.get('out') or '') + (res.get('err') or '')
+    m = re.search(r'(\d+)\s+passed,\s+(\d+)\s+failed', out)
+    if m:
+        passed, failed = int(m.group(1)), int(m.group(2))
+        for i in range(passed):
+            scenarios.append({'name': 'liebert_guard check %d' % (i + 1), 'pass': True,
+                              'expect': 'pass', 'got': 'pass'})
+        for ln in out.splitlines():
+            if ln.strip().startswith('FAIL'):
+                sc(ln.strip()[4:].strip(' :'), False, 'pass', 'FAIL')
+        if failed and not any(not s['pass'] for s in scenarios):
+            sc('liebert_guard module self-test', False, '0 failed', '%d failed' % failed)
+    else:
+        sc('liebert_guard module self-test', False, 'N passed, 0 failed',
+           'rc %s %s' % (res.get('rc'), out.strip()[-160:]))
+
+    # 2. In-app adapter.
+    srv, cli, atk = '10.9.0.5', '10.9.0.77', '203.0.113.9'
+    resp = b'HTTP/1.1 200 OK\r\nServer: RomPager/4.07 UPnP/1.0\r\nContent-Length: 0\r\n\r\n'
+    patched = b'HTTP/1.1 200 OK\r\nServer: RomPager/4.51\r\n\r\n'
+    longm = b'A' * 70 + b' / HTTP/1.1\r\nHost: x\r\n\r\n'
+    frames = [(1000.0, _liebert_frame(srv, cli, 80, 40000, resp)),
+              (1001.0, _liebert_frame(atk, srv, 40001, 80, longm)),
+              (1002.0, _liebert_frame('2001:db8::5', '2001:db8::77', 80, 40002, resp, v6=True))]
+    tmpdir = tempfile.mkdtemp(prefix='liebert-st-')
+
+    def write(path, fr):
+        with open(path, 'wb') as fh:
+            fh.write(struct.pack('<IHHiIII', 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1))
+            for ts, f in fr:
+                fh.write(struct.pack('<IIII', int(ts), 0, len(f), len(f)) + f)
+    try:
+        p0 = os.path.join(tmpdir, 'clean.pcap')
+        write(p0, [(1000.0, _liebert_frame(srv, cli, 80, 40000,
+                                           b'HTTP/1.1 200 OK\r\nServer: lighttpd/1.4\r\n\r\n'))])
+        f0, _ = _liebert_analyze_pcap(p0)
+        sc('liebert-clean-server', _guard_verdict(f0) == 'clean', 'clean', _guard_verdict(f0))
+
+        p1 = os.path.join(tmpdir, 'all.pcap')
+        write(p1, frames)
+        f1, n1 = _liebert_analyze_pcap(p1)
+        codes = sorted((f['code'], f['detail'].get('family')) for f in f1)
+        sc('liebert-rompager-v4-v6', ('LG-001', 'ipv4') in codes and ('LG-001', 'ipv6') in codes,
+           'LG-001 on both families', codes)
+        lg001 = next((f for f in f1 if f['code'] == 'LG-001'), {})
+        sc('liebert-lg001-mapping', lg001.get('severity') == 'CRITICAL'
+           and lg001.get('klass') == 'POSTURE' and lg001.get('cves') == ['CVE-2014-9222']
+           and lg001.get('src') == srv, 'CRITICAL POSTURE CVE-2014-9222 src=server',
+           {k: lg001.get(k) for k in ('severity', 'klass', 'src')})
+        lg101 = next((f for f in f1 if f['code'] == 'LG-101'), {})
+        sc('liebert-lg101-attempt', lg101.get('klass') == 'ATTACK' and lg101.get('src') == atk
+           and lg101.get('cves') == ['CVE-2025-41426'] and _guard_verdict(f1) == 'attack',
+           'ATTACK src=client → attack', {k: lg101.get(k) for k in ('klass', 'src')})
+
+        p2 = os.path.join(tmpdir, 'patched.pcap')
+        write(p2, [(1000.0, _liebert_frame(srv, cli, 80, 40000, patched))])
+        f2, _ = _liebert_analyze_pcap(p2)
+        sc('liebert-patched-is-inventory', [f['code'] for f in f2] == ['LG-003']
+           and _guard_verdict(f2) == 'observed', 'LG-003 → observed', [f['code'] for f in f2])
+
+        p3 = os.path.join(tmpdir, 'port.pcap')
+        write(p3, [(1000.0, _liebert_frame(srv, cli, 8080, 40000, resp))])
+        sc('liebert-port-selects', not _liebert_analyze_pcap(p3, 80)[0]
+           and _liebert_analyze_pcap(p3, 8080)[0], 'silent on 80, fires on 8080', '')
+
+        sc('liebert-tables-cover-codes', set(_LIEBERT_KLASS) == set(lg.SEVERITY) == set(_LIEBERT_NAMES)
+           and set(_LIEBERT_SEVERITY) >= set(lg.SEVERITY.values())
+           and set(_LIEBERT_CVES) == set(lg.CVES.values()), 'every code mapped', '')
+
+        if _have('tcpdump'):
+            pout = os.path.join(tmpdir, 'out.pcap')
+            r = _run(['tcpdump', '-nn', '-r', p1, '-w', pout, _liebert_bpf(80)], timeout=20)
+            try:
+                f4, n4 = _liebert_analyze_pcap(pout)
+            except (OSError, ValueError):
+                f4, n4 = [], 0
+            sc('liebert-tcpdump-bpf-replay', n4 == n1 == 3 and _guard_verdict(f4) == 'attack',
+               '3 frames admitted → attack', '%d frames %s %s' % (
+                   n4, _guard_verdict(f4), (r.get('err') or '')[-60:]))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    failed = sum(1 for s in scenarios if not s['pass'])
+    return {'success': failed == 0, 'passed': len(scenarios) - failed,
+            'total': len(scenarios), 'scenarios': scenarios}
+
+
 def _guard_rec(proto=None, src='10.0.0.9', sport=40000, dst='10.0.0.1',
                dport=None, payload=b'', dissect='', vlan_tags=0, ipver=4,
                ip_raw=b''):
@@ -23104,9 +25525,9 @@ def _cisco_selftest():
     # observed: a Cisco device sighting, no CVE-relevant finding.
     check('cisco-observed', [_guard_rec(dissect='Cisco IOS Software ...')],
           'observed', ['CG-001'])
-    # posture: an IOS XE version that screens into the CVE range.
+    # posture: an IOS XE version in a tracked affected train (17.12 < 17.12.5).
     check('cisco-posture', [_guard_rec(
-        dissect='Cisco IOS-XE Software, Version 17.6.3')], 'posture', ['CG-004'])
+        dissect='Cisco IOS-XE Software, Version 17.12.3')], 'posture', ['CG-004'])
     # exposure: cleartext SNMPv2c with a default community.
     check('cisco-snmp-default', [_guard_rec(
         proto='UDP', dport=161, payload=_snmp_v2c_get(b'public'))],
@@ -23129,6 +25550,74 @@ def _cisco_selftest():
     # out-of-scope firewall is screened, not misclassified as a router.
     check('cisco-oos', [_guard_rec(dissect='Cisco Adaptive Security Appliance (ASA)')],
           'observed', ['CG-009'])
+
+    # v6: NX-OS version in a tracked affected train -> CG-005 (names CVE-2025-20111).
+    _r_nx = check('cisco-nxos-posture', [_guard_rec(
+        dissect='Cisco Nexus Operating System (NX-OS) Software, Version 10.2(5)')],
+        'posture', ['CG-005'])
+    scenarios.append({'name': 'cisco-nxos-cve-named', 'expect': 'CVE-2025-20111',
+                      'got': str([f['cves'] for f in _r_nx['findings'] if f['code'] == 'CG-005']),
+                      'pass': any('CVE-2025-20111' in f['cves'] for f in _r_nx['findings']
+                                  if f['code'] == 'CG-005')})
+    # v6: a patched IOS-XE train (17.12.5 == fixed) must NOT flag CG-004.
+    _r_patched = _cisco_analyze([_guard_rec(
+        dissect='Cisco IOS-XE Software, Version 17.12.5')])
+    scenarios.append({'name': 'cisco-iosxe-patched-clean', 'expect': 'no CG-004',
+                      'got': str(sorted({f['code'] for f in _r_patched['findings']})),
+                      'pass': 'CG-004' not in {f['code'] for f in _r_patched['findings']}})
+    # v6: IOS-XE CG-004 names the August 2026 advisory wave.
+    scenarios.append({'name': 'cisco-iosxe-2026-wave-named', 'expect': 'CVE-2026-20272',
+                      'got': '', 'pass': any('CVE-2026-20272' in f['cves']
+                      for f in _cisco_analyze([_guard_rec(
+                          dissect='Cisco IOS-XE Software, Version 17.12.3')])['findings']
+                      if f['code'] == 'CG-004')})
+    # v6: Cisco Small Business switch web UI (CG-113). A vulnerable SG350 model in
+    # the HTTP response banner -> exposure; the 220 Series is excluded.
+    _smb_resp = b'HTTP/1.1 200 OK\r\nServer: Cisco SG350-28P Managed Switch\r\n\r\n'
+    check('cisco-smb-webui', [_guard_rec(proto='TCP', src='10.0.0.5', sport=80,
+          dst='10.0.0.9', dport=51000, payload=_smb_resp)], 'exposure', ['CG-113'])
+    _smb220 = b'HTTP/1.1 200 OK\r\nServer: Cisco SG220-26 Smart Switch\r\n\r\n'
+    _r_220 = _cisco_analyze([_guard_rec(proto='TCP', src='10.0.0.6', sport=80,
+             dst='10.0.0.9', dport=51001, payload=_smb220)])
+    scenarios.append({'name': 'cisco-smb-220-not-vulnerable', 'expect': 'no CG-113',
+                      'got': str(sorted({f['code'] for f in _r_220['findings']})),
+                      'pass': 'CG-113' not in {f['code'] for f in _r_220['findings']}})
+    # v6: LISP malformed control (CVE-2024-20311). Reserved LISP type on UDP/4342.
+    check('cisco-lisp-malformed', [_guard_rec(proto='UDP', sport=4342, dport=4342,
+          payload=b'\xf0\x00\x00\x02' + b'\x00' * 16)], 'attack', ['CG-240'])
+    # v6: LISP Map-Request whose source-EID AFI overruns the datagram -> CG-241.
+    check('cisco-lisp-afi', [_guard_rec(proto='UDP', sport=4342, dport=4342,
+          payload=b'\x10\x00\x00\x02' + b'\x00' * 8 + b'\x00\x02')], 'attack', ['CG-241'])
+
+    # v7: TWAMP control plane reachable (TCP/862) -> exposure CG-114.
+    check('cisco-twamp-exposed', [_guard_rec(proto='TCP', dport=862)],
+          'exposure', ['CG-114'])
+    # v7: a 64-byte TWAMP Server Greeting advertising Unauthenticated mode (Modes
+    # bit 0x1 at offset 12, MBZ tail zero) -> responder (CG-014) + unauth (CG-115).
+    _greet_ok = bytes(12) + (0x1).to_bytes(4, 'big') + bytes(36) + bytes(12)
+    _r_tw = check('cisco-twamp-unauth', [_guard_rec(proto='TCP', src='10.0.0.5',
+                  sport=862, dst='10.0.0.9', dport=50000, payload=_greet_ok)],
+                  'exposure', ['CG-014', 'CG-115'])
+    scenarios.append({'name': 'cisco-twamp-cve-named', 'expect': 'CVE-2025-20154',
+                      'got': '', 'pass': any('CVE-2025-20154' in f['cves']
+                      for f in _r_tw['findings'] if f['code'] == 'CG-114')})
+    # v7: a greeting with a nonzero MBZ tail is malformed -> CG-294.
+    _greet_bad = bytes(12) + (0x1).to_bytes(4, 'big') + bytes(36) + b'\x01' * 12
+    check('cisco-twamp-malformed', [_guard_rec(proto='TCP', sport=862, dport=50000,
+          payload=_greet_bad)], 'attack', ['CG-294'])
+    # v7: Cisco IP SLA Responder control (UDP/1967) -> exposure CG-116.
+    check('cisco-ipsla', [_guard_rec(proto='UDP', dport=1967)], 'exposure', ['CG-116'])
+    # v7: a Catalyst 9800 WLC identity -> CG-105 (CVE-2025-20188, 10.0).
+    _r_wlc = check('cisco-wlc-oob', [_guard_rec(
+        dissect='Cisco IOS XE Software, Catalyst 9800-CL Wireless Controller')],
+        'exposure', ['CG-105'])
+    scenarios.append({'name': 'cisco-wlc-cve-named', 'expect': 'CVE-2025-20188',
+                      'got': '', 'pass': any('CVE-2025-20188' in f['cves']
+                      for f in _r_wlc['findings'] if f['code'] == 'CG-105')})
+    # v7: a Catalyst SD-WAN Manager (vManage) API path -> CG-106.
+    check('cisco-sdwan', [_guard_rec(proto='TCP', dport=80,
+          payload=b'GET /dataservice/system/device HTTP/1.1\r\nHost: x\r\n\r\n')],
+          'exposure', ['CG-106'])
 
     # attack: IKEv2 message whose declared Length overruns the datagram
     # (CVE-2024-20307/20308 malformed-input shape). 28-byte header, Length=9999.
@@ -23224,6 +25713,43 @@ def _cisco_selftest():
     scenarios.append({'name': 'cisco-capwap-runt', 'expect': 'CG-292, no CG-112',
                       'got': str(sorted(_cwr)),
                       'pass': 'CG-292' in _cwr and 'CG-112' not in _cwr})
+
+    # v8: model-driven telemetry in cleartext (CG-117). The RFC 9113 HTTP/2 preface
+    # on a gNMI/gRPC port is the definitive cleartext marker.
+    check('cisco-mdt-cleartext',
+          [_guard_rec(proto='TCP', src='10.0.0.9', sport=50000, dst='10.0.0.1',
+                      dport=50052, payload=_CISCO_H2_PREFACE + b'\x00\x00\x00\x04')],
+          'exposure', ['CG-117'])
+    # a TLS-looking handshake on the same port must NOT fire CG-117 (that's tlswatch).
+    r_mdt = _cisco_analyze([_guard_rec(proto='TCP', dport=9339,
+                            payload=b'\x16\x03\x01\x00\x50' + b'\x00' * 40)])
+    scenarios.append({'name': 'cisco-mdt-tls-silent', 'expect': 'no CG-117',
+                      'got': str(sorted({f['code'] for f in r_mdt['findings']})),
+                      'pass': 'CG-117' not in {f['code'] for f in r_mdt['findings']}})
+    # v8: an observed IOS-XE device surfaces the secure-boot advisory (CG-008, INFO)
+    # naming CVE-2025-20313 / CVE-2025-20314.
+    r_sb = _cisco_analyze([_guard_rec(dissect='Cisco IOS-XE Software, Version 17.12.3')])
+    scenarios.append({'name': 'cisco-secureboot-advisory', 'expect': 'CG-008 + CVE-2025-20313',
+                      'got': str(sorted({f['code'] for f in r_sb['findings']})),
+                      'pass': any(f['code'] == 'CG-008' and 'CVE-2025-20313' in f['cves']
+                                  for f in r_sb['findings'])})
+    # v8: the IE Switch Device Manager web UI DoS (CVE-2025-20327) folds into CG-103.
+    scenarios.append({'name': 'cisco-ie-devicemgr-cve', 'expect': 'CG-103 names CVE-2025-20327',
+                      'got': '', 'pass': any('CVE-2025-20327' in f['cves']
+                      for f in _cisco_analyze([_guard_rec(proto='TCP', dport=80,
+                          payload=b'GET / HTTP/1.1\r\nHost: x\r\n\r\n')])['findings']
+                      if f['code'] == 'CG-103')})
+    # v8: the Catalyst 9000 crafted-frame egress block (CVE-2025-20311) folds into CG-220.
+    scenarios.append({'name': 'cisco-vlan-egress-cve', 'expect': 'CG-220 names CVE-2025-20311',
+                      'got': '', 'pass': any('CVE-2025-20311' in f['cves']
+                      for f in _cisco_analyze([_guard_rec(proto='TCP', dport=80,
+                          vlan_tags=4)])['findings'] if f['code'] == 'CG-220')})
+    # v8: the EOL SMB switch default-account re-enable (CVE-2018-15439) folds into CG-113.
+    scenarios.append({'name': 'cisco-smb-defaultacct-cve', 'expect': 'CG-113 names CVE-2018-15439',
+                      'got': '', 'pass': any('CVE-2018-15439' in f['cves']
+                      for f in _cisco_analyze([_guard_rec(proto='TCP', src='10.0.0.5',
+                          sport=80, dst='10.0.0.9', dport=51000, payload=_smb_resp)])['findings']
+                      if f['code'] == 'CG-113')})
 
     # --- Scapy end-to-end: craft SNMP default-community -> pcap -> tcpdump -X. ---
     scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
@@ -23403,108 +25929,74 @@ def _juniper_selftest():
     return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
 
 
-def _radius_packet(code=1, attrs=None):
-    """Craft a RADIUS packet for the self-test. attrs: list of (type, value)."""
-    body = b''
-    for atype, val in (attrs or []):
-        body += bytes([atype, len(val) + 2]) + val
-    length = 20 + len(body)
-    return bytes([code, 1]) + length.to_bytes(2, 'big') + bytes(16) + body
-
-
 def _arista_selftest():
-    """Self-test the Arista guard detectors with synthetic records + a scapy
-    end-to-end leg (crafted RADIUS + SSH banner -> pcap -> tcpdump -X -> parse)."""
+    """Arista Guard: run the vendored aristaguard engine's own offline suite (the
+    test_* functions — catalog, version screening, parsers, posture/RADIUS/tunnel/VLAN/
+    dot1x/OSPFv3 rules, BlastRADIUS fixes, IPv6 extension headers, the passive-invariant
+    AST guard — pure-python, no scapy), plus the in-app adapter: Finding mapping, catalog
+    exposure, empty-capture cleanliness, and a Scapy pcap end-to-end leg mirroring the
+    engine's own posture fixture (Arista LLDP -> AG-001 EOS version observed)."""
+    import io as _io
+    import contextlib as _ctx
     scenarios = []
 
-    def check(name, recs, expect_verdict, expect_codes=()):
-        res = _arista_analyze(recs)
-        codes = {f['code'] for f in res['findings']}
-        ok = res['verdict'] == expect_verdict and all(c in codes for c in expect_codes)
-        scenarios.append({'name': name, 'expect': f'{expect_verdict}/{list(expect_codes)}',
-                          'got': f"{res['verdict']}/{sorted(codes)}", 'pass': ok})
-        return res
+    def sc(name, ok, expect='', got=''):
+        scenarios.append({'name': name, 'pass': bool(ok), 'expect': expect, 'got': str(got)})
 
-    check('arista-clean', [], 'clean')
-    check('arista-observed', [_guard_rec(dissect='Arista Networks EOS-4.29.2F running')],
-          'observed', ['AG-001'])
-    check('arista-oos', [_guard_rec(dissect='Arista CloudVision Portal 2024.1.0')],
-          'observed', ['AG-009'])
-    # RADIUS Access-Request without Message-Authenticator -> AG-101 + AG-102.
-    check('arista-radius-noauth', [_guard_rec(proto='UDP', dport=1812,
-        payload=_radius_packet(1, [(1, b'admin')]))], 'exposure', ['AG-101', 'AG-102'])
-    # BlastRADIUS collision-block shape: Proxy-State (33) bytes SUMMED > 128 -> AG-201.
-    check('arista-radius-forgery', [_guard_rec(proto='UDP', dport=1812,
-        payload=_radius_packet(1, [(33, b'X' * 200)]))], 'attack', ['AG-201'])
-    # Response with no Message-Authenticator -> AG-110 (exposure, renumbered v3).
-    check('arista-radius-resp', [_guard_rec(proto='UDP', sport=1812, dport=41000,
-        payload=_radius_packet(2, [(1, b'ok')]))], 'exposure', ['AG-110'])
-    # Access-Accept with M-A present but NOT first -> AG-110 case not_first.
-    check('arista-radius-ma-not-first', [_guard_rec(proto='UDP', sport=1812,
-        dport=41000, payload=_radius_packet(2, [(1, b'ok'), (80, bytes(16))]))],
-        'exposure', ['AG-110'])
-    # Proxy-State injected on the NAS-side leg: request 'AAAA', response 'BBBB' ->
-    # AG-212. The two records correlate on 4-tuple + Identifier.
-    check('arista-radius-proxy-injected', [
-        _guard_rec(proto='UDP', src='10.0.0.9', dst='10.0.0.1', sport=40000,
-                   dport=1812, payload=_radius_packet(1, [(33, b'AAAA')])),
-        _guard_rec(proto='UDP', src='10.0.0.1', dst='10.0.0.9', sport=1812,
-                   dport=40000, payload=_radius_packet(2, [(33, b'BBBB')]))],
-        'attack', ['AG-212'])
-    # Collision block smuggled in a Reply-Message (invalid UTF-8) -> AG-213.
-    check('arista-radius-reply-malformed', [_guard_rec(proto='UDP', sport=1812,
-        dport=41000, payload=_radius_packet(2, [(18, b'\xff\xfebad')]))],
-        'attack', ['AG-213'])
-    # Opaque Vendor-Specific attribute (long, high-entropy, non-printable) -> AG-214.
-    _vsa = bytes([0, 0, 0, 9, 1, 82]) + bytes([200 + (i % 55) for i in range(80)])
-    check('arista-radius-opaque', [_guard_rec(proto='UDP', sport=1812, dport=41000,
-        payload=_radius_packet(2, [(26, _vsa)]))], 'attack', ['AG-214'])
-    # gNOI TransferToRemote credential marker in a RADIUS accounting record -> AG-211.
-    check('arista-radius-accounting-cred', [_guard_rec(proto='UDP', dport=1813,
-        payload=b'\x04\x01' + (41).to_bytes(2, 'big') + bytes(16)
-                + b'gNOI TransferToRemote')], 'attack', ['AG-211'])
-    # Vulnerable SSH banner (regreSSHion window) -> AG-104.
-    check('arista-ssh-vuln', [_guard_rec(proto='TCP', sport=22, dport=40000,
-        payload=b'SSH-2.0-OpenSSH_9.6p1 Debian\r\n')], 'exposure', ['AG-104'])
-    # Patched SSH banner -> no AG-104.
-    r = _arista_analyze([_guard_rec(proto='TCP', sport=22, dport=40000,
-        payload=b'SSH-2.0-OpenSSH_9.8p1\r\n')])
-    scenarios.append({'name': 'arista-ssh-patched', 'expect': 'clean/no-AG-104',
-                      'got': r['verdict'],
-                      'pass': all(f['code'] != 'AG-104' for f in r['findings'])})
-    # gNMI listener -> AG-103 exposure.
-    check('arista-gnmi', [_guard_rec(proto='TCP', dport=6030, payload=b'')],
-          'exposure', ['AG-103'])
-    # VLAN tag anomaly -> AG-205 attack.
-    check('arista-vlan', [_guard_rec(proto='UDP', dport=1812, vlan_tags=3,
-        payload=_radius_packet(1, [(80, bytes(16))]))], 'attack', ['AG-205'])
-
-    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
     try:
-        import tempfile
-        from scapy.all import Ether, IP, UDP, TCP, Raw, wrpcap
-        if _have('tcpdump'):
-            pkts = [
-                (Ether() / IP(src='10.0.0.8', dst='10.0.0.1')
-                 / UDP(sport=41000, dport=1812)
-                 / Raw(_radius_packet(1, [(1, b'admin'), (33, b'Y' * 200)]))),
-                (Ether() / IP(src='10.0.0.9', dst='10.0.0.2')
-                 / TCP(sport=22, dport=43000, flags='PA')
-                 / Raw(b'SSH-2.0-OpenSSH_9.6p1\r\n')),
-            ]
-            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
-                pcap_path = tf.name
-            wrpcap(pcap_path, pkts)
-            res = _run(['tcpdump', '-nn', '-tt', '-v', '-x', '-r', pcap_path], timeout=10)
-            out = _arista_analyze(_guard_packets(res['out']))
-            codes = {f['code'] for f in out['findings']}
-            ok = ('AG-201' in codes and 'AG-104' in codes and out['verdict'] == 'attack')
-            scapy_result = {'ran': True, 'pass': ok, 'verdict': out['verdict'],
-                            'codes': sorted(codes)}
-            try:
-                os.remove(pcap_path)
-            except OSError:
-                pass
+        ag = _arista_module()
+    except Exception as e:
+        return {'success': False,
+                'scenarios': [{'name': 'import aristaguard', 'pass': False,
+                               'expect': 'import ok', 'got': str(e)}],
+                'scapy': {'ran': False, 'reason': 'module import failed'}}
+
+    # 1. Vendored offline suite — prints "N/N checks passed", returns 0 on pass.
+    buf = _io.StringIO()
+    try:
+        with _ctx.redirect_stdout(buf):
+            rc = ag.selftest()
+    except Exception as e:
+        rc = 1
+        buf.write('%s: %s' % (type(e).__name__, e))
+    tail = (buf.getvalue().strip().splitlines() or [''])[-1]
+    sc('vendored aristaguard self-test', rc == 0, '0 fails', tail)
+
+    # 2. Finding mapping: lowercase klass -> UPPER, severity preserved in the rank set.
+    spec = ag.FINDINGS['AG-201']
+    mapped = _arista_map_finding(ag.Finding(
+        code=spec.code, name=spec.name, severity=spec.severity, klass=spec.klass,
+        ts=0.0, detail={'src': '10.0.0.1'}, cves=spec.cves))
+    sc('finding klass -> ATTACK', mapped['klass'] == 'ATTACK', 'ATTACK', mapped['klass'])
+    sc('finding severity in rank set', mapped['severity'] in _GUARD_SEVERITY_RANK,
+       'in _GUARD_SEVERITY_RANK', mapped['severity'])
+
+    # 3. Catalog exposure: BlastRADIUS + the exploited tunnel-decap CVE are tracked.
+    cat = {e.cve for e in ag.CVE_CATALOG}
+    sc('catalog carries CVE-2024-3596', 'CVE-2024-3596' in cat, 'present', 'CVE-2024-3596' in cat)
+    sc('catalog carries CVE-2026-7473', 'CVE-2026-7473' in cat, 'present', 'CVE-2026-7473' in cat)
+
+    # 4. Empty capture -> clean, no crash.
+    f0, _ = _arista_analyze_frames([])
+    sc('empty capture -> no findings', f0 == [], '[]', f0)
+
+    # 5. Scapy pcap end-to-end: an Arista LLDP frame (the engine's own ARISTA_DESC
+    #    fixture) -> pcap -> _apc_pcap_frames -> engine -> AG-001 off the wire.
+    scapy_result = {'ran': False, 'reason': 'scapy not installed'}
+    try:
+        from scapy.all import Ether, wrpcap
+        frame = ag._mk_eth(b'\x01\x80\xc2\x00\x00\x0e', b'\x02' * 6, ag.ETH_P_LLDP,
+                           ag._mk_lldp('sw1', ag.ARISTA_DESC))
+        d = tempfile.mkdtemp(prefix='aristaselftest-')
+        p = os.path.join(d, 'c.pcap')
+        try:
+            wrpcap(p, [Ether(frame)])
+            codes = sorted({x['code'] for x in _arista_analyze_frames(_apc_pcap_frames(p))[0]})
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        ok = 'AG-001' in codes
+        scapy_result = {'ran': True, 'pass': ok, 'codes': codes}
+        sc('scapy e2e: Arista LLDP -> AG-001', ok, 'AG-001 present', codes)
     except Exception as e:
         scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
 
@@ -23885,20 +26377,72 @@ def _ipsec_selftest():
 # cache-poisoning (CVE-2021-25220) and SAD DNS (CVE-2020-25705). v5 adds malformed-record
 # parser CVEs (compression-pointer loops, malformed DNSKEY, RRSIG label overrun, NSEC/NSEC3
 # chain escape and coexistence), protocol abuse (SVCB AliasMode fan-out, duplicate EDNS
-# options, duplicate-RR floods, TKEY queries) and unsigned multi-message XFR. Dual-stack; the engine
-# never transmits (AST-enforced in its conformance). Complements the ACTIVE do_dns_doctor.
+# options, duplicate-RR floods, TKEY queries) and unsigned multi-message XFR. v6 adds the mDNS
+# tier on UDP/5353 (DNSD-070..076): a Matter/Thread census (informational, once per instance)
+# and RFC 6762 scope checks — a TTL != 255 hop-limit violation, and the CERT VU#550620 off-link
+# source / open-reflector pair (CVE-2015-2809 / CVE-2017-6520 / CVE-2015-1892), the latter armed
+# from the capture interface's own subnets. v7 adds SIGRed (CVE-2020-1350, DNSD-044) plus the
+# DDNS tier (RFC 2136 opcode-5 dynamic-update posture — unsigned/TSIG-bypass accepted writes,
+# CVE-2017-3143; DNSD-053/054 fold in the BIND GSS-TSIG overflows CVE-2020-8622 / CVE-2020-8625
+# / CVE-2021-25216) and the rDNS tier (PTR private-topology leak to a public resolver, and
+# ip6.arpa reverse-tree enumeration). v8 adds BIND IXFR SOA-owner-not-apex (CVE-2021-25214,
+# DNSD-062) and five link-local / transport posture tiers: unicast DNS-SD enumeration, LLMNR
+# on 5355, NBT-NS on 137 (the MS16-077 WPAD query, CVE-2016-3213 / CVE-2016-3236), encrypted-DNS
+# transport on 853 (DoT/DoQ census, DDR/DNR discovery, DoH-endpoint resolution) and TSIG/SIG(0)
+# posture. This owns the name-resolution POSTURE (the vulnerable query); the POISONED answer
+# stays with SMB Watch / Relay. v9 adds the SPF parser tier (DNSD-150..153 — SPF TXT-record
+# shapes that reach the libspf2 CVEs CVE-2021-33912 / CVE-2021-33913 / CVE-2021-20314 /
+# CVE-2023-42118) and TCP stream reassembly (DNSD-160 — a Ptacek-Newsham segment-overlap
+# mismatch, where two segments give different bytes for one sequence range so a first-wins
+# sensor and a last-wins resolver parse different DNS messages). Reassembly is internal to the
+# engine's handle_frame, so the adapter still just feeds frames. Dual-stack; the engine never
+# transmits (AST-enforced in its conformance). Complements the ACTIVE do_dns_doctor.
 _DNS_PASSIVE_PKG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                     'python', 'dns_doctor_passive')
 
 
-def _dns_passive_engine():
+def _dns_passive_engine(local_prefixes=None):
     """Import the vendored dns_doctor_passive engine (its dir must be on sys.path so the
-    bare cross-imports resolve). Returns a fresh Engine with default Config."""
+    bare cross-imports resolve). Returns a fresh Engine with default Config.
+
+    `local_prefixes` (CIDR strings for the capture interface) arm the mDNS scope detectors
+    DNSD-075/076. The rDNS leak detector (DNSD-090) and the v8 encrypted-DNS census own-resolver
+    flag (DNSD-130/131) are armed with the private-address space itself — a private reverse query
+    or an encrypted-DNS session to a NON-private (public) resolver is the leak/bypass — reusing
+    netscope's own table so it never drifts. The DDNS updater allowlist (DNSD-082) is left empty:
+    who may write a zone is an operator trust decision, not something to infer from the capture
+    point, and the detected DDNS codes (DNSD-080/081) fire without it."""
     if _DNS_PASSIVE_PKG_DIR not in sys.path:
         sys.path.insert(0, _DNS_PASSIVE_PKG_DIR)
     import engine as _e
     from state import Config as _Config
-    return _e.Engine(_Config())
+    cfg = _Config()
+    if local_prefixes:
+        cfg.mdns_local_prefixes = tuple(local_prefixes)
+    try:
+        import netscope as _ns
+        _private = tuple(str(n) for n in (_ns.PRIVATE_V4 + _ns.PRIVATE_V6))
+        cfg.rdns_internal_prefixes = _private
+        cfg.dns_own_resolver_prefixes = _private
+    except Exception:
+        pass
+    return _e.Engine(cfg)
+
+
+def _dns_passive_local_prefixes(iface):
+    """Capture-interface subnets as CIDR strings, for the mDNS scope detectors. mDNS is
+    link-local, so a source outside the interface's own prefixes is off-link (DNSD-075/076)."""
+    prefixes = []
+    try:
+        v4, v6 = _iface_addrs(iface)
+        for a in list(v4) + list(v6):
+            try:
+                prefixes.append(str(ipaddress.ip_interface(a).network))
+            except ValueError:
+                continue
+    except Exception:
+        return []
+    return sorted(set(prefixes))
 
 
 def _iter_pcap_frames(path):
@@ -23952,11 +26496,16 @@ def _dns_passive_verdict(findings):
 
 
 def do_dns_watch(interface=None, seconds=20, learn=True, quick=False):
-    """Passive DNS-response threat detector on port 53 (detection-only, never transmits).
-    Flags DNSSEC-CVE signatures (KeyTrap CVE-2023-50387, NSEC3 CVE-2023-50868) and over-DNS
-    attacks (NXNSAttack, MaginotDNS cache-poisoning, DNSBomb, SAD DNS) in the observed DNS
-    record structure. Dual-stack; adapts the vendored dns_doctor_passive engine over a
-    bounded capture."""
+    """Passive DNS-response threat detector on port 53 + mDNS on 5353 (detection-only, never
+    transmits). Flags DNSSEC-CVE signatures (KeyTrap CVE-2023-50387, NSEC3 CVE-2023-50868) and
+    over-DNS attacks (NXNSAttack, MaginotDNS cache-poisoning, DNSBomb, SAD DNS) in the observed
+    DNS record structure, plus the v6 mDNS tier (Matter/Thread census and RFC 6762 scope / CERT
+    VU#550620 off-link reflector) and the v7 SIGRed (CVE-2020-1350) + DDNS (RFC 2136 dynamic-
+    update posture, CVE-2017-3143) and rDNS (PTR topology-leak / ip6.arpa walk) tiers, plus the
+    v8 LLMNR (5355) / NBT-NS (137, MS16-077 WPAD CVE-2016-3213/3236) / encrypted-DNS (853 DoT-DoQ)
+    / DNS-SD / TSIG posture tiers and BIND IXFR CVE-2021-25214, plus the v9 SPF/libspf2 parser
+    tier (CVE-2021-33912/33913/20314, CVE-2023-42118) and TCP stream reassembly (segment-overlap
+    evasion). Dual-stack; adapts the vendored dns_doctor_passive engine over a bounded capture."""
     iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
@@ -23969,8 +26518,12 @@ def do_dns_watch(interface=None, seconds=20, learn=True, quick=False):
     fd, pcap = tempfile.mkstemp(suffix='.pcap')
     os.close(fd)
     # Large snaplen: DNSSEC responses (DNSKEY/RRSIG bundles) are big and must not truncate.
+    # Ports mirror the engine's own BPF: 53 unicast DNS, 5353 mDNS (v6), and the v8 tiers —
+    # 5355 LLMNR, 137 NBT-NS, 853 DoT/DoQ (encrypted-DNS transport census).
     res = _run(['timeout', str(seconds), 'tcpdump', '-i', iface, '-nn', '-p',
-                '-s', '65535', '-c', '20000', '-w', pcap, 'udp port 53 or tcp port 53'],
+                '-s', '65535', '-c', '20000', '-w', pcap,
+                '(udp or tcp) and (port 53 or port 5353 or port 5355 '
+                'or port 137 or port 853)'],
                timeout=seconds + 8)
     if (os.path.getsize(pcap) <= 24 and res['err'] and any(
             k in res['err'].lower() for k in ('permission', "couldn't",
@@ -23982,7 +26535,7 @@ def do_dns_watch(interface=None, seconds=20, learn=True, quick=False):
         return {'success': False, 'interface': iface, 'error': res['err'].strip()[:200]}
     findings, frames = [], 0
     try:
-        eng = _dns_passive_engine()
+        eng = _dns_passive_engine(local_prefixes=_dns_passive_local_prefixes(iface))
         for frame in _iter_pcap_frames(pcap):
             frames += 1
             try:
@@ -24336,6 +26889,2295 @@ def _smtp_selftest():
             'scenarios': [{'name': c['name'], 'pass': c['pass']} for c in r['scenarios']]}
 
 
+# ==========================================================================
+# Modbus Watch — passive Modbus/TCP posture monitor (vendored python/modbuswatch/)
+# ==========================================================================
+# Adapts the vendored modbuswatch package: a passive reader of Modbus/TCP (tcp/502)
+# that answers the question that matters on an OT segment — who is talking to the
+# PLCs and what are they telling them to do. Modbus has no authentication, so most of
+# it is posture: a write (or any function code) from a master outside the learned
+# baseline (MBW-001/004), FC8 Force Listen Only that silently drops a slave off the
+# bus (MBW-002) or a restart / clear-counters (MBW-003), Schneider UMAS (FC90)
+# activity (MBW-010) and the ModiPwn read-then-reconfigure sequence (MBW-011,
+# CVE-2021-22779), Read-Device-ID enumeration bursts (MBW-020), unit-ID sweeps
+# (MBW-021), and Modbus outside a declared OT subnet / plain 502 to a host that also
+# speaks Modbus Security on 802 (MBW-040/041). The CVE layer is thin and honest:
+# MBW-030 flags malformed MBAP/PDU framing — the libmodbus over-read / over-reply
+# class (CVE-2019-14462, CVE-2019-14463, CVE-2024-10918) — as a TRIGGER only; it
+# cannot confirm the server runs libmodbus. Dual-stack, including the IPv6
+# extension-header walk to the TCP header. Modbus RTU/serial is out of scope (no
+# passive wire tap); 802 is TLS and only its presence is recorded.
+#
+# The master baseline is learn-then-arm: the first Modbus ADU seen starts a learning
+# window (default one hour, across scans and the background rotation); masters seen
+# in it are trusted per (slave, unit). It persists in data/modbus_watch.json so the
+# window spans scans. "Arm now" ends learning early; "Re-learn" forgets it.
+_MODBUS_PY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'python')
+_MODBUS_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'data', 'modbus_watch.json')
+_modbus_lock = threading.Lock()
+_MODBUS_LEARN_S = 3600.0
+_MODBUS_MAX_PROFILES = 2048
+_MODBUS_MAX_MASTERS = 64
+_MODBUS_SEV_RANK = {'info': 0, 'low': 1, 'medium': 2, 'high': 3}
+_MODBUS_SEV_TO_GUARD = {'high': 'HIGH', 'medium': 'MEDIUM', 'low': 'LOW', 'info': 'INFO'}
+# Codes that name a CVE. MBW-030 is trigger detection for the libmodbus framing
+# class; MBW-011 tracks the published ModiPwn chain over UMAS.
+_MODBUS_CVES = {'MBW-030': ['CVE-2019-14462', 'CVE-2019-14463', 'CVE-2024-10918'],
+                'MBW-011': ['CVE-2021-22779']}
+# Capture filter: Modbus/TCP and Modbus Security, plus IPv6 whose first next-header
+# is NOT TCP/UDP/ICMPv6 — i.e. an extension-header chain (or a fragment), which a
+# plain `tcp port 502` can never match in libpcap. The sensor walks the chain and
+# its own port gate drops anything that is not Modbus.
+_MODBUS_BPF = ('tcp port 502 or tcp port 802 or '
+               '(ip6 and not ip6 proto 6 and not ip6 proto 17 and not ip6 proto 58)')
+
+
+def _modbus_import():
+    """Import the vendored modbuswatch package (python/ must be on sys.path; the
+    package uses relative imports so its findings/state modules never collide with
+    dns_doctor_passive's). Returns (findings, state, parser). The sensor module needs
+    scapy and is imported separately, only when a pcap is replayed."""
+    if _MODBUS_PY_DIR not in sys.path:
+        sys.path.insert(0, _MODBUS_PY_DIR)
+    from modbuswatch import findings as _f, state as _s, parser as _p
+    return _f, _s, _p
+
+
+def _modbus_af(family):
+    import socket as _sock
+    return 6 if family == _sock.AF_INET6 else 4
+
+
+def _modbus_family(af):
+    import socket as _sock
+    return _sock.AF_INET6 if int(af) == 6 else _sock.AF_INET
+
+
+def _modbus_parse_subnets(specs):
+    """['10.20.0.0/24', ...] -> (clean string list, [(family, ip_network)]). Invalid
+    entries are dropped; at most 16 are kept."""
+    import ipaddress
+    clean, nets = [], []
+    for s in (specs or [])[:16]:
+        try:
+            net = ipaddress.ip_network(str(s).strip(), strict=False)
+        except ValueError:
+            continue
+        clean.append(str(net))
+        nets.append((_modbus_family(net.version), net))
+    return clean, nets
+
+
+def _modbus_load():
+    try:
+        with open(_MODBUS_STATE_PATH) as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _modbus_save(d):
+    try:
+        os.makedirs(os.path.dirname(_MODBUS_STATE_PATH), exist_ok=True)
+        tmp = _MODBUS_STATE_PATH + '.tmp'
+        with open(tmp, 'w') as fh:
+            json.dump(d, fh, indent=1)
+        os.replace(tmp, _MODBUS_STATE_PATH)
+    except OSError:
+        pass
+
+
+def _modbus_baseline_from(state_mod, d, window_s):
+    """Rebuild a vendored Baseline from the persisted JSON state."""
+    bl = state_mod.Baseline(window_s=window_s)
+    bl.armed_at = d.get('armed_at')
+    for p in d.get('profiles') or []:
+        try:
+            slot = (_modbus_family(p['af']), str(p['slave']), int(p['unit']))
+        except (KeyError, TypeError, ValueError):
+            continue
+        bl.profiles[slot] = state_mod.SlaveProfile(
+            masters_seen=set(p.get('masters') or []),
+            fcs_seen=set(int(x) for x in p.get('fcs') or []),
+            first_seen=float(p.get('first_seen') or 0.0))
+    return bl
+
+
+def _modbus_baseline_to(bl, security_hosts, ot_clean):
+    profiles = []
+    for (fam, slave, unit), prof in list(bl.profiles.items())[:_MODBUS_MAX_PROFILES]:
+        profiles.append({'af': _modbus_af(fam), 'slave': slave, 'unit': unit,
+                         'masters': sorted(prof.masters_seen)[:_MODBUS_MAX_MASTERS],
+                         'fcs': sorted(prof.fcs_seen),
+                         'first_seen': prof.first_seen})
+    return {'armed_at': bl.armed_at, 'window_s': bl.window_s, 'profiles': profiles,
+            'security_hosts': sorted([_modbus_af(f), h] for f, h in security_hosts),
+            'ot_subnets': ot_clean}
+
+
+def _modbus_summarize(engine, findings_mod):
+    """Collapse the engine's per-ADU findings into one row per (code, family, master,
+    slave, unit) with a count — the engine emits on every matching request."""
+    rows = {}
+    for f in engine.findings:
+        title, klass, sev, conf = findings_mod.REGISTRY[f.code]
+        k = (f.code, f.key.family, f.key.src, f.key.dst, f.key.unit_id)
+        r = rows.get(k)
+        if r is None:
+            rows[k] = {'code': f.code, 'name': title, 'klass': klass, 'severity': sev,
+                       'confidence': conf, 'af': 'v%d' % _modbus_af(f.key.family),
+                       'master': f.key.src, 'slave': f.key.dst, 'unit': f.key.unit_id,
+                       'detail': f.detail, 'cves': list(_MODBUS_CVES.get(f.code, [])),
+                       'count': 1, 'first_ts': f.ts}
+        else:
+            r['count'] += 1
+    return sorted(rows.values(), key=lambda r: (-_MODBUS_SEV_RANK.get(r['severity'], 0),
+                                                r['code'], r['slave'], r['master']))
+
+
+def _modbus_verdict(findings, adus, learning):
+    """clean < learning < exposure < suspicious < plc-abuse. A high finding is an
+    observed action against a PLC (off-baseline write, Force Listen Only, the ModiPwn
+    sequence); medium is a trigger or unusual-but-possibly-legitimate activity
+    (malformed framing, UMAS, restart, an unlearned master reading)."""
+    sev = {f['severity'] for f in findings}
+    if 'high' in sev:
+        return 'plc-abuse'
+    if 'medium' in sev:
+        return 'suspicious'
+    if sev:
+        return 'exposure'
+    if adus and learning:
+        return 'learning'
+    return 'clean'
+
+
+def _modbus_normalize(f):
+    """modbuswatch summary row -> the guard finding shape _guard_emit_jsonl expects."""
+    return {'code': f['code'], 'name': f['name'],
+            'severity': _MODBUS_SEV_TO_GUARD.get(f['severity'], 'MEDIUM'),
+            'klass': 'ATTACK' if f['klass'] == 'abuse' else 'EXPOSURE',
+            'src': f['master'], 'cves': list(f.get('cves') or []),
+            'detail': {'slave': f['slave'], 'unit': f['unit'], 'af': f['af'],
+                       'confidence': f['confidence'], 'count': f['count'],
+                       'text': f['detail']}}
+
+
+def _modbus_analyze(pcap, ot_subnets=None, learn_seconds=None, persist=True):
+    """Replay a pcap through the vendored sensor + engine with the persisted (or, when
+    persist=False, a fresh) baseline. Returns (summary rows, stats dict)."""
+    F, S, _P = _modbus_import()
+    from modbuswatch import sensor as _sensor
+    from scapy.utils import PcapReader
+    d = _modbus_load() if persist else {}
+    window = float(learn_seconds if learn_seconds is not None
+                   else d.get('window_s') or _MODBUS_LEARN_S)
+    if ot_subnets is None:
+        ot_clean, ot_nets = _modbus_parse_subnets(d.get('ot_subnets') or [])
+    else:
+        ot_clean, ot_nets = _modbus_parse_subnets(ot_subnets)
+    bl = _modbus_baseline_from(S, d, window)
+    sec_hosts = set()
+    for af, host in d.get('security_hosts') or []:
+        sec_hosts.add((_modbus_family(af), str(host)))
+    eng = F.Engine(baseline=bl, ot_subnets=ot_nets, security_hosts=sec_hosts)
+    counts = {'frames': 0, 'adus': 0}
+    _feed = eng.feed
+
+    def _counting_feed(*a, **k):
+        counts['adus'] += 1
+        return _feed(*a, **k)
+    eng.feed = _counting_feed
+    last_ts = None
+    with PcapReader(pcap) as rd:
+        for pkt in rd:
+            counts['frames'] += 1
+            try:
+                last_ts = float(pkt.time)
+                _sensor.process_packet(pkt, eng)
+            except Exception:
+                continue          # one malformed frame must never kill the scan
+    rows = _modbus_summarize(eng, F)
+    now = last_ts if last_ts is not None else time.time()
+    learning = bl.armed_at is not None and bl.learning(now)
+    stats = {'adus': counts['adus'], 'frames': counts['frames'],
+             'learning': learning,
+             'learning_ends': (bl.armed_at + bl.window_s) if bl.armed_at is not None else None,
+             'slaves': len(bl.profiles),
+             'masters': sorted({m for p in bl.profiles.values() for m in p.masters_seen}),
+             'security_hosts': sorted(h for _f, h in eng.security_hosts),
+             'ot_subnets': ot_clean}
+    if persist:
+        _modbus_save(_modbus_baseline_to(bl, eng.security_hosts, ot_clean))
+    return rows, stats
+
+
+def do_modbus_watch(interface=None, seconds=20, ot_subnets=None, learn_seconds=None,
+                    pcap=None, persist=True, quick=False):
+    """Passive Modbus/TCP posture scan (detection-only, never transmits). Learns which
+    masters talk to each PLC, then flags off-baseline writes and function codes, FC8
+    Force Listen Only / restart, UMAS + the ModiPwn sequence (CVE-2021-22779),
+    enumeration and unit-ID sweeps, malformed framing (libmodbus CVE-2019-14462 /
+    CVE-2019-14463 / CVE-2024-10918 trigger) and cleartext-segment posture.
+    Dual-stack. `ot_subnets` (list) is saved for later scans when given; `pcap`
+    replays a file instead of capturing."""
+    if not _have_scapy():
+        return {'success': False, 'error': 'Modbus Watch needs the Python scapy module '
+                '(pip install scapy).'}
+    iface = None
+    tmp = None
+    if pcap:
+        if not os.path.isfile(pcap):
+            return {'success': False, 'error': 'pcap not found: %s' % pcap}
+        seconds = 0
+    else:
+        iface = interface if _valid_iface(interface or '') else _capture_iface()
+        if not iface:
+            return {'success': False, 'error': 'no interface to capture on'}
+        seconds = _clamp_int(seconds, 20, 5, 60)
+        if not _have('tcpdump'):
+            return {'success': False, 'interface': iface,
+                    'error': 'tcpdump is not installed. Click Install to add it.',
+                    'missing_tool': 'tcpdump'}
+        import tempfile
+        fd, tmp = tempfile.mkstemp(suffix='.pcap')
+        os.close(fd)
+        # Full snaplen: MBW-030 compares the MBAP length field with the bytes that
+        # actually arrived, so a truncated segment would read as malformed framing.
+        res = _run(['timeout', str(seconds), 'tcpdump', '-i', iface, '-nn', '-p',
+                    '-s', '65535', '-c', '20000', '-w', tmp, _MODBUS_BPF],
+                   timeout=seconds + 8)
+        if (os.path.getsize(tmp) <= 24 and res['err'] and any(
+                k in res['err'].lower() for k in ('permission', "couldn't",
+                                                  'no such device', 'syntax error'))):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return {'success': False, 'interface': iface, 'error': res['err'].strip()[:200]}
+        pcap = tmp
+    try:
+        with _modbus_lock:
+            rows, st = _modbus_analyze(pcap, ot_subnets=ot_subnets,
+                                       learn_seconds=learn_seconds, persist=persist)
+    except Exception as e:
+        return {'success': False, 'interface': iface,
+                'error': 'modbus analysis failed: %s: %s' % (type(e).__name__, e)}
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    verdict = _modbus_verdict(rows, st['adus'], st['learning'])
+    reasons = []
+    for f in rows:
+        if f['severity'] == 'info' and len(rows) > 1:
+            continue
+        reasons.append('%s: %s — %s %s → %s unit %s (%s×)' % (
+            f['code'], f['name'], f['af'], f['master'], f['slave'], f['unit'], f['count']))
+        if len(reasons) >= 8:
+            break
+    if not reasons:
+        if not st['adus']:
+            reasons = ['No Modbus/TCP traffic seen on this segment (tcp/502)']
+        elif st['learning']:
+            reasons = ['Learning the master baseline — %d slave/unit pair(s), %d master(s) '
+                       'so far; off-baseline writes alert once the window closes'
+                       % (st['slaves'], len(st['masters']))]
+        else:
+            reasons = ['Modbus/TCP observed; every request came from a learned master and '
+                       'no abuse, sweep or malformed framing was seen']
+    by_sev = {}
+    for f in rows:
+        by_sev[f['severity']] = by_sev.get(f['severity'], 0) + 1
+    result = {'success': True, 'module': 'modbus_watch', 'interface': iface,
+              'seconds': seconds, 'verdict': verdict, 'reasons': reasons,
+              'findings': rows, 'by_severity': by_sev,
+              'adus': st['adus'], 'packet_count': st['frames'],
+              'learning': st['learning'], 'learning_ends': st['learning_ends'],
+              'slaves': st['slaves'], 'masters': st['masters'],
+              'security_hosts': st['security_hosts'], 'ot_subnets': st['ot_subnets']}
+    # HIGH and MEDIUM reach Watchtower: both are observed actions or triggers on a
+    # PLC segment. Low/info posture (enumeration, cleartext segment) stays in the card.
+    alerts = [_modbus_normalize(f) for f in rows if f['severity'] in ('high', 'medium')]
+    if not quick and persist and alerts:
+        _guard_emit_jsonl('modbus_watch', {'interface': iface, 'findings': alerts})
+    return result
+
+
+def do_modbus_baseline(action='get', ot_subnets=None):
+    """Manage the learned Modbus master baseline. 'arm' ends the learning window now
+    (keeps what was learned); 'reset' forgets it so the next Modbus seen starts a new
+    window; 'config' saves the declared OT subnet list (enables MBW-040)."""
+    with _modbus_lock:
+        d = _modbus_load()
+        if action == 'reset':
+            d = {'ot_subnets': d.get('ot_subnets') or [],
+                 'window_s': d.get('window_s') or _MODBUS_LEARN_S}
+            _modbus_save(d)
+        elif action == 'arm':
+            d['armed_at'] = time.time() - float(d.get('window_s') or _MODBUS_LEARN_S)
+            _modbus_save(d)
+        elif action == 'config':
+            d['ot_subnets'] = _modbus_parse_subnets(ot_subnets or [])[0]
+            _modbus_save(d)
+        armed_at = d.get('armed_at')
+        window = float(d.get('window_s') or _MODBUS_LEARN_S)
+        return {'success': True, 'action': action,
+                'learning': armed_at is None or (time.time() - armed_at) < window,
+                'learning_ends': (armed_at + window) if armed_at is not None else None,
+                'slaves': len(d.get('profiles') or []),
+                'masters': sorted({m for p in d.get('profiles') or []
+                                   for m in p.get('masters') or []}),
+                'ot_subnets': d.get('ot_subnets') or []}
+
+
+def _modbus_selftest():
+    """Offline scenarios over the vendored parser + engine (no scapy, no root), plus
+    a Scapy end-to-end leg that writes IPv4, IPv6 and IPv6-behind-an-extension-header
+    pcaps and replays them through do_modbus_watch's own pcap path."""
+    import socket as _sock
+    import struct as _st
+    scenarios = []
+
+    def check(name, cond):
+        scenarios.append({'name': name, 'pass': bool(cond)})
+
+    try:
+        F, S, P = _modbus_import()
+    except Exception as e:
+        return {'success': False, 'scenarios': [
+            {'name': 'modbuswatch import failed: %s' % e, 'pass': False}]}
+
+    def adu(unit, pdu, txn=1, length=None, proto=0):
+        ln = len(pdu) + 1 if length is None else length
+        return _st.pack('>HHHB', txn, proto, ln, unit) + pdu
+
+    def eng(window=0.0, learned=(), **kw):
+        bl = S.Baseline(window_s=window)
+        for fam, src, dst, unit in learned:
+            bl.observe(S.FlowKey(fam, src, dst, unit), 3, now=0.0)
+        bl.armed_at = 0.0
+        return F.Engine(baseline=bl, **kw)
+
+    def codes(e):
+        return {f.code for f in e.findings}
+
+    # v2: the cleartext-posture exposure codes (MBW-040 OT-subnet, MBW-041/042
+    # secure-Modbus availability) are orthogonal to the abuse/framing/enum
+    # detectors and fire once per slave on any armed plaintext 502. Strip them
+    # when a scenario is focused on an abuse/framing code; the dedicated
+    # posture scenarios below assert them with the full `codes()` set.
+    def abuse_codes(e):
+        return codes(e) - {'MBW-040', 'MBW-041', 'MBW-042'}
+
+    V4, V6 = _sock.AF_INET, _sock.AF_INET6
+    M, A, PLC = '10.20.0.5', '10.20.0.99', '10.20.0.20'
+    read = _st.pack('>BHH', 3, 0, 5)
+    coil = _st.pack('>BHH', 5, 0, 0xFF00)
+
+    # Registry + severity split (v2: 12 codes — 3 high / 4 medium / 3 low / 2 info;
+    # the new MBW-042 is the info/exposure "cleartext, no secure peer seen" code).
+    reg = F.REGISTRY
+    split = {}
+    for v in reg.values():
+        split[v[2]] = split.get(v[2], 0) + 1
+    check('registry: 12 codes, 3 high / 4 medium / 3 low / 2 info',
+          len(reg) == 12 and split == {'high': 3, 'medium': 4, 'low': 3, 'info': 2})
+
+    # Parser: framing cross-checks (MBW-030 is load-bearing in parse()).
+    a = P.parse(adu(1, read))
+    check('parser: well-formed FC3 read decodes clean',
+          a is not None and a.malformed is None and a.function_code == 3)
+    check('parser: MBAP length > bytes present is malformed (CVE-2024-10918 shape)',
+          (P.parse(adu(1, read, length=30)) or P.Adu(0, 0, 0, 0, 0, False)).malformed)
+    check('parser: protocol id != 0 is malformed',
+          (P.parse(adu(1, read, proto=7)) or P.Adu(0, 0, 0, 0, 0, False)).malformed)
+    bad16 = _st.pack('>BHHB', 16, 0, 2, 9) + b'\x00' * 9      # qty 2 -> 4 bytes, says 9
+    check('parser: FC16 byte_count != 2*quantity is malformed (CVE-2019-14462/14463)',
+          P.parse(adu(1, bad16)).malformed)
+    bad15 = _st.pack('>BHHB', 15, 0, 10, 2) + b'\x00'         # 10 coils -> 2 bytes, 1 sent
+    check('parser: FC15 trailing data short of byte_count is malformed',
+          P.parse(adu(1, bad15)).malformed)
+    ok16 = _st.pack('>BHHB', 16, 0, 2, 4) + b'\x00\x01\x00\x02'
+    check('parser: conformant FC16 write is NOT malformed (FP guard)',
+          P.parse(adu(1, ok16)).malformed is None)
+    check('parser: short segment (< MBAP+FC) is skipped, not flagged',
+          P.parse(b'\x00\x01\x00') is None)
+
+    # Engine: baseline / abuse.
+    e = eng(learned=[(V4, M, PLC, 1)])
+    e.feed(S.FlowKey(V4, M, PLC, 1), P.parse(adu(1, coil)), now=10.0)
+    e.feed(S.FlowKey(V4, M, PLC, 1), P.parse(adu(1, read)), now=10.0)
+    check('engine: learned master reading + writing raises no abuse (FP guard)',
+          abuse_codes(e) == set())
+    e = eng(learned=[(V4, M, PLC, 1)])
+    e.feed(S.FlowKey(V4, A, PLC, 1), P.parse(adu(1, coil)), now=10.0)
+    check('engine: write from an unlearned master -> MBW-001', abuse_codes(e) == {'MBW-001'})
+    e = eng(learned=[(V4, M, PLC, 1)])
+    e.feed(S.FlowKey(V4, A, PLC, 1), P.parse(adu(1, read)), now=10.0)
+    check('engine: read from an unlearned master -> MBW-004', abuse_codes(e) == {'MBW-004'})
+    e = eng(window=3600.0)
+    e.feed(S.FlowKey(V4, A, PLC, 1), P.parse(adu(1, coil)), now=10.0)
+    check('engine: no off-baseline alert while the learning window is open',
+          not e.findings)
+    e = eng(learned=[(V4, M, PLC, 1)])
+    e.feed(S.FlowKey(V4, M, PLC, 1), P.parse(adu(1, _st.pack('>BHH', 8, 4, 0))), now=10.0)
+    check('engine: FC8 sub 0x0004 Force Listen Only -> MBW-002', 'MBW-002' in codes(e))
+    e = eng(learned=[(V4, M, PLC, 1)])
+    e.feed(S.FlowKey(V4, M, PLC, 1), P.parse(adu(1, _st.pack('>BHH', 8, 1, 0))), now=10.0)
+    check('engine: FC8 restart-comm -> MBW-003', abuse_codes(e) == {'MBW-003'})
+    e = eng(learned=[(V4, M, PLC, 1)])
+    e.feed(S.FlowKey(V4, M, PLC, 1),
+           P.parse(adu(1, _st.pack('>BHH', 8, 4, 0)), is_response=True), now=10.0)
+    check('engine: an FC8 RESPONSE is not an attack (direction guard)', not e.findings)
+
+    # Enumeration / sweeps.
+    mei = _st.pack('>BBBB', 43, 0x0E, 1, 0)
+    e = eng(learned=[(V4, M, PLC, 1)])
+    for i in range(2):
+        e.feed(S.FlowKey(V4, M, PLC, 1), P.parse(adu(1, mei)), now=10.0 + i)
+    two = codes(e)
+    e.feed(S.FlowKey(V4, M, PLC, 1), P.parse(adu(1, mei)), now=12.0)
+    check('engine: 3 Read-Device-ID in 10 s -> MBW-020 (2 do not)',
+          'MBW-020' not in two and 'MBW-020' in codes(e))
+    e = eng(learned=[(V4, M, PLC, u) for u in range(1, 10)])
+    for u in range(1, 8):
+        e.feed(S.FlowKey(V4, M, PLC, u), P.parse(adu(u, read)), now=10.0)
+    seven = codes(e)
+    e.feed(S.FlowKey(V4, M, PLC, 8), P.parse(adu(8, read)), now=10.5)
+    check('engine: 8 unit IDs in 10 s -> MBW-021 (7 do not)',
+          'MBW-021' not in seven and 'MBW-021' in codes(e))
+
+    # UMAS / ModiPwn.
+    def umas(sub):
+        return adu(1, bytes([90, sub]) + b'\x00\x00')
+    e = eng(learned=[(V4, M, PLC, 1)])
+    e.feed(S.FlowKey(V4, A, PLC, 1), P.parse(umas(0x20)), now=10.0)
+    e.feed(S.FlowKey(V4, A, PLC, 1), P.parse(umas(0x23)), now=12.0)
+    check('engine: UMAS read primitive then write within 30 s -> MBW-010 + MBW-011',
+          {'MBW-010', 'MBW-011'} <= codes(e))
+    e = eng(learned=[(V4, M, PLC, 1)])
+    e.feed(S.FlowKey(V4, M, PLC, 1), P.parse(umas(0x23)), now=10.0)
+    check('engine: UMAS write with no preceding read -> MBW-010 only, no MBW-011',
+          abuse_codes(e) == {'MBW-010'})
+    e = eng(learned=[(V4, M, PLC, 1)])
+    e.feed(S.FlowKey(V4, M, PLC, 1), P.parse(umas(0x20)), now=10.0)
+    e.feed(S.FlowKey(V4, M, PLC, 1), P.parse(umas(0x23)), now=100.0)
+    check('engine: UMAS read and write 90 s apart -> no MBW-011', 'MBW-011' not in codes(e))
+
+    # Posture.
+    _c, ot = _modbus_parse_subnets(['10.20.0.0/24'])
+    e = eng(learned=[(V4, '192.168.1.5', '192.168.1.20', 1)], ot_subnets=ot)
+    e.feed(S.FlowKey(V4, '192.168.1.5', '192.168.1.20', 1), P.parse(adu(1, read)), now=10.0)
+    check('engine: Modbus outside the declared OT subnet -> MBW-040', 'MBW-040' in codes(e))
+    e = eng(learned=[(V4, M, PLC, 1)], ot_subnets=ot)
+    e.feed(S.FlowKey(V4, M, PLC, 1), P.parse(adu(1, read)), now=10.0)
+    check('engine: Modbus inside the declared OT subnet -> no MBW-040', 'MBW-040' not in codes(e))
+    e = eng(learned=[(V4, M, PLC, 1)], security_hosts={(V4, PLC)})
+    e.feed(S.FlowKey(V4, M, PLC, 1), P.parse(adu(1, read)), now=10.0)
+    check('engine: plain 502 to a host seen on 802 -> MBW-041', codes(e) == {'MBW-041'})
+    # v2 MBW-042: armed, no 802 ever seen for the slave -> cleartext-without-secure-peer
+    # (once per family/slave); a legit read from the learned master still exposes it.
+    e = eng(learned=[(V4, M, PLC, 1)])
+    e.feed(S.FlowKey(V4, M, PLC, 1), P.parse(adu(1, read)), now=10.0)
+    check('engine: plain 502, no 802 seen for the slave -> MBW-042', codes(e) == {'MBW-042'})
+    e.feed(S.FlowKey(V4, M, PLC, 1), P.parse(adu(1, read)), now=11.0)
+    check('engine: MBW-042 fires once per (family, slave)',
+          [f.code for f in e.findings].count('MBW-042') == 1)
+    # once the slave is seen on 802, it is never re-reported as 042 (-> MBW-041 instead).
+    e = eng(learned=[(V4, M, PLC, 1)])
+    e.note_security_host(V4, PLC)
+    e.feed(S.FlowKey(V4, M, PLC, 1), P.parse(adu(1, read)), now=10.0)
+    check('engine: a slave later seen on 802 is MBW-041, never MBW-042', codes(e) == {'MBW-041'})
+
+    # Malformed framing + dual-stack.
+    e = eng(learned=[(V4, M, PLC, 1)])
+    e.feed(S.FlowKey(V4, A, PLC, 1), P.parse(adu(1, coil, proto=7)), now=10.0)
+    check('engine: malformed framing -> MBW-030 only (abuse checks suppressed)',
+          codes(e) == {'MBW-030'})
+    e = eng(learned=[(V6, '2001:db8::5', '2001:db8::20', 1)])
+    e.feed(S.FlowKey(V6, '2001:db8::99', '2001:db8::20', 1), P.parse(adu(1, coil)), now=10.0)
+    e.feed(S.FlowKey(V4, '2001:db8::5', '2001:db8::20', 1), P.parse(adu(1, coil)), now=10.0)
+    _abuse = [f for f in e.findings if f.code not in ('MBW-040', 'MBW-041', 'MBW-042')]
+    check('engine: IPv6 off-baseline write -> MBW-001, and a v6 master is not trusted '
+          'on v4 (families tracked apart)',
+          [f.code for f in _abuse] == ['MBW-001', 'MBW-001']
+          and {f.key.family for f in _abuse} == {V4, V6})
+
+    # Adapter: baseline persistence + verdict ladder.
+    bl = S.Baseline(window_s=60.0)
+    bl.observe(S.FlowKey(V6, '2001:db8::5', '2001:db8::20', 3), 16, now=1.0)
+    bl.armed_at = 1.0
+    d = json.loads(json.dumps(_modbus_baseline_to(bl, {(V4, PLC)}, ['10.20.0.0/24'])))
+    bl2 = _modbus_baseline_from(S, d, 60.0)
+    check('adapter: baseline survives a JSON round-trip (family, master, unit, 802 host)',
+          bl2.is_known_master(S.FlowKey(V6, '2001:db8::5', '2001:db8::20', 3))
+          and not bl2.is_known_master(S.FlowKey(V4, '2001:db8::5', '2001:db8::20', 3))
+          and d['security_hosts'] == [[4, PLC]] and bl2.armed_at == 1.0)
+    check('adapter: verdict ladder clean/learning/exposure/suspicious/plc-abuse',
+          _modbus_verdict([], 0, False) == 'clean'
+          and _modbus_verdict([], 5, True) == 'learning'
+          and _modbus_verdict([{'severity': 'low'}], 5, False) == 'exposure'
+          and _modbus_verdict([{'severity': 'medium'}], 5, False) == 'suspicious'
+          and _modbus_verdict([{'severity': 'high'}, {'severity': 'low'}], 5, False)
+          == 'plc-abuse')
+
+    # Scapy end-to-end: pcap -> do_modbus_watch (fresh, non-persisted baseline).
+    e2e = {'ran': False, 'reason': 'scapy not installed'}
+    if _have_scapy():
+        import tempfile
+        try:
+            from scapy.all import Ether, IP, IPv6, TCP, wrpcap
+            from scapy.layers.inet6 import IPv6ExtHdrDestOpt
+            legs = [('IPv4', lambda s, d_: IP(src=s, dst=d_), M, A, PLC),
+                    ('IPv6', lambda s, d_: IPv6(src=s, dst=d_),
+                     '2001:db8::5', '2001:db8::99', '2001:db8::20'),
+                    ('IPv6 + Destination-Options header',
+                     lambda s, d_: IPv6(src=s, dst=d_) / IPv6ExtHdrDestOpt(),
+                     '2001:db8::5', '2001:db8::99', '2001:db8::20')]
+            ok_all = True
+            for label, l3, master, attacker, plc in legs:
+                pkts = []
+
+                def put(src, dst, sport, dport, payload, t):
+                    p = Ether() / l3(src, dst) / TCP(sport=sport, dport=dport,
+                                                       flags='PA') / payload
+                    p.time = t
+                    pkts.append(p)
+                for i in range(4):          # learning: legit poll + reply
+                    put(master, plc, 40000, 502, adu(1, read, txn=i), 1000.0 + i)
+                    put(plc, master, 502, 40000,
+                        adu(1, _st.pack('>BB', 3, 10) + b'\x00' * 10, txn=i), 1000.2 + i)
+                put(attacker, plc, 41000, 502, adu(1, coil, txn=50), 1010.0)
+                put(attacker, plc, 41000, 502, adu(1, _st.pack('>BHH', 8, 4, 0), txn=51),
+                    1010.5)
+                put(master, plc, 40000, 502, adu(1, read, txn=52), 1011.0)
+                fd, path = tempfile.mkstemp(suffix='.pcap')
+                os.close(fd)
+                try:
+                    wrpcap(path, pkts)
+                    r = do_modbus_watch(pcap=path, persist=False, learn_seconds=5.0)
+                finally:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                got = {f['code'] for f in r.get('findings') or []}
+                fam_ok = all(f['af'] == ('v4' if label == 'IPv4' else 'v6')
+                             for f in r.get('findings') or [])
+                # v2: the orthogonal cleartext-posture note MBW-042 fires once per
+                # slave on the armed plaintext; strip it to assert the abuse set.
+                ok = (r.get('success') and r.get('verdict') == 'plc-abuse'
+                      and got - {'MBW-040', 'MBW-041', 'MBW-042'} == {'MBW-001', 'MBW-002', 'MBW-004'}
+                      and fam_ok and r.get('adus') == 11)
+                check('e2e %s pcap: off-baseline write + Force Listen Only -> plc-abuse '
+                      '(learned master raises no abuse)' % label, ok)
+                ok_all = ok_all and ok
+            e2e = {'ran': True, 'pass': ok_all, 'scenarios_run': len(legs)}
+        except Exception as ex:
+            check('e2e pcap leg raised %s: %s' % (type(ex).__name__, ex), False)
+            e2e = {'ran': True, 'pass': False}
+    return {'success': all(s['pass'] for s in scenarios), 'scenarios': scenarios,
+            'scapy': e2e}
+
+
+# ==========================================================================
+# LLDP Watch — passive IEEE 802.1AB security monitor (vendored python/lldpwatch.py)
+# ==========================================================================
+# Adapts the vendored lldpwatch engine. LLDP (EtherType 0x88CC, link-local group
+# MACs, never forwarded past the first hop) is the multi-vendor sibling of CDP, and
+# its parsers carry a long CVE backbone: lldpd (CVE-2015-8011 lldp_decode overflow /
+# CVE-2015-8012 assert crash / CVE-2020-27827 leak, inherited by Ruckus), Cisco
+# FXOS/NX-OS/IOS-XE (CVE-2018-0395, CVE-2021-34703, CVE-2023-20089, CVE-2024-20294,
+# CVE-2026-20010), Juniper l2cpd (CVE-2018-0007, CVE-2020-1641, CVE-2021-0277,
+# CVE-2023-36849, CVE-2024-21618 — l2cpd also drives STP/LACP, so a crash flaps
+# both), Open vSwitch (CVE-2022-4337 / CVE-2022-4338 Auto Attach TLV), Aruba
+# (CVE-2020-7121, CVE-2021-34618), FortiSwitch lldpmedd (CVE-2021-26111), PAN-OS
+# (CVE-2025-0116) and SonicWall SWS (CVE-2021-20024).
+#
+# Three classes. Class A (LLDP-040..054) is the spine: vendor-agnostic structural TLV
+# bounds and grammar checks — a declared length past the frame, an oversized or
+# family-mismatched Management Address (v4 AND v6), an ID subtype that disagrees
+# with its length, a fixed-length org TLV of the wrong size, reserved TLV types,
+# non-zero data after End-of-LLDPDU (all-zero Ethernet padding and a 4-octet FCS
+# stay silent). Class B (LLDP-020..030) screens the cleartext System Name /
+# Description against the vulnerable-family table — a NOTE, never a verdict, since a
+# version string cannot show patch state. Class C: LLDP-048 flood / neighbour-table
+# pressure (the only signal for the leak CVEs, which have no single-frame shape) and
+# LLDP-049 forged neighbour, which needs a trusted baseline and is off until the
+# operator clicks "Trust current" (kept in data/lldp_watch.json).
+#
+# Capture is tcpdump -> pcap (inbound only, so this unit's own lldpd adverts are not
+# screened) and the engine walks raw frames; no scapy on this path. LLDP-MED
+# voice-VLAN hopping, SDN topology poisoning and E911/PoE semantics are out of scope.
+_LLDP_PY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'python')
+_LLDP_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'data', 'lldp_watch.json')
+_lldp_lock = threading.Lock()
+_LLDP_MAX_BASELINE = 256
+_LLDP_MAX_NEIGHBOURS = 64
+_LLDP_SEV_RANK = {'notice': 0, 'low': 1, 'medium': 2, 'high': 3, 'critical': 4}
+_LLDP_SEV_TO_GUARD = {'critical': 'CRITICAL', 'high': 'HIGH', 'medium': 'MEDIUM',
+                      'low': 'LOW', 'notice': 'INFO'}
+# CVEs a structural / abuse code is the detection shape for (the engine's own finding
+# text names them). Screening rows carry their family's CVE list from the engine.
+_LLDP_CODE_CVES = {
+    'LLDP-040': ['CVE-2015-8011', 'CVE-2021-20024', 'CVE-2024-20294', 'CVE-2021-0277',
+                 'CVE-2024-21618'],
+    'LLDP-045': ['CVE-2015-8011'],
+    'LLDP-048': ['CVE-2020-27827', 'CVE-2023-20089', 'CVE-2021-26111'],
+    'LLDP-051': ['CVE-2022-4337', 'CVE-2022-4338'],
+}
+
+
+def _lldp_import():
+    """Import the vendored engine (python/ on sys.path). Pure Python — the engine
+    imports scapy only inside its own standalone live-capture function."""
+    if _LLDP_PY_DIR not in sys.path:
+        sys.path.insert(0, _LLDP_PY_DIR)
+    import lldpwatch as _w
+    return _w
+
+
+def _lldp_load():
+    try:
+        with open(_LLDP_STATE_PATH) as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _lldp_save(d):
+    try:
+        os.makedirs(os.path.dirname(_LLDP_STATE_PATH), exist_ok=True)
+        tmp = _LLDP_STATE_PATH + '.tmp'
+        with open(tmp, 'w') as fh:
+            json.dump(d, fh, indent=2)
+        os.replace(tmp, _LLDP_STATE_PATH)
+    except OSError:
+        pass
+
+
+def _lldp_read_pcap(path):
+    """Yield (ts, raw) from a classic pcap (either byte order, micro- or nanosecond).
+    Ethernet link type only: LLDP is EtherType-framed and the engine parses from the
+    MAC header. Raises ValueError on anything else."""
+    import struct as _st
+    with open(path, 'rb') as fh:
+        hdr = fh.read(24)
+        if len(hdr) < 24:
+            return
+        magic = hdr[:4]
+        if magic in (b'\xd4\xc3\xb2\xa1', b'\x4d\x3c\xb2\xa1'):
+            end = '<'
+        elif magic in (b'\xa1\xb2\xc3\xd4', b'\xa1\xb2\x3c\x4d'):
+            end = '>'
+        else:
+            raise ValueError('not a classic pcap file (pcapng is not supported)')
+        div = 1e9 if magic in (b'\x4d\x3c\xb2\xa1', b'\xa1\xb2\x3c\x4d') else 1e6
+        linktype = _st.unpack(end + 'I', hdr[20:24])[0] & 0x0FFFFFFF
+        if linktype != 1:
+            raise ValueError('pcap link type %d is not Ethernet' % linktype)
+        while True:
+            rec = fh.read(16)
+            if len(rec) < 16:
+                return
+            sec, frac, incl, _orig = _st.unpack(end + 'IIII', rec)
+            data = fh.read(incl)
+            if len(data) < incl:
+                return
+            yield sec + frac / div, data
+
+
+def _lldp_neighbour(W, fr, walk):
+    """Summarise one well-formed-enough LLDPDU for the neighbour table."""
+    n = {'src': fr.src, 'vlans': list(fr.vlans), 'chassis': None, 'port': None,
+         'name': None, 'desc': None, 'ttl': None,
+         'mgmt': W.extract_mgmt_addrs(walk)}
+    for t in walk.tlvs:
+        v = t.value
+        if t.type in (W.TLV_CHASSIS_ID, W.TLV_PORT_ID) and len(v) >= 2:
+            sub, body = v[0], v[1:]
+            mac_sub = 4 if t.type == W.TLV_CHASSIS_ID else 3
+            txt = W.normalise_mac(body) if sub == mac_sub and len(body) == 6 \
+                else W.printable(body, 64)
+            n['chassis' if t.type == W.TLV_CHASSIS_ID else 'port'] = txt
+        elif t.type == W.TLV_TTL and len(v) == 2:
+            n['ttl'] = (v[0] << 8) | v[1]
+        elif t.type == W.TLV_SYS_NAME:
+            n['name'] = W.printable(v, 64)
+        elif t.type == W.TLV_SYS_DESC:
+            n['desc'] = W.printable(v, 160)
+    return n
+
+
+def _lldp_summarize(findings):
+    """Collapse the engine's per-frame findings into one row per (code, source) with
+    a count — a malformed sender repeats every hello."""
+    rows = {}
+    for f in findings:
+        k = (f['code'], f['src'])
+        r = rows.get(k)
+        if r is None:
+            cves = list(f.get('cves') or _LLDP_CODE_CVES.get(f['code'], []))
+            rows[k] = {'code': f['code'], 'name': f['name'], 'severity': f['severity'],
+                       'group': f['group'], 'src': f['src'], 'detail': f['detail'],
+                       'cves': cves, 'family': f.get('family'),
+                       'mgmt_addrs': list(f.get('mgmt_addrs') or []),
+                       'count': 1, 'first_ts': f['ts']}
+        else:
+            r['count'] += 1
+    return sorted(rows.values(), key=lambda r: (-_LLDP_SEV_RANK.get(r['severity'], 0),
+                                                r['code'], r['src']))
+
+
+def _lldp_verdict(rows, frames):
+    """no-traffic < clean / observed < exposure < suspicious < attack. A high or
+    critical finding is a malformed-frame CVE shape, a flood or a forged neighbour;
+    medium is a reserved type / duplicate / smuggled tail; low is a below-floor
+    version or a missing End TLV. Screening notes alone are 'observed' (the card lists
+    them, but an advertised version is not a vulnerability)."""
+    sev = {r['severity'] for r in rows}
+    if sev & {'critical', 'high'}:
+        return 'attack'
+    if 'medium' in sev:
+        return 'suspicious'
+    if 'low' in sev:
+        return 'exposure'
+    if sev:
+        return 'observed'
+    return 'clean' if frames else 'no-traffic'
+
+
+def _lldp_normalize(r):
+    """lldpwatch summary row -> the guard finding shape _guard_emit_jsonl expects."""
+    return {'code': r['code'], 'name': r['name'],
+            'severity': _LLDP_SEV_TO_GUARD.get(r['severity'], 'MEDIUM'),
+            'klass': 'ATTACK' if r['group'] in ('structural', 'abuse') else 'EXPOSURE',
+            'src': r['src'], 'cves': list(r.get('cves') or []),
+            'detail': {'count': r['count'], 'group': r['group'], 'text': r['detail']}}
+
+
+def _lldp_analyze(pcap, baseline=None, enforce=False):
+    """Replay a pcap through the vendored engine. Returns (rows, neighbours, frames,
+    sources)."""
+    W = _lldp_import()
+    cfg = W.Config()
+    if enforce and baseline:
+        cfg.baseline = tuple(W.normalise_mac(m) for m in baseline)
+        cfg.enforce = True
+    eng = W.Engine(cfg)
+    frames = 0
+    neigh = {}
+    for ts, raw in _lldp_read_pcap(pcap):
+        fr = W.parse_ethernet(raw)
+        if fr is None:
+            continue
+        frames += 1
+        try:
+            eng.handle_frame(raw, ts=ts)
+            if fr.src in neigh or len(neigh) < _LLDP_MAX_NEIGHBOURS:
+                neigh[fr.src] = _lldp_neighbour(W, fr, W.walk_tlvs(fr.payload,
+                                                                   cfg.allow_fcs_tail))
+        except Exception:
+            continue              # one hostile frame must never kill the scan
+    rows = _lldp_summarize(eng.findings)
+    bl = set(cfg.baseline)
+    for n in neigh.values():
+        n['trusted'] = (n['src'] in bl) if bl else None
+    return rows, sorted(neigh.values(), key=lambda n: n['src']), frames, sorted(neigh)
+
+
+def do_lldp_watch(interface=None, seconds=30, pcap=None, persist=True, quick=False):
+    """Passive LLDP (802.1AB) security scan — detection-only, never transmits. Flags
+    malformed LLDPDUs in the shapes the lldpd / Cisco / Juniper l2cpd / OVS / Aruba /
+    PAN-OS / SonicWall parser CVEs are reached through, screens advertised software
+    against the vulnerable-family table (notes only), and trips on LLDP floods and —
+    once a baseline is trusted — forged neighbours. LLDP hellos are ~30 s apart.
+    `pcap` replays a file instead of capturing."""
+    iface = None
+    tmp = None
+    if pcap:
+        if not os.path.isfile(pcap):
+            return {'success': False, 'error': 'pcap not found: %s' % pcap}
+        seconds = 0
+    else:
+        iface = interface if _valid_iface(interface or '') else _capture_iface()
+        if not iface:
+            return {'success': False, 'error': 'no interface to capture on'}
+        seconds = _clamp_int(seconds, 30, 5, 65)
+        if not _have('tcpdump'):
+            return {'success': False, 'interface': iface,
+                    'error': 'tcpdump is not installed. Click Install to add it.',
+                    'missing_tool': 'tcpdump'}
+        W = _lldp_import()
+        import tempfile
+        fd, tmp = tempfile.mkstemp(suffix='.pcap')
+        os.close(fd)
+        # Promiscuous (no -p): the LLDP group MACs are multicasts the host never
+        # joins. -Q in: this unit's own lldpd adverts are not the neighbour. Full
+        # snaplen so LLDP-040's declared-vs-available length check sees every byte.
+        res = _run(['timeout', str(seconds), 'tcpdump', '-i', iface, '-nn', '-Q', 'in',
+                    '-s', '65535', '-c', '5000', '-w', tmp, W.BPF_FILTER],
+                   timeout=seconds + 8)
+        if (os.path.getsize(tmp) <= 24 and res['err'] and any(
+                k in res['err'].lower() for k in ('permission', "couldn't",
+                                                  'no such device', 'syntax error'))):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return {'success': False, 'interface': iface, 'error': res['err'].strip()[:200]}
+        pcap = tmp
+    try:
+        with _lldp_lock:
+            d = _lldp_load() if persist else {}
+            rows, neigh, frames, sources = _lldp_analyze(
+                pcap, baseline=d.get('baseline') or [], enforce=bool(d.get('enforce')))
+            if persist and sources:
+                d['last_sources'] = sources[:_LLDP_MAX_BASELINE]
+                d['last_seen'] = time.time()
+                _lldp_save(d)
+    except Exception as e:
+        return {'success': False, 'interface': iface,
+                'error': 'lldp analysis failed: %s: %s' % (type(e).__name__, e)}
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    verdict = _lldp_verdict(rows, frames)
+    reasons = []
+    for r in rows:
+        if r['severity'] == 'notice' and len(rows) > 1 and reasons:
+            continue
+        cv = (' [%s]' % ', '.join(r['cves'][:3])) if r['cves'] else ''
+        reasons.append('%s: %s — %s (%s×)%s' % (r['code'], r['name'], r['src'],
+                                                r['count'], cv))
+        if len(reasons) >= 8:
+            break
+    if not reasons:
+        reasons = (['LLDP seen from %d neighbour(s); every LLDPDU was well-formed and no '
+                    'flood or forged neighbour was seen' % len(neigh)] if frames else
+                   ['No LLDP on this segment (EtherType 0x88CC) — LLDP is off here, or '
+                    'the window was shorter than the ~30 s hello interval'])
+    by_sev = {}
+    for r in rows:
+        by_sev[r['severity']] = by_sev.get(r['severity'], 0) + 1
+    result = {'success': True, 'module': 'lldp_watch', 'interface': iface,
+              'seconds': seconds, 'verdict': verdict, 'reasons': reasons,
+              'findings': rows, 'by_severity': by_sev, 'packet_count': frames,
+              'neighbours': neigh, 'enforce': bool(d.get('enforce')),
+              'baseline_count': len(d.get('baseline') or [])}
+    # Medium and up reach Watchtower: malformed frames, floods and forged neighbours.
+    # Screening notes / below-floor hints stay in the card.
+    alerts = [_lldp_normalize(r) for r in rows
+              if _LLDP_SEV_RANK.get(r['severity'], 0) >= 2]
+    if not quick and persist and alerts:
+        _guard_emit_jsonl('lldp_watch', {'interface': iface, 'findings': alerts})
+    return result
+
+
+def do_lldp_baseline(action='get'):
+    """Manage the trusted LLDP neighbour baseline. 'trust' adds the neighbours seen in
+    the last scan and turns LLDP-049 (forged neighbour) on; 'reset' forgets the
+    baseline and turns it off again."""
+    with _lldp_lock:
+        d = _lldp_load()
+        if action == 'reset':
+            d = {'last_sources': d.get('last_sources') or []}
+            _lldp_save(d)
+        elif action == 'trust':
+            bl = sorted(set(d.get('baseline') or []) | set(d.get('last_sources') or []))
+            d['baseline'] = bl[:_LLDP_MAX_BASELINE]
+            d['enforce'] = bool(d['baseline'])
+            _lldp_save(d)
+        return {'success': True, 'action': action, 'enforce': bool(d.get('enforce')),
+                'baseline': d.get('baseline') or [],
+                'last_sources': d.get('last_sources') or [],
+                'last_seen': d.get('last_seen')}
+
+
+def _lldp_selftest():
+    """Adapter scenarios over the vendored engine + frame builders (offline, no root),
+    plus the module's own tiers run out-of-process: the 2568-check conformance harness
+    (which asserts scapy is NOT imported, so it cannot run inside this process), the
+    338-check scapy cross-check, and — with tshark present — the 130-check DCBX
+    Wireshark-dissector cross-check (v3 added the DCBX class, LLDP-060..069)."""
+    import tempfile
+    scenarios = []
+
+    def check(name, cond):
+        scenarios.append({'name': name, 'pass': bool(cond)})
+
+    try:
+        W = _lldp_import()
+        import lldpwatch_frames as Fr
+    except Exception as e:
+        return {'success': False, 'scenarios': [
+            {'name': 'lldpwatch import failed: %s' % e, 'pass': False}]}
+
+    check('registry: 40 codes (15 screening / 21 structural / 4 abuse)',
+          len(W.FINDINGS) == 40 and
+          sorted(g for _n, _s, g in W.FINDINGS.values()).count('screening') == 15 and
+          sorted(g for _n, _s, g in W.FINDINGS.values()).count('structural') == 21 and
+          sorted(g for _n, _s, g in W.FINDINGS.values()).count('abuse') == 4)
+    fam_cves = {c for f in W.BUILTIN_FAMILIES for c in f.cves}
+    check('screening table names 30 distinct LLDP CVEs', len(fam_cves) == 30)
+    check('engine passes its own passive-invariant AST audit',
+          W.audit_source(open(W.__file__).read(), 'lldpwatch.py') == [])
+
+    def replay(frames, baseline=None, enforce=False, interval=0.001):
+        fd, path = tempfile.mkstemp(suffix='.pcap')
+        os.close(fd)
+        try:
+            Fr.write_pcap(path, frames, interval=interval)
+            return _lldp_analyze(path, baseline=baseline, enforce=enforce)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    # v3's benign set has 13 distinct sources — above the 12-distinct-source flood
+    # threshold — so space it 1 s/frame (no 10 s window holds 12) to prove the
+    # per-frame FP guard without tripping the rate correlator (flood is covered below).
+    rows, neigh, n, _src = replay([b() for b in Fr.BENIGN_BUILDERS], interval=1.0)
+    check('benign set (v4/v6 mgmt, 802.1Q, QinQ, MED phone, long banner, padding, FCS, '
+          'DCBX) -> no finding (FP guard)', n == len(Fr.BENIGN_BUILDERS) and not rows)
+    check('verdict: benign LLDP -> clean, nothing captured -> no-traffic',
+          _lldp_verdict(rows, n) == 'clean' and _lldp_verdict([], 0) == 'no-traffic')
+    v6 = [x for x in neigh if any(a.startswith('[') for a in x['mgmt'])]
+    check('neighbour table renders an IPv6 management address bracketed', bool(v6))
+
+    for code, builders in sorted(Fr.MALFORMED_BUILDERS.items()):
+        hit = all(code in {r['code'] for r in replay([b()])[0]} for b in builders)
+        check('%s %s: every fixture (%d) fires' % (code, W.FINDINGS[code][0], len(builders)),
+              hit)
+    rows = replay([Fr.mal_mgmt_v6_short()])[0]
+    check('LLDP-045 IPv6-family management address with a v4-sized body is caught '
+          '(dual-stack) and names CVE-2015-8011',
+          any(r['code'] == 'LLDP-045' and 'CVE-2015-8011' in r['cves'] for r in rows))
+    check('verdict: an LLDP-040 overrun -> attack',
+          _lldp_verdict(replay([Fr.mal_length_overrun()])[0], 1) == 'attack')
+
+    for code, b in sorted(Fr.VENDOR_BUILDERS.items()):
+        rows = replay([b()])[0]
+        check('%s screening note carries its family CVEs (severity notice)' % code,
+              any(r['code'] == code and r['cves'] and r['severity'] == 'notice'
+                  for r in rows))
+    check('verdict: a screening note alone -> observed (not a vulnerability verdict)',
+          _lldp_verdict(replay([Fr.vendor_juniper()])[0], 1) == 'observed')
+
+    rows = replay(Fr.flood_frames(30))[0]
+    check('LLDP-048 flood from 30 distinct sources -> attack, names CVE-2020-27827',
+          any(r['code'] == 'LLDP-048' and 'CVE-2020-27827' in r['cves'] for r in rows)
+          and _lldp_verdict(rows, 30) == 'attack')
+    rows = replay(Fr.flood_frames(5))[0]
+    check('5 neighbours in a window -> no LLDP-048 (FP guard)',
+          'LLDP-048' not in {r['code'] for r in rows})
+
+    good = Fr.benign_full()
+    src = W.parse_ethernet(good).src
+    rows = replay([good, Fr.benign_minimal()], baseline=[src], enforce=True)[0]
+    check('LLDP-049 with a trusted baseline: the unknown neighbour fires, the trusted '
+          'one does not', [(r['code'], r['src']) for r in rows if r['code'] == 'LLDP-049']
+          == [('LLDP-049', W.parse_ethernet(Fr.benign_minimal()).src)])
+    rows = replay([Fr.benign_minimal()])[0]
+    check('LLDP-049 is off without a trusted baseline (grab-and-go)', not rows)
+
+    # Out-of-process tiers.
+    here = _LLDP_PY_DIR
+    r = _run([sys.executable, os.path.join(here, 'lldpwatch.py'), '--self-test'],
+             timeout=120)
+    tail = (r['out'] or r['err'] or '').strip().splitlines()[-1:] or ['']
+    check('conformance tier: %s' % tail[0][:90], r['rc'] == 0)
+    xcheck = {'ran': False, 'reason': 'scapy not installed'}
+    if _have_scapy():
+        r = _run([sys.executable, os.path.join(here, 'lldpwatch_scapy_xcheck.py'),
+                  '--quiet'], timeout=180)
+        tail = (r['out'] or '').strip().splitlines()[-1:] or ['']
+        check('scapy cross-check tier: %s' % tail[0][:90], r['rc'] == 0)
+        xcheck = {'ran': True, 'pass': r['rc'] == 0}
+    # DCBX Wireshark-dissector cross-check (v3; needs tshark, skipped otherwise).
+    if _have('tshark'):
+        r = _run([sys.executable, os.path.join(here, 'lldpwatch_dcbx_xcheck.py'),
+                  '--quiet'], timeout=180)
+        tail = (r['out'] or r['err'] or '').strip().splitlines()[-1:] or ['']
+        check('DCBX cross-check tier: %s' % tail[0][:90], r['rc'] == 0)
+    return {'success': all(s['pass'] for s in scenarios), 'scenarios': scenarios,
+            'scapy': xcheck}
+
+
+# ==========================================================================
+# OAM Watch — passive IEEE 802.3ah Link OAM abuse monitor (vendored python/oamwatch/)
+# ==========================================================================
+# Adapts the vendored oamwatch package. Link OAM (EFM OAM, IEEE 802.3 Clause 57) is
+# the per-link operations channel on slow-protocols EtherType 0x8809 subtype 0x03 —
+# LACP's sibling (Ragnar's LACP Watch owns subtypes 0x01/0x02). It is cleartext,
+# unauthenticated, link-local, and capped by the standard at 10 frames/s. The
+# headline primitive is Loopback Control: ONE forged frame puts the peer into remote
+# loopback and sends its higher-layer egress to DISCARD — an instant link blackhole
+# (OAM-060, confirmed by OAM-062). The other abuse: forged Dying Gasp / Critical
+# Event / Link Fault flags that drive protection switches (a single assertion is
+# often real; OAM-066 is the repeated assert-and-clear while the session stays up),
+# discovery restart / peer substitution / capability escalation, cleartext Clause 30
+# MIB reads (Variable Request/Response), event-sequence replay, a second OAM speaker
+# on a point-to-point link, and the 10 PDU/s cap exceeded. Structural OAM-04x/05x
+# codes catch grammar and bounds violations. Posture OAM-02x are capability notes.
+#
+# There is NO CVE backbone (no Link OAM CVE clears the bar), so nothing here names
+# one. The vantage is narrow: Link OAM lives on one provider-to-CPE / metro handoff
+# link and is config-gated, so on most ports this sits silent — correctly. The engine
+# is kept per interface across scans (in memory), because its session state — peer
+# identity, flags, event sequence, flap history — is learned from the link itself and
+# a 30 s window alone would never see a 300 s flap or a peer swapped between scans.
+# 802.1ag CFM / Y.1731 (EtherType 0x8902) is a different protocol and out of scope.
+_OAM_PY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'python')
+_oam_lock = threading.Lock()
+_oam_engines = {}                  # iface -> persistent oamwatch Engine
+_OAM_BPF = 'ether proto 0x8809 and ether[14] = 3'
+_OAM_SEV_RANK = {'INFO': 0, 'LOW': 1, 'MEDIUM': 2, 'HIGH': 3, 'CRITICAL': 4}
+# A single failure-flag assertion is commonly legitimate (a real power loss sends a
+# Dying Gasp), so on its own it is 'suspicious', not 'attack'. OAM-066 (flapping) is
+# the forgery signal and is critical in the registry.
+_OAM_FLAG_CODES = ('OAM-063', 'OAM-064', 'OAM-065')
+
+
+def _oam_import():
+    """Import the vendored oamwatch package (relative imports inside; python/ must be
+    on sys.path). Returns (engine, parser, registry, config, sensor) modules. The
+    sensor's live AF_PACKET path imports socket lazily and is never used here."""
+    if _OAM_PY_DIR not in sys.path:
+        sys.path.insert(0, _OAM_PY_DIR)
+    from oamwatch import engine as _e, parser as _p, registry as _r, config as _c
+    from oamwatch import sensor as _s
+    return _e, _p, _r, _c, _s
+
+
+def _oam_summarize(findings):
+    """Collapse findings into one row per (code, source MAC) with a count."""
+    rows = {}
+    for f in findings:
+        k = (f.code, f.src)
+        r = rows.get(k)
+        if r is None:
+            rows[k] = {'code': f.code, 'name': f.name, 'klass': f.klass,
+                       'severity': f.severity.lower(), 'src': f.src,
+                       'detail': f.detail, 'count': 1, 'first_ts': f.ts}
+        else:
+            r['count'] += 1
+            r['detail'] = f.detail          # keep the latest wording (e.g. rates)
+    return sorted(rows.values(), key=lambda r: (-_OAM_SEV_RANK.get(r['severity'].upper(), 0),
+                                                r['code'], r['src']))
+
+
+def _oam_verdict(rows, frames):
+    """no-traffic < clean / observed < exposure < suspicious < attack. Posture notes
+    (capability bits) alone are 'observed'. A critical finding (loopback enable /
+    remote-loopback state, flag flapping, peer substitution, a second speaker) or a
+    high non-flag finding is 'attack'; a single failure-flag assertion or a medium
+    finding is 'suspicious'; a low structural finding is 'exposure'."""
+    sev_attack = False
+    sev = set()
+    for r in rows:
+        s = r['severity']
+        if r['klass'] == 'posture':
+            sev.add('posture')
+            continue
+        if s == 'critical' or (s == 'high' and r['code'] not in _OAM_FLAG_CODES):
+            sev_attack = True
+        elif s in ('high', 'medium'):
+            sev.add('medium')
+        elif s == 'low':
+            sev.add('low')
+    if sev_attack:
+        return 'attack'
+    if 'medium' in sev:
+        return 'suspicious'
+    if 'low' in sev:
+        return 'exposure'
+    if 'posture' in sev:
+        return 'observed'
+    return 'clean' if frames else 'no-traffic'
+
+
+def _oam_peers(engine, parser_mod):
+    names = {0x01: 'active', 0x02: 'unidirectional', 0x04: 'loopback',
+             0x08: 'link-events', 0x10: 'variable-retrieval'}
+    out = []
+    for mac, p in sorted(engine.peers.items()):
+        cfg = p.config
+        out.append({'src': mac, 'pdus': p.pdu_count, 'operational': bool(p.operational),
+                    'remote_loopback': bool(p.in_remote_loopback),
+                    'oui': p.identity[0].hex(':') if p.identity else None,
+                    'capabilities': [n for b, n in names.items() if cfg is not None and cfg & b],
+                    'flags': ('0x%04x' % p.last_flags) if p.last_flags is not None else None})
+    return out
+
+
+def _oam_normalize(r):
+    """oamwatch summary row -> the guard finding shape _guard_emit_jsonl expects."""
+    return {'code': r['code'], 'name': r['name'],
+            'severity': r['severity'].upper(),
+            'klass': 'ATTACK' if r['klass'] == 'abuse' else 'MALFORMED'
+            if r['klass'] == 'structural' else 'EXPOSURE',
+            'src': r['src'], 'cves': [],
+            'detail': {'count': r['count'], 'class': r['klass'], 'text': r['detail']}}
+
+
+def _oam_analyze(pcap, engine):
+    """Replay a pcap through `engine` (persistent or fresh). Returns (new findings,
+    OAM frames seen)."""
+    _e, P, _r, _c, S = _oam_import()
+    new = []
+    frames = 0
+    for ts, raw in S.read_pcap(pcap):
+        if not P.is_oam_frame(raw):
+            continue
+        frames += 1
+        try:
+            pdu = P.parse_frame(raw, strict_tail=engine.cfg.strict_tail, ts=ts)
+            if pdu is not None:
+                new.extend(engine.observe(pdu))
+        except Exception:
+            continue              # one hostile frame must never kill the scan
+    return new, frames
+
+
+def do_oam_watch(interface=None, seconds=30, pcap=None, quick=False):
+    """Passive IEEE 802.3ah Link OAM scan — detection-only, never transmits. Flags the
+    Loopback Control link-blackhole primitive, forged/flapping failure flags,
+    discovery restart and peer substitution, cleartext Clause 30 MIB reads, event
+    replay, a second OAM speaker, rate-cap floods and malformed OAMPDUs. Link OAM is
+    point-to-point and config-gated: it is only visible on an OAM-enabled link.
+    `pcap` replays a file through a fresh engine instead of capturing."""
+    E, P, _R, C, _S = _oam_import()
+    iface = None
+    tmp = None
+    if pcap:
+        if not os.path.isfile(pcap):
+            return {'success': False, 'error': 'pcap not found: %s' % pcap}
+        seconds = 0
+        engine = E.Engine(C.Config())
+    else:
+        iface = interface if _valid_iface(interface or '') else _capture_iface()
+        if not iface:
+            return {'success': False, 'error': 'no interface to capture on'}
+        seconds = _clamp_int(seconds, 30, 5, 65)
+        if not _have('tcpdump'):
+            return {'success': False, 'interface': iface,
+                    'error': 'tcpdump is not installed. Click Install to add it.',
+                    'missing_tool': 'tcpdump'}
+        import tempfile
+        fd, tmp = tempfile.mkstemp(suffix='.pcap')
+        os.close(fd)
+        # Promiscuous (no -p): 01:80:C2:00:00:02 is a group the host never joins.
+        # -Q in: only the far end's OAMPDUs — this unit is not the peer.
+        res = _run(['timeout', str(seconds), 'tcpdump', '-i', iface, '-nn', '-Q', 'in',
+                    '-s', '65535', '-c', '5000', '-w', tmp, _OAM_BPF],
+                   timeout=seconds + 8)
+        if (os.path.getsize(tmp) <= 24 and res['err'] and any(
+                k in res['err'].lower() for k in ('permission', "couldn't",
+                                                  'no such device', 'syntax error'))):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return {'success': False, 'interface': iface, 'error': res['err'].strip()[:200]}
+        pcap = tmp
+        engine = None
+    try:
+        with _oam_lock:
+            if engine is None:
+                engine = _oam_engines.get(iface)
+                if engine is None:
+                    engine = _oam_engines[iface] = E.Engine(C.Config())
+            new, frames = _oam_analyze(pcap, engine)
+            peers = _oam_peers(engine, P)
+    except Exception as e:
+        return {'success': False, 'interface': iface,
+                'error': 'oam analysis failed: %s: %s' % (type(e).__name__, e)}
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    rows = _oam_summarize(new)
+    verdict = _oam_verdict(rows, frames)
+    reasons = []
+    for r in rows:
+        if r['klass'] == 'posture' and len(rows) > 1 and reasons:
+            continue
+        reasons.append('%s: %s — %s (%s×)' % (r['code'], r['name'], r['src'], r['count']))
+        if len(reasons) >= 8:
+            break
+    if not reasons:
+        if not frames:
+            reasons = ['No Link OAM on this port (slow-protocols 0x8809 subtype 3). '
+                       'Link OAM is point-to-point and config-gated — it is normally '
+                       'only seen on a metro / access handoff link']
+        else:
+            reasons = ['Link OAM seen from %d peer(s); every OAMPDU was well-formed and '
+                       'no loopback, flag forgery, re-peering or MIB read was seen'
+                       % len(peers)]
+    by_sev = {}
+    for r in rows:
+        by_sev[r['severity']] = by_sev.get(r['severity'], 0) + 1
+    result = {'success': True, 'module': 'oam_watch', 'interface': iface,
+              'seconds': seconds, 'verdict': verdict, 'reasons': reasons,
+              'findings': rows, 'by_severity': by_sev, 'packet_count': frames,
+              'peers': peers}
+    # Structural and abuse findings at MEDIUM and up reach Watchtower; posture notes
+    # stay in the card.
+    alerts = [_oam_normalize(r) for r in rows if r['klass'] != 'posture'
+              and _OAM_SEV_RANK.get(r['severity'].upper(), 0) >= 2]
+    if not quick and iface and alerts:
+        _guard_emit_jsonl('oam_watch', {'interface': iface, 'findings': alerts})
+    return result
+
+
+def do_oam_reset(interface=None):
+    """Forget the in-memory Link OAM session state (all interfaces, or one) — use after
+    a legitimate peer swap so the next scan does not report a peer substitution."""
+    with _oam_lock:
+        if interface:
+            _oam_engines.pop(interface, None)
+        else:
+            _oam_engines.clear()
+    return {'success': True, 'reset': interface or 'all'}
+
+
+def _oam_selftest():
+    """Adapter scenarios over the vendored engine with the upstream test frames
+    (offline, no root), plus the module's own tiers out-of-process: the 297-check
+    conformance harness (asserts scapy is NOT imported, so it cannot run in this
+    process) and, with scapy + tshark present, the 163-check Wireshark cross-check."""
+    import importlib.util
+    import tempfile
+    scenarios = []
+
+    def check(name, cond):
+        scenarios.append({'name': name, 'pass': bool(cond)})
+
+    try:
+        E, P, R, C, S = _oam_import()
+        spec = importlib.util.spec_from_file_location(
+            '_oamwatch_test_frames', os.path.join(_OAM_PY_DIR, 'oamwatch_tests', 'frames.py'))
+        Fr = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(Fr)
+    except Exception as e:
+        return {'success': False, 'scenarios': [
+            {'name': 'oamwatch import failed: %s' % e, 'pass': False}]}
+
+    split = {}
+    for _n, k, _s, _d in R.REGISTRY.values():
+        split[k] = split.get(k, 0) + 1
+    check('registry: 44 codes (5 posture / 18 structural / 21 abuse)',
+          len(R.REGISTRY) == 44 and split == {'posture': 5, 'structural': 18, 'abuse': 21})
+
+    def replay(frames, engine=None, step=0.2):
+        eng = engine or E.Engine(C.Config())
+        fd, path = tempfile.mkstemp(suffix='.pcap')
+        os.close(fd)
+        try:
+            S.write_pcap(path, frames, interval=step)
+            new, n = _oam_analyze(path, eng)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        rows = _oam_summarize(new)
+        return rows, n, eng
+
+    def codes(rows):
+        return {r['code'] for r in rows}
+
+    rows, n, _e = replay(Fr.clean_set())
+    check('clean reference set: no structural or abuse finding (posture notes only) '
+          '-> observed', n == len(Fr.clean_set()) and
+          all(r['klass'] == 'posture' for r in rows) and _oam_verdict(rows, n) == 'observed')
+    check('verdict: nothing captured -> no-traffic', _oam_verdict([], 0) == 'no-traffic')
+    nonoam = Fr.eth(0x00, b'\x00', subtype=0x01)            # an LACP-subtype frame
+    rows, n, _e = replay([nonoam])
+    check('LACP (slow-protocols subtype 1) is not parsed as OAM', n == 0 and not rows)
+
+    rows, n, _e = replay([Fr.information(), Fr.loopback_control(command=0x01)])
+    check('Loopback Control enable -> OAM-060, verdict attack (link-blackhole primitive)',
+          'OAM-060' in codes(rows) and _oam_verdict(rows, n) == 'attack')
+    rows, n, _e = replay([Fr.information([Fr.info_tlv(state=0x01)])])
+    check('peer reports parser=loopback -> OAM-062 remote-loopback confirmed',
+          'OAM-062' in codes(rows) and _oam_verdict(rows, n) == 'attack')
+    rows, n, _e = replay([Fr.information(flags=Fr.FLAGS_OPERATIONAL | Fr.F_DYING_GASP)])
+    check('a single Dying Gasp -> OAM-063 but only suspicious (often a real power loss)',
+          'OAM-063' in codes(rows) and _oam_verdict(rows, n) == 'suspicious')
+    flap = []
+    for _i in range(3):
+        flap += [Fr.information(flags=Fr.FLAGS_OPERATIONAL | Fr.F_DYING_GASP),
+                 Fr.information(flags=Fr.FLAGS_OPERATIONAL)]
+    rows, n, _e = replay(flap)
+    check('Dying Gasp asserted+cleared 3x with the session up -> OAM-066 flapping, attack',
+          'OAM-066' in codes(rows) and _oam_verdict(rows, n) == 'attack')
+    rows, n, _e = replay([Fr.keepalive(src=Fr.SRC_A), Fr.keepalive(src=Fr.SRC_B)])
+    check('two OAM speakers on a point-to-point link -> OAM-074', 'OAM-074' in codes(rows))
+    rows, n, _e = replay([Fr.keepalive() for _i in range(16)], step=0.05)
+    check('16 OAMPDUs in under a second -> OAM-070 rate cap; 4 do not',
+          'OAM-070' in codes(rows) and
+          'OAM-070' not in codes(replay([Fr.keepalive() for _i in range(4)], step=0.05)[0]))
+    rows, n, _e = replay([Fr.variable_response()])
+    check('Variable Response with MIB contents -> OAM-072 cleartext leak',
+          'OAM-072' in codes(rows))
+    # v2: a conformant (byte-identical) retransmission of the same seq is NOT a
+    # replay; OAM-073 needs the sequence to go BACKWARDS (same-seq-different-content
+    # is the new OAM-080, covered by the conformance tier).
+    rows, n, _e = replay([Fr.event_notification(seq=5), Fr.event_notification(seq=3)])
+    check('Event Notification sequence going backwards -> OAM-073 replay',
+          'OAM-073' in codes(rows))
+    bad = Fr.information([bytes([0x01, 0x40]) + b'\x00' * 8])
+    rows, n, _e = replay([bad])
+    check('TLV length past the OAMPDU -> structural finding, verdict attack',
+          {'OAM-040', 'OAM-042'} & codes(rows) and _oam_verdict(rows, n) == 'attack')
+    rows, n, _e = replay([Fr.information([Fr.info_tlv(version=0x02)])])
+    check('Information TLV version != 1 -> OAM-054 (low) -> exposure',
+          'OAM-054' in codes(rows) and _oam_verdict(rows, n) == 'exposure')
+
+    # Persistent engine: session state carries across scan windows.
+    rows1, _n, eng = replay([Fr.information([Fr.info_tlv(oui=Fr.OUI_A)])])
+    rows2, _n, _e = replay([Fr.information([Fr.info_tlv(oui=Fr.OUI_B)])], engine=eng)
+    check('peer identity swapped between two scans -> OAM-068 on the second scan '
+          '(engine kept per interface)', 'OAM-068' in codes(rows2)
+          and 'OAM-068' not in codes(rows1))
+    check('peer table: OUI, capabilities and operational state reported',
+          any(p['oui'] and 'loopback' in p['capabilities'] and p['operational']
+              for p in _oam_peers(eng, P)))
+    r = do_oam_reset('selftest0')
+    check('reset clears per-interface session state', r.get('success'))
+
+    # Out-of-process tiers.
+    tdir = os.path.join(_OAM_PY_DIR, 'oamwatch_tests')
+    r = _run([sys.executable, os.path.join(tdir, 'conformance.py')], timeout=120)
+    tail = (r['out'] or r['err'] or '').strip().splitlines()[-1:] or ['']
+    check('conformance tier: %s' % tail[0][:90], r['rc'] == 0)
+    xcheck = {'ran': False, 'reason': 'needs scapy and tshark'}
+    if _have_scapy() and _have('tshark'):
+        r = _run([sys.executable, os.path.join(tdir, 'xcheck.py')], timeout=180)
+        tail = (r['out'] or '').strip().splitlines()[-1:] or ['']
+        check('Wireshark cross-check tier: %s' % tail[0][:90], r['rc'] == 0)
+        xcheck = {'ran': True, 'pass': r['rc'] == 0}
+    return {'success': all(s['pass'] for s in scenarios), 'scenarios': scenarios,
+            'scapy': xcheck}
+
+# ==========================================================================
+# CFM Watch — passive IEEE 802.1ag CFM / ITU-T Y.1731 service-OAM monitor
+# (vendored python/cfmwatch.py, stdlib-only, unmodified)
+# ==========================================================================
+# CFM is the service layer of carrier Ethernet OAM (EtherType 0x8902 inside the
+# service VLAN; 802.1Q and QinQ parsed): maintenance domains at levels 0-7,
+# continuity checks between MEPs, and the Y.1731 overlay (AIS / LCK / CSF, APS
+# protection switching, loopback, linktrace, performance). All of it is cleartext
+# and unauthenticated, so any station on an EVC trunk can forge it: a forged APS
+# moves production traffic onto the protection path or locks protection out
+# (CFM-081/083/087), a forged AIS hides a real fault (CFM-061/063), a forged CCM
+# raises a cross-connect / unexpected-MEP defect (CFM-040/041/045/046), and a
+# linktrace sweep maps the provider's MIP chain (CFM-103/104).
+#
+# CVE backbone: CVE-2020-1639 (Junos crafted Ethernet OAM cores cfmd) is CFM-140,
+# raised off the Class A bounds violations; CVE-2025-52961 (Junos Evolved cfmd
+# CPU / cfmman leak from VALID traffic) is CFM-122/141, a rate correlation with LOW
+# confidence — it cannot tell the CVE from any other heavy CFM talker. Huawei's
+# Y.1731 DoS has no published trigger field and so no code; a Cisco IOS XR CFM bug
+# is rejected below the CVSS bar. Both stay context only.
+#
+# The engine is kept per interface across scans (in memory): MA / MEP state,
+# APS group ownership and the CCM history that disarms CFM-061 are learned from
+# the link, and a 30 s window alone would see neither an established MEP moving to
+# a new MAC between scans nor an AIS from a source that has CCM'd before. Each scan
+# reports only what it added. 802.3ah Link OAM (EtherType 0x8809) is OAM Watch.
+_CFMW_PY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'python')
+_cfmw_lock = threading.Lock()
+_cfmw_engines = {}                 # iface -> persistent cfmwatch Engine
+# 0x8902 untagged, behind one tag, or behind QinQ (libpcap's `vlan` also reads the
+# kernel-offloaded tag).
+# CFM is EtherType 0x8902; E-LMI (MEF 16, class L) is 0x88EE on the UNI. Admit both,
+# untagged and behind one/two VLAN tags (802.1Q / QinQ).
+_CFMW_ET = '(ether proto 0x8902 or ether proto 0x88ee)'
+_CFMW_BPF = ('%s or (vlan and (%s or (vlan and %s)))' % (_CFMW_ET, _CFMW_ET, _CFMW_ET))
+_CFMW_SEV_RANK = {'info': 0, 'low': 1, 'medium': 2, 'high': 3, 'critical': 4}
+
+
+def _cfmw_import():
+    """Import the vendored cfmwatch module (python/ must be on sys.path). Its live
+    AF_PACKET path is never used here — capture is tcpdump, like every in-app watch."""
+    if _CFMW_PY_DIR not in sys.path:
+        sys.path.insert(0, _CFMW_PY_DIR)
+    import cfmwatch
+    return cfmwatch
+
+
+def _cfmw_ceiling(v):
+    """MD-level ceiling (0-7) arms CFM-021; anything else leaves it off."""
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return None
+    return v if 0 <= v <= 7 else None
+
+
+def _cfmw_analyze(pcap, engine):
+    """Replay a pcap through `engine` (persistent or fresh) and return (rows added by
+    this scan, CFM frames seen). The engine collapses findings per (code, context)
+    with a running count, so a row's count here is this scan's delta."""
+    cw = _cfmw_import()
+    before = {k: f.count for k, f in engine.findings.items()}
+    before_cfm = engine.frames_cfm   # counts CFM (0x8902) AND E-LMI (0x88EE), not junk
+    for i, (ts, raw) in enumerate(cw.read_pcap(pcap)):
+        try:
+            engine.feed_raw(raw, i, ts)
+        except Exception:
+            continue              # one hostile frame must never kill the scan
+    frames = engine.frames_cfm - before_cfm
+    if frames:
+        engine.finalize()         # posture inventory roll-up (CFM-160..163)
+    rows = []
+    for k, f in engine.findings.items():
+        delta = f.count - before.get(k, 0)
+        if delta <= 0:
+            continue
+        s = f.spec
+        rows.append({'code': f.code, 'name': s.title, 'severity': s.severity.lower(),
+                     'klass': s.cls, 'class_name': cw.CLASS_NAMES.get(s.cls, s.cls),
+                     'confidence': s.confidence.lower(), 'cves': list(s.cves),
+                     'src': (f.evidence or {}).get('src') or '', 'context': f.key,
+                     'detail': f.detail, 'caveat': s.caveat, 'count': delta})
+    rows.sort(key=lambda r: (-_CFMW_SEV_RANK.get(r['severity'], 0), r['code'], r['context']))
+    return rows, frames
+
+
+def _cfmw_verdict(rows, frames):
+    """no-traffic < clean < observed < suspicious < attack. Class P inventory and the
+    INFO 'APS frame observed' note are by-design visibility on a carrier handoff, not
+    weaknesses, so they alone are 'clean'. LOW codes are real operational events (RDI,
+    AIS, CSF, LBM / LTM seen) -> 'observed'. MEDIUM, or a HIGH resting on LOW-confidence
+    evidence (CFM-122 rate correlation), -> 'suspicious'. CRITICAL or any other HIGH
+    -> 'attack'."""
+    level = 0
+    for r in rows:
+        s = r['severity']
+        if s == 'critical' or (s == 'high' and r['confidence'] != 'low'):
+            return 'attack'
+        if s in ('high', 'medium'):
+            level = max(level, 2)
+        elif s == 'low':
+            level = max(level, 1)
+    if level == 2:
+        return 'suspicious'
+    if level == 1:
+        return 'observed'
+    return 'clean' if frames else 'no-traffic'
+
+
+def _cfmw_inventory(engine):
+    """Maintenance endpoints, MD levels and service VLANs learned so far."""
+    cw = _cfmw_import()
+    meps = [dict(engine.inv_meps[k]) for k in sorted(engine.inv_meps)][:40]
+    vlans = [{'tags': list(vk) or ['untagged'], 'frames': c}
+             for vk, c in sorted(engine.inv_vlans.items())]
+    return {'meps': meps, 'levels': sorted(engine.inv_levels), 'vlans': vlans,
+            'y1731': sorted(cw.OPCODE_NAMES.get(o, str(o)) for o in engine.inv_y1731)}
+
+
+def _cfmw_normalize(r):
+    """cfmwatch row -> the guard finding shape _guard_emit_jsonl expects."""
+    return {'code': r['code'], 'name': r['name'], 'severity': r['severity'].upper(),
+            'klass': 'MALFORMED' if r['klass'] == 'A' else 'ATTACK',
+            'src': r['src'], 'cves': r['cves'],
+            'detail': {'count': r['count'], 'class': r['class_name'],
+                       'confidence': r['confidence'], 'context': r['context'],
+                       'text': r['detail']}}
+
+
+def do_cfm_watch(interface=None, seconds=30, pcap=None, md_ceiling=None, quick=False):
+    """Passive IEEE 802.1ag CFM / Y.1731 scan — detection-only, never transmits. Flags
+    forged APS protection switching (forced / lockout / uncorroborated Signal Fail /
+    churn), forged AIS and LCK, CCM forgery (MAID mismatch, duplicate or moved MEP,
+    unexpected MEP), MD-level hierarchy violations, LBM floods and linktrace sweeps,
+    malformed CFM (CVE-2020-1639 shape) and the CVE-2025-52961 load pattern. CFM only
+    appears on a carrier / metro Ethernet service handoff. `md_ceiling` (0-7) arms
+    CFM-021; `pcap` replays a file through a fresh engine instead of capturing."""
+    cw = _cfmw_import()
+    ceiling = _cfmw_ceiling(md_ceiling)
+    iface = None
+    tmp = None
+    engine = None
+    if pcap:
+        if not os.path.isfile(pcap):
+            return {'success': False, 'error': 'pcap not found: %s' % pcap}
+        seconds = 0
+        engine = cw.Engine(cw.Config(md_ceiling=ceiling, rings=_cfmw_rings(),
+                                     evcs=_cfmw_evcs()))
+    else:
+        iface = interface if _valid_iface(interface or '') else _capture_iface()
+        if not iface:
+            return {'success': False, 'error': 'no interface to capture on'}
+        seconds = _clamp_int(seconds, 30, 5, 65)
+        if not _have('tcpdump'):
+            return {'success': False, 'interface': iface,
+                    'error': 'tcpdump is not installed. Click Install to add it.',
+                    'missing_tool': 'tcpdump'}
+        import tempfile
+        fd, tmp = tempfile.mkstemp(suffix='.pcap')
+        os.close(fd)
+        # Promiscuous (no -p): the 01:80:C2:00:00:3x CFM groups are never joined and
+        # LBM / LTR are unicast to the MEP. -Q in: only frames from the wire.
+        res = _run(['timeout', str(seconds), 'tcpdump', '-i', iface, '-nn', '-Q', 'in',
+                    '-s', '65535', '-c', '20000', '-w', tmp, _CFMW_BPF],
+                   timeout=seconds + 8)
+        if (os.path.getsize(tmp) <= 24 and res['err'] and any(
+                k in res['err'].lower() for k in ('permission', "couldn't",
+                                                  'no such device', 'syntax error'))):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return {'success': False, 'interface': iface, 'error': res['err'].strip()[:200]}
+        pcap = tmp
+    try:
+        with _cfmw_lock:
+            if engine is None:
+                rings = _cfmw_rings()
+                evcs = _cfmw_evcs()
+                engine = _cfmw_engines.get(iface)
+                if engine is None:
+                    engine = _cfmw_engines[iface] = cw.Engine(
+                        cw.Config(rings=rings, evcs=evcs))
+                engine.cfg.md_ceiling = ceiling
+                engine.cfg.rings = rings
+                engine.cfg.evcs = evcs
+            rows, frames = _cfmw_analyze(pcap, engine)
+            inventory = _cfmw_inventory(engine)
+    except Exception as e:
+        return {'success': False, 'interface': iface,
+                'error': 'cfm analysis failed: %s: %s' % (type(e).__name__, e)}
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    verdict = _cfmw_verdict(rows, frames)
+    reasons = []
+    for r in rows:
+        if r['klass'] == 'P':
+            continue
+        cves = [c for c in r['cves'] if c not in r['name']]
+        cve = (' [%s]' % ', '.join(cves)) if cves else ''
+        reasons.append('%s: %s%s — %s (%s×)' % (r['code'], r['name'], cve,
+                                                r['src'] or r['context'], r['count']))
+        if len(reasons) >= 8:
+            break
+    if not reasons:
+        if not frames:
+            reasons = ['No CFM on this port (EtherType 0x8902, untagged or VLAN-tagged). '
+                       'CFM / Y.1731 service OAM is normally only seen on a carrier or '
+                       'metro Ethernet service handoff']
+        else:
+            reasons = ['CFM seen from %d maintenance endpoint(s) at MD level(s) %s; every '
+                       'frame was well-formed and no forgery, protection-switch abuse, '
+                       'linktrace sweep or flood was seen'
+                       % (len(inventory['meps']),
+                          ', '.join(str(x) for x in inventory['levels']) or '—')]
+    by_sev = {}
+    for r in rows:
+        by_sev[r['severity']] = by_sev.get(r['severity'], 0) + 1
+    result = {'success': True, 'module': 'cfm_watch', 'interface': iface,
+              'seconds': seconds, 'verdict': verdict, 'reasons': reasons,
+              'findings': rows, 'by_severity': by_sev, 'packet_count': frames,
+              'md_ceiling': ceiling, 'inventory': inventory}
+    # Everything but the posture inventory, at MEDIUM and up, reaches Watchtower.
+    alerts = [_cfmw_normalize(r) for r in rows if r['klass'] != 'P'
+              and _CFMW_SEV_RANK.get(r['severity'], 0) >= 2]
+    if not quick and iface and alerts:
+        _guard_emit_jsonl('cfm_watch', {'interface': iface, 'findings': alerts})
+    return result
+
+
+def do_cfm_reset(interface=None):
+    """Forget the in-memory CFM state (all interfaces, or one) — use after a legitimate
+    MEP / protection-group change so the next scan does not report it as forgery."""
+    with _cfmw_lock:
+        if interface:
+            _cfmw_engines.pop(interface, None)
+        else:
+            _cfmw_engines.clear()
+    return {'success': True, 'reset': interface or 'all'}
+
+
+# --- ERPS / G.8032 ring declaration (Class R) -----------------------------
+# The engine's ring-topology rules (forged RPL owner, two blocks, ring-open,
+# off-VLAN R-APS, revision / sub-ring propagation) are baseline-dependent: on the
+# wire a legitimate protection switch and a forged R-APS are identical without the
+# declared topology — the module's own design, the same declare-or-stay-quiet
+# pattern vrfwatch uses for an interface role. So CFM Watch persists the operator's
+# ring declarations and feeds them to the engine; with none declared it still flags
+# ERPS presence (CFM-200) and structural / forged R-APS, it just cannot judge ring
+# topology. Specs are stored verbatim and re-parsed each scan via cw.parse_ring.
+_CFMW_STORE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           'data', 'cfm_watch.json')
+
+
+def _cfmw_store_load():
+    try:
+        with open(_CFMW_STORE) as fh:
+            return json.load(fh) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _cfmw_load_specs(key):
+    specs = (_cfmw_store_load().get(key)) or []
+    return [s for s in specs if isinstance(s, str) and s.strip()]
+
+
+def _cfmw_save_specs(key, specs):
+    try:
+        d = _cfmw_store_load()
+        d[key] = list(specs)
+        os.makedirs(os.path.dirname(_CFMW_STORE), exist_ok=True)
+        with open(_CFMW_STORE, 'w') as fh:
+            json.dump(d, fh, indent=2)
+        return True
+    except OSError:
+        return False
+
+
+def _cfmw_load_ring_specs():
+    return _cfmw_load_specs('rings')
+
+
+def _cfmw_save_ring_specs(specs):
+    return _cfmw_save_specs('rings', specs)
+
+
+def _cfmw_load_evc_specs():
+    return _cfmw_load_specs('evcs')
+
+
+def _cfmw_save_evc_specs(specs):
+    return _cfmw_save_specs('evcs', specs)
+
+
+def _cfmw_evcs():
+    """Declared EVC specs -> parsed Evc objects (a spec that no longer parses is
+    skipped, never fatal)."""
+    cw = _cfmw_import()
+    out = []
+    for s in _cfmw_load_evc_specs():
+        try:
+            out.append(cw.parse_evc(s))
+        except Exception:
+            continue
+    return tuple(out)
+
+
+def _cfmw_evc_list(specs, cw):
+    out = []
+    for s in specs:
+        try:
+            e = cw.parse_evc(s)
+            out.append({'spec': s, 'name': e.label or ('evc%d' % e.reference), 'ok': True})
+        except Exception as e:
+            out.append({'spec': s, 'ok': False, 'error': str(e)})
+    return out
+
+
+def do_cfm_evc(action='list', spec=None):
+    """Declare / list / remove the E-LMI EVCs (MEF 16) whose CE-VLAN→EVC join CFM
+    Watch should police. A spec is `REFERENCE,vlan=VLAN[,name=LABEL]`. Declaring an
+    EVC arms the Class L cross-plane rules (an E-LMI EVC status that contradicts the
+    CFM continuity picture on the same service); with none declared, E-LMI presence
+    is still reported but the join cannot be checked."""
+    cw = _cfmw_import()
+    spec = (str(spec).strip() if spec is not None else '')
+    with _cfmw_lock:
+        specs = _cfmw_load_evc_specs()
+        if action == 'declare':
+            if not spec:
+                return {'success': False, 'error': 'no EVC specification given'}
+            try:
+                evc = cw.parse_evc(spec)
+            except Exception as e:
+                return {'success': False, 'error': 'invalid EVC specification: %s' % e}
+            if spec not in specs:
+                specs.append(spec)
+                _cfmw_save_evc_specs(specs)
+            _cfmw_engines.clear()
+            return {'success': True, 'declared': spec,
+                    'name': evc.label or ('evc%d' % evc.reference),
+                    'evcs': _cfmw_evc_list(specs, cw)}
+        if action == 'remove':
+            new = [s for s in specs if s != spec]
+            _cfmw_save_evc_specs(new)
+            _cfmw_engines.clear()
+            return {'success': True, 'evcs': _cfmw_evc_list(new, cw)}
+        if action == 'clear':
+            _cfmw_save_evc_specs([])
+            _cfmw_engines.clear()
+            return {'success': True, 'evcs': []}
+        return {'success': True, 'evcs': _cfmw_evc_list(specs, cw)}
+
+
+def _cfmw_rings():
+    """Declared ring specs -> parsed Ring objects (a spec that no longer parses is
+    skipped, never fatal)."""
+    cw = _cfmw_import()
+    out = []
+    for s in _cfmw_load_ring_specs():
+        try:
+            out.append(cw.parse_ring(s))
+        except Exception:
+            continue
+    return tuple(out)
+
+
+def _cfmw_ring_list(specs, cw):
+    out = []
+    for s in specs:
+        try:
+            out.append({'spec': s, 'name': cw.parse_ring(s).name(), 'ok': True})
+        except Exception as e:
+            out.append({'spec': s, 'ok': False, 'error': str(e)})
+    return out
+
+
+def do_cfm_ring(action='list', spec=None):
+    """Declare / list / remove the ERPS (G.8032) rings whose topology CFM Watch should
+    police. A spec is `VLAN[,rpl=MAC][,nodes=MAC/MAC][,role=major|sub][,parent=NAME]
+    [,name=LABEL]` (VLAN may be `untagged` or OUTER/INNER for QinQ). Declaring a ring
+    arms the Class R topology rules (forged RPL owner, two blocks, ring-open, off-VLAN
+    R-APS, revision / sub-ring propagation); with none declared the watcher still
+    reports ERPS presence (CFM-200) and structural / forged R-APS."""
+    cw = _cfmw_import()
+    spec = (str(spec).strip() if spec is not None else '')
+    with _cfmw_lock:
+        specs = _cfmw_load_ring_specs()
+        if action == 'declare':
+            if not spec:
+                return {'success': False, 'error': 'no ring specification given'}
+            try:
+                ring = cw.parse_ring(spec)
+            except Exception as e:
+                return {'success': False, 'error': 'invalid ring specification: %s' % e}
+            if spec not in specs:
+                specs.append(spec)
+                _cfmw_save_ring_specs(specs)
+            _cfmw_engines.clear()        # rebuild engines so the ring arms next scan
+            return {'success': True, 'declared': spec, 'name': ring.name(),
+                    'rings': _cfmw_ring_list(specs, cw)}
+        if action == 'remove':
+            new = [s for s in specs if s != spec]
+            _cfmw_save_ring_specs(new)
+            _cfmw_engines.clear()
+            return {'success': True, 'rings': _cfmw_ring_list(new, cw)}
+        if action == 'clear':
+            _cfmw_save_ring_specs([])
+            _cfmw_engines.clear()
+            return {'success': True, 'rings': []}
+        return {'success': True, 'rings': _cfmw_ring_list(specs, cw)}
+
+
+def _cfmw_selftest():
+    """Adapter scenarios over the vendored engine with the upstream fixture corpus
+    (offline, no root): every fixture must fire exactly its manifest code set through
+    this adapter, plus verdict, CVE tagging and cross-scan persistence. Then the
+    module's own tiers out-of-process: the 284-check conformance harness and, with
+    scapy + tshark present, the dual-dissector cross-check. (The upstream fuzz tier
+    scans its own directory's copy of the module and is not run in-app.)"""
+    import importlib.util
+    import tempfile
+    scenarios = []
+
+    def check(name, cond):
+        scenarios.append({'name': name, 'pass': bool(cond)})
+
+    tdir = os.path.join(_CFMW_PY_DIR, 'cfmwatch_tests')
+    fdir = os.path.join(tdir, 'fixtures')
+    try:
+        cw = _cfmw_import()
+        spec = importlib.util.spec_from_file_location(
+            '_cfmwatch_test_fixtures', os.path.join(tdir, 'make_fixtures.py'))
+        mk = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mk)
+        manifest = json.load(open(os.path.join(fdir, 'manifest.json')))
+    except Exception as e:
+        return {'success': False, 'scenarios': [
+            {'name': 'cfmwatch import failed: %s' % e, 'pass': False}]}
+
+    split = {}
+    for s in cw.SPECS:
+        split[s.severity] = split.get(s.severity, 0) + 1
+    check('registry: 107 codes (3 critical / 36 high / 44 medium / 12 low / 12 info)',
+          len(cw.SPECS) == 107 and split == {'CRITICAL': 3, 'HIGH': 36, 'MEDIUM': 44,
+                                             'LOW': 12, 'INFO': 12})
+
+    def fixture(name):
+        e = next(x for x in manifest if x['name'] == name)
+        args = e['args']
+        ceiling = args[args.index('--md-ceiling') + 1] if '--md-ceiling' in args else None
+        rings = tuple(cw.parse_ring(args[i + 1])
+                      for i, a in enumerate(args) if a == '--ring')
+        evcs = tuple(cw.parse_evc(args[i + 1])
+                     for i, a in enumerate(args) if a == '--evc')
+        rows, n = _cfmw_analyze(os.path.join(fdir, e['pcap']),
+                                cw.Engine(cw.Config(md_ceiling=_cfmw_ceiling(ceiling),
+                                                    rings=rings, evcs=evcs)))
+        return e, rows, n
+
+    def codes(rows):
+        return {r['code'] for r in rows}
+
+    fired = set()
+    bad = []
+    for e in manifest:
+        _e, rows, n = fixture(e['name'])
+        fired |= codes(rows)
+        if codes(rows) != set(e['expect']) or n != e['frames']:
+            bad.append(e['name'])
+    check('all %d fixtures fire exactly their manifest codes through the adapter%s'
+          % (len(manifest), (' (bad: %s)' % ', '.join(bad)) if bad else ''), not bad)
+    check('the fixture corpus covers all 107 codes', len(fired) == 107)
+
+    _e, rows, n = fixture('baseline')
+    check('baseline (settled CCMs, APS No Request, LMM): inventory only -> clean',
+          _cfmw_verdict(rows, n) == 'clean' and all(r['severity'] == 'info' for r in rows))
+    check('verdict: nothing captured -> no-traffic', _cfmw_verdict([], 0) == 'no-traffic')
+    _e, rows, n = fixture('structural')
+    check('malformed CFM -> CFM-140 tagged CVE-2020-1639, verdict attack',
+          any(r['code'] == 'CFM-140' and 'CVE-2020-1639' in r['cves'] for r in rows)
+          and _cfmw_verdict(rows, n) == 'attack')
+    _e, rows, n = fixture('rate')
+    check('sustained valid burst -> CFM-141 tagged CVE-2025-52961 (low confidence)',
+          any(r['code'] == 'CFM-141' and 'CVE-2025-52961' in r['cves']
+              and r['confidence'] == 'low' for r in rows))
+    _e, rows, n = fixture('aps')
+    check('APS Lockout of protection -> CFM-087 critical, verdict attack',
+          any(r['code'] == 'CFM-087' and r['severity'] == 'critical' for r in rows)
+          and _cfmw_verdict(rows, n) == 'attack')
+    _e, rows, n = fixture('ceiling')
+    check('MD-level ceiling 4 arms CFM-021', 'CFM-021' in codes(rows))
+    rows, n = _cfmw_analyze(os.path.join(fdir, 'ceiling.pcap'), cw.Engine(cw.Config()))
+    check('no ceiling configured -> CFM-021 stays inert', 'CFM-021' not in codes(rows))
+    check('verdict ladder: a lone LOW event (RDI) -> observed, a HIGH on LOW-confidence '
+          'evidence -> suspicious',
+          _cfmw_verdict([{'severity': 'low', 'confidence': 'high'}], 1) == 'observed' and
+          _cfmw_verdict([{'severity': 'high', 'confidence': 'low'}], 1) == 'suspicious')
+
+    def replay(frames, engine):
+        fd, path = tempfile.mkstemp(suffix='.pcap')
+        os.close(fd)
+        try:
+            mk.write_pcap(path, frames)
+            return _cfmw_analyze(path, engine)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    oam = mk.MAC_A + mk.MAC_B + b'\x88\x09\x03' + b'\x00' * 50
+    rows, n = replay([(mk.BASE_TS, oam)], cw.Engine(cw.Config()))
+    check('802.3ah Link OAM (0x8809) is not parsed as CFM', n == 0 and not rows)
+
+    # Persistent engine: an established MEP moving to a new MAC between two scans.
+    eng = cw.Engine(cw.Config())
+    settle = [(mk.BASE_TS + i, mk.eth(mk.D3, mk.MAC_A, mk.ccm(3, 10, seq=i + 1)))
+              for i in range(3)]
+    moved = [(mk.BASE_TS + 3, mk.eth(mk.D3, mk.MAC_C, mk.ccm(3, 10, seq=4)))]
+    rows1, _n = replay(settle, eng)
+    rows2, _n = replay(moved, eng)
+    rows3, _n = replay(moved, cw.Engine(cw.Config()))
+    check('MEP moved to a new MAC between two scans -> CFM-046 on the second scan '
+          '(engine kept per interface; a fresh engine misses it)',
+          'CFM-046' in codes(rows2) and 'CFM-046' not in codes(rows1)
+          and 'CFM-046' not in codes(rows3))
+    check('second scan reports only its own delta (inventory counted once)',
+          all(r['count'] == 1 for r in rows2))
+    inv = _cfmw_inventory(eng)
+    check('inventory: MEP 10 at level 3 on VLAN 100',
+          any(m['mepid'] == 10 and m['md_level'] == 3 for m in inv['meps'])
+          and 3 in inv['levels'] and any(v['tags'] == [100] for v in inv['vlans']))
+    r = do_cfm_reset('selftest0')
+    check('reset clears per-interface state', r.get('success'))
+
+    # ERPS ring-declaration store (Class R): a declared ring arms the topology
+    # rules; with none declared R-APS still surfaces as the CFM-200 posture. Snapshot
+    # and restore the real store so a self-test run never clobbers operator config.
+    _saved_rings = _cfmw_load_ring_specs()
+    try:
+        _rspec = ('500,rpl=00:11:22:aa:00:01,'
+                  'nodes=00:11:22:bb:00:02/00:11:22:cc:00:03,name=ring-500')
+        _rd = do_cfm_ring('declare', _rspec)
+        _parsed = _cfmw_rings()
+        check('do_cfm_ring declare persists + parses a ring spec',
+              _rd.get('success') and len(_parsed) == 1 and _parsed[0].name() == 'ring-500')
+        rows, _n = _cfmw_analyze(os.path.join(fdir, 'raps_forged.pcap'),
+                                 cw.Engine(cw.Config(rings=_cfmw_rings())))
+        check('declared ring (loaded from store) arms Class R topology codes',
+              bool({'CFM-192', 'CFM-195'} & codes(rows)))
+        do_cfm_ring('clear')
+        rows, _n = _cfmw_analyze(os.path.join(fdir, 'raps_baseline.pcap'),
+                                 cw.Engine(cw.Config(rings=_cfmw_rings())))
+        check('undeclared R-APS -> CFM-200 (declare-your-ring posture)',
+              'CFM-200' in codes(rows))
+    finally:
+        _cfmw_save_ring_specs(_saved_rings)
+        _cfmw_engines.clear()
+
+    # E-LMI EVC-declaration store (Class L, v5): a declared EVC arms the cross-plane
+    # rules; with none declared E-LMI presence surfaces as CFM-254 (undeclared).
+    _saved_evcs = _cfmw_load_evc_specs()
+    try:
+        _ed = do_cfm_evc('declare', '7,vlan=500,name=cust-A')
+        _pe = _cfmw_evcs()
+        check('do_cfm_evc declare persists + parses an EVC spec',
+              _ed.get('success') and len(_pe) == 1)
+        rows, _n = _cfmw_analyze(os.path.join(fdir, 'elmi.pcap'),
+                                 cw.Engine(cw.Config(evcs=_cfmw_evcs())))
+        check('declared EVC (loaded from store) arms Class L cross-plane codes',
+              bool({'CFM-251', 'CFM-252', 'CFM-253'} & codes(rows)))
+        do_cfm_evc('clear')
+        rows, _n = _cfmw_analyze(os.path.join(fdir, 'elmi_undeclared.pcap'),
+                                 cw.Engine(cw.Config(evcs=_cfmw_evcs())))
+        check('undeclared E-LMI -> CFM-254 (declare-your-EVC posture)',
+              'CFM-254' in codes(rows))
+    finally:
+        _cfmw_save_evc_specs(_saved_evcs)
+        _cfmw_engines.clear()
+
+    # Out-of-process tiers: the upstream harnesses import cfmwatch from their own
+    # directory, so run them with python/ on the path.
+    def tier(script, timeout):
+        code = ('import runpy,sys; sys.path.append(%r); sys.argv=[%r]; '
+                'runpy.run_path(%r, run_name="__main__")' % (_CFMW_PY_DIR, script, script))
+        r = _run([sys.executable, '-c', code], timeout=timeout)
+        tail = (r['out'] or r['err'] or '').strip().splitlines()[-1:] or ['']
+        return r['rc'] == 0, tail[0][:90]
+
+    ok, tail = tier(os.path.join(tdir, 'test_conformance.py'), 120)
+    check('conformance tier: %s' % tail, ok)
+    xcheck = {'ran': False, 'reason': 'needs scapy and tshark'}
+    if _have_scapy() and _have('tshark'):
+        ok, tail = tier(os.path.join(tdir, 'test_xcheck.py'), 240)
+        check('Wireshark + scapy cross-check tier: %s' % tail, ok)
+        xcheck = {'ran': True, 'pass': ok}
+    return {'success': all(s['pass'] for s in scenarios), 'scenarios': scenarios,
+            'scapy': xcheck}
+
+
+# ==========================================================================
+# BLE Watch — passive Bluetooth Low Energy attack monitor (vendored blewatch.py)
+# ==========================================================================
+# Unlike the on-the-wire watchers, BLE is not captured off a NIC: the RX is done
+# by an external nRF/Bluefruit LE sniffer over USB and blewatch.py only parses the
+# captured BLE Link-Layer PDUs. So do_ble_watch is device-gated — with no sniffer
+# attached it reports that cleanly rather than pretending to listen. It reuses the
+# python/blewatch.py module directly (same engine the standalone + self-test use).
+_BLE_PY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'python')
+_BLE_SEV_TO_GUARD = {'critical': 'CRITICAL', 'high': 'HIGH', 'medium': 'MEDIUM',
+                     'low': 'LOW', 'info': 'INFO'}
+_BLE_SEV_RANK = {'info': 0, 'low': 1, 'medium': 2, 'high': 3, 'critical': 4}
+# Impersonation / hijack / downgrade / spam are active attacks; identity reuse and
+# churn/flood are exposure; the vendor-shape mismatch is posture.
+_BLE_KLASS = {
+    'BLE-001': 'ATTACK', 'BLE-002': 'ATTACK', 'BLE-003': 'EXPOSURE',
+    'BLE-004': 'EXPOSURE', 'BLE-005': 'ATTACK', 'BLE-006': 'EXPOSURE',
+    'BLE-007': 'EXPOSURE', 'BLE-008': 'ATTACK', 'BLE-009': 'ATTACK',
+    'BLE-010': 'ATTACK', 'BLE-011': 'ATTACK', 'BLE-012': 'ATTACK',
+    'BLE-013': 'ATTACK', 'BLE-014': 'EXPOSURE', 'BLE-015': 'POSTURE',
+    'BLE-016': 'ATTACK',
+}
+
+
+def _ble_module():
+    if _BLE_PY_DIR not in sys.path:
+        sys.path.insert(0, _BLE_PY_DIR)
+    import blewatch
+    return blewatch
+
+
+def _ble_verdict(alerts):
+    """clean < observed < suspicious < attack-indicator < impersonation. A critical
+    means two radios shared one address or two centrals raced a connection — the
+    strongest in-band evidence of a BLE identity attack."""
+    sev = {a.get('severity') for a in alerts}
+    if 'critical' in sev:
+        return 'impersonation'
+    if 'high' in sev:
+        return 'attack-indicator'
+    if sev & {'medium', 'low'}:
+        return 'suspicious'
+    return 'observed' if alerts else 'clean'
+
+
+def _ble_normalize(alert, blewatch):
+    """blewatch alert (merged, multi-code) -> one guard finding per evidence code,
+    the shape _guard_emit_jsonl / Watchtower expects."""
+    out = []
+    for ev in alert.get('evidence', []):
+        code = ev['code']
+        out.append({'code': code,
+                    'name': (blewatch.CODES.get(code) or (None, code))[1],
+                    'severity': _BLE_SEV_TO_GUARD.get(ev['severity'], 'MEDIUM'),
+                    'klass': _BLE_KLASS.get(code, 'EXPOSURE'),
+                    'src': alert.get('adva'), 'cves': [],
+                    'detail': {'pdu': alert.get('pdu'), 'inita': alert.get('inita'),
+                               'channel': alert.get('channel'), 'rssi': alert.get('rssi'),
+                               'text': ev['detail']}})
+    return out
+
+
+# Trusted-device baseline for BLE Watch (data/ble_watch.json). Unlike the IGMP/
+# NDP "reset then re-learn on next scan" model, BLE is device-gated (each learn
+# needs a sniffer capture), so the web controls manage an explicit trust LIST:
+# "Trust current" MERGES the advertisers seen in the last scan into it, "Clear
+# list" empties it. do_ble_watch loads it so trusted devices suppress clone /
+# service-masquerade findings and anchor the clone-identity baseline.
+_BLE_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'ble_watch.json')
+_ble_watch_lock = threading.Lock()
+
+
+def _ble_watch_load():
+    try:
+        with open(_BLE_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _ble_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_BLE_WATCH_PATH), exist_ok=True)
+        tmp = _BLE_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _BLE_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_ble_baseline(action='get', devices=None):
+    """Manage the BLE Watch trusted-device list (data/ble_watch.json).
+
+    action='get'   -> return the current trusted_devices.
+    action='trust' -> merge `devices` ({addr: {name, services}} or [addr,...])
+                      into trusted_devices (what "Trust current" sends from the
+                      last scan's seen devices). Additive and idempotent.
+    action='clear' -> empty the trusted-device list.
+    """
+    with _ble_watch_lock:
+        base = _ble_watch_load()
+        trusted = base.get('trusted_devices')
+        if not isinstance(trusted, dict):
+            # Normalise a bare-list baseline to the dict shape we persist.
+            trusted = {str(a).lower(): {} for a in trusted} if isinstance(trusted, list) else {}
+        if action == 'clear':
+            base['trusted_devices'] = {}
+            _ble_watch_save(base)
+            return {'success': True, 'cleared': True, 'trusted_devices': {}, 'count': 0}
+        if action == 'trust':
+            added = skipped_rotating = 0
+            items = devices.items() if isinstance(devices, dict) else \
+                ((str(a), {}) for a in (devices or []))
+            for addr, meta in items:
+                akey = str(addr).strip().lower()
+                if not re.fullmatch(r'[0-9a-f:]{2,32}', akey):
+                    continue
+                meta = meta if isinstance(meta, dict) else {}
+                # Skip rotating private addresses (resolvable / non-resolvable /
+                # unclassified random): they change every ~15 min, so trusting
+                # them by address is pointless and makes the list grow forever.
+                # Only 'public' and 'static' (random-static) addresses are stable.
+                if meta.get('rpa_class') in ('rpa', 'nonresolvable', 'random'):
+                    skipped_rotating += 1
+                    continue
+                entry = {}
+                if meta.get('name'):
+                    entry['name'] = str(meta['name'])[:64]
+                if isinstance(meta.get('services'), list):
+                    entry['services'] = [str(s)[:40] for s in meta['services'][:32]]
+                if akey not in trusted:
+                    added += 1
+                trusted[akey] = entry
+            base['trusted_devices'] = trusted
+            _ble_watch_save(base)
+            return {'success': True, 'trusted': True, 'added': added,
+                    'skipped_rotating': skipped_rotating,
+                    'count': len(trusted), 'trusted_devices': trusted}
+        return {'success': True, 'trusted_devices': trusted, 'count': len(trusted)}
+
+
+def do_ble_watch(device=None, seconds=20, replay=None, config=None, quick=False):
+    """Passive BLE attack monitor (detection-only, never transmits). Reads the BLE
+    link layer from an external nRF/Bluefruit LE sniffer (or a --replay pcap) and
+    flags advertising-layer impersonation (device/beacon clones, two radios sharing
+    an address), advertising floods / BLE-spam tooling, and the connection-layer
+    abuse the sniffer can see when it follows a link (CONNECT_IND races, version
+    swaps, Just-Works pairing downgrade, forced re-pair storms). Device-gated: with
+    no sniffer attached it says so rather than pretending to listen."""
+    try:
+        blewatch = _ble_module()
+    except Exception as e:
+        return {'success': False, 'module': 'ble_watch',
+                'error': 'blewatch module unavailable: %s' % e}
+    seconds = _clamp_int(seconds, 20, 5, 120)
+    cfg = {}
+    if isinstance(config, dict):
+        cfg = config
+    elif isinstance(config, str) and config:
+        try:
+            with open(config) as f:
+                cfg = json.load(f)
+        except (OSError, ValueError) as e:
+            return {'success': False, 'module': 'ble_watch',
+                    'error': 'bad config: %s' % e}
+    else:
+        # No explicit config: use the persisted trusted-device baseline so
+        # "Trust current" devices suppress clone / masquerade findings.
+        cfg = _ble_watch_load()
+
+    alerts = []
+    guard = blewatch.BleWatch(cfg, emit=alerts.append)
+    source = None
+    if replay:
+        if not os.path.exists(replay):
+            return {'success': False, 'module': 'ble_watch',
+                    'error': 'replay pcap not found: %s' % replay}
+        source = 'replay:' + os.path.basename(replay)
+        try:
+            blewatch.run_replay(replay, guard)
+        except Exception as e:
+            return {'success': False, 'module': 'ble_watch',
+                    'error': 'replay failed: %s: %s' % (type(e).__name__, e)}
+    else:
+        # Identify by firmware, not USB name: the Bluefruit LE Sniffer and its
+        # look-alike Bluefruit LE Friend both enumerate as a plain CP210x bridge.
+        candidates = [] if device else blewatch.detect_sniffers(probe=True)
+        dev = device or blewatch.find_sniffer(candidates=candidates)
+        if dev and not any(c['path'] == dev and c['kind'] == 'nrf-sniffer'
+                           for c in candidates):
+            # User-chosen port (device field / $RAGNAR_BLE_SNIFFER) skipped
+            # autodetect, so check it now. A Friend or a missing port stops here;
+            # a port that just didn't answer is still tried, since it's their call.
+            chosen = blewatch.check_port(dev)
+            candidates = [chosen]
+            if chosen['kind'] in blewatch.NOT_CAPTURABLE:
+                dev = None
+        if not dev:
+            friend = next((c for c in candidates if c['kind'] == 'bluefruit-friend'), None)
+            nrf52 = next((c for c in candidates if c['kind'] == 'nrf-other-fw'), None)
+            if nrf52:
+                msg = ('%s is an nRF52 but it is not running nRF Sniffer firmware (%s). '
+                       'This is a firmware problem, not a hardware one: the board can sniff '
+                       'once the nRF52840 dongle sniffer hex is flashed. Steps below.'
+                       % (nrf52['path'], 'DFU bootloader' if nrf52.get('role') == 'bootloader'
+                          else 'it runs Nordic\'s Connectivity firmware'))
+            elif friend:
+                msg = ('%s is a Bluefruit LE Friend, not a sniffer. It runs Adafruit\'s '
+                       'AT-command firmware, which never streams BLE packets, and no '
+                       'switch or button position changes that. Flash the Nordic nRF '
+                       'Sniffer (nRF51) firmware over SWD, or use a Bluefruit LE Sniffer '
+                       '(#2269) or an nRF52840 dongle running nRF Sniffer.' % friend['path'])
+            elif device or os.environ.get('RAGNAR_BLE_SNIFFER'):
+                c = candidates[0] if candidates else {}
+                msg = 'Cannot capture on %s: %s' % (c.get('path', device), c.get('note', ''))
+            elif candidates:
+                msg = ('No BLE sniffer detected. No serial port answered the nRF Sniffer '
+                       'protocol. Ports checked are listed below.')
+            else:
+                msg = ('No BLE sniffer detected and no USB serial ports present. Attach '
+                       'an nRF51/nRF52 sniffer (set $RAGNAR_BLE_SNIFFER or pick a '
+                       'device), or replay a capture.')
+            return {'success': False, 'module': 'ble_watch', 'missing_hw': True,
+                    'error': msg, 'candidates': [
+                        {'path': c['path'], 'kind': c['kind'], 'note': c['note'],
+                         'usb': ('%s:%s %s' % (c['usb'].get('vid', '?'),
+                                               c['usb'].get('pid', '?'),
+                                               c['usb'].get('product', ''))).strip()}
+                        for c in candidates]}
+        source = dev
+        try:
+            blewatch.run_live(dev, guard, seconds,
+                              baud=blewatch.sniffer_baud(candidates, dev))
+        except RuntimeError as e:          # helper missing / capture stopped
+            r = {'success': False, 'module': 'ble_watch', 'device': dev, 'error': str(e)}
+            if blewatch.find_extcap() is None:
+                r['missing_tool'] = 'nrf_sniffer_ble'
+            return r
+        except Exception as e:
+            return {'success': False, 'module': 'ble_watch', 'device': dev,
+                    'error': 'capture failed: %s: %s' % (type(e).__name__, e)}
+
+    findings = []
+    for a in alerts:
+        findings.extend(_ble_normalize(a, blewatch))
+    verdict = _ble_verdict(alerts)
+    reasons, seen = [], set()
+    for a in sorted(alerts, key=lambda x: _BLE_SEV_RANK.get(x.get('severity'), 0),
+                    reverse=True):
+        for code in a['codes']:
+            if code in seen:
+                continue
+            seen.add(code)
+            reasons.append('%s: %s' % (code, a['summary']))
+        if len(reasons) >= 8:
+            break
+    if not reasons:
+        reasons = ['BLE link activity observed; no clone, spoof, flood or connection '
+                   'abuse seen'] if guard.frames else \
+                  ['No BLE PDUs captured (sniffer idle or out of range)']
+    by_sev = {}
+    for a in alerts:
+        by_sev[a['severity']] = by_sev.get(a['severity'], 0) + 1
+    result = {'success': True, 'module': 'ble_watch', 'device': source,
+              'seconds': seconds, 'verdict': verdict, 'reasons': reasons,
+              'findings': findings,
+              'devices': sorted({a['adva'] for a in alerts if a.get('adva')}),
+              # Every advertiser seen this run (addr -> {name, services}), so the
+              # web "Trust current" control can persist exactly what's on the air.
+              'seen': guard.seen_devices(),
+              'trusted_count': len(getattr(guard, 'trusted', {}) or {}),
+              'alerts': len(alerts), 'by_severity': by_sev,
+              'packet_count': guard.frames}
+    hi = [f for f in findings if f['severity'] in ('HIGH', 'CRITICAL')]
+    if not quick and hi:
+        _guard_emit_jsonl('ble_watch', {'device': source, 'findings': hi})
+    return result
+
+
+def _ble_selftest():
+    """Adapt blewatch_selftest.selftest() to the aggregator's scenarios shape. The
+    decode + detect path is pure-Python (own pcap reader + BLE LL parser), so the
+    suite runs offline: no radio, no root, no Scapy."""
+    _ble_module()                                  # put python/ on sys.path
+    import blewatch_selftest
+    r = blewatch_selftest.selftest()
+    return {'success': r['success'],
+            'scenarios': [{'name': c['name'], 'pass': c['pass']} for c in r['scenarios']]}
+
+
 def do_routing_selftest():
     """Run the IGMP / OSPF / BGP detector self-tests and report a combined result
     plus whether Scapy is available for the end-to-end packet-crafting leg. Drives
@@ -24344,7 +29186,10 @@ def do_routing_selftest():
               'ndp': _ndp_selftest(), 'raguard': _raguard_selftest(),
               'ntp': _ntp_selftest(), 'icmp': _icmp_selftest(),
               'snmp': _snmp_selftest(), 'cert': _cert_selftest(),
-              'stp': _stp_selftest(), 'isis': _isis_selftest(),
+              'stp': _stp_selftest(), 'mrp': _mrp_selftest(), 'isis': _isis_selftest(),
+              'pim': _pim_selftest(),
+              'radius': _radiuswatch_selftest(),
+              'rip': _rip_selftest(),
               'smb': _smb_selftest(), 'relay': _relay_selftest(),
               'dtp': _dtp_selftest(), 'cdp': _cdp_selftest(), 'vtp': _vtp_selftest(),
               'eigrp': _eigrp_selftest(),
@@ -24355,7 +29200,9 @@ def do_routing_selftest():
               'bfd': _bfd_selftest(), 'ptp': _ptp_selftest(),
               'srmpls': _srmpls_selftest(), 'ipsec': _ipsec_selftest(),
               'dns_passive': _dns_passive_selftest(), 'ftp': _ftp_selftest(),
-              'smtp': _smtp_selftest(),
+              'smtp': _smtp_selftest(), 'modbus': _modbus_selftest(),
+              'lldp': _lldp_selftest(), 'oam': _oam_selftest(), 'cfm': _cfmw_selftest(),
+              'ble': _ble_selftest(),
               'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
               'arp': _arp_selftest(), 'dns': _dns_selftest(),
               'mac': _mac_selftest(), 'dhcp': _dhcp_selftest(),
@@ -24364,8 +29211,11 @@ def do_routing_selftest():
               'mikrotik_guard': _mikrotik_selftest(),
               'aruba_guard': _aruba_selftest(),
               'apc_guard': _apc_selftest(),
+              'liebert_guard': _liebert_selftest(),
               'dell_guard': _dell_selftest(),
-              'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
+              'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest(),
+              'bgp_tap': _bgptap_selftest(), 'bgpsec': _bgpsec_selftest(),
+              'bgp_srte': _bgpsrte_selftest()}
     return {
         'success': all(s['success'] for s in suites.values()),
         'scapy_available': _have_scapy(),
@@ -25916,11 +30766,15 @@ def register_network_diagnostics(app, logger=None):
     @app.route('/api/net/mac-watch', methods=['GET'])
     def net_mac_watch():
         # scan=0 reads the neighbour table only (no arp-scan sweep, silent);
-        # default runs an arp-scan sweep to widen coverage.
+        # default runs an arp-scan sweep to widen coverage. l2sec=1 adds the opt-in
+        # passive MACsec/EAPOL/MKA sniff (link-security control plane).
         scan = request.args.get('scan', '1') not in ('0', 'false', 'no')
         iface = (request.args.get('interface') or '').strip() or None
-        _log(f"net/mac-watch scan={scan}")
-        return jsonify(do_mac_watch(scan=scan, interface=iface))
+        l2sec = request.args.get('l2sec', '0') in ('1', 'true', 'yes')
+        secs = _clamp_int(request.args.get('l2sec_seconds'), _L2SEC_CAPTURE_S, 2, 30)
+        _log(f"net/mac-watch scan={scan} l2sec={l2sec}")
+        return jsonify(do_mac_watch(scan=scan, interface=iface,
+                                    l2sec=l2sec, l2sec_seconds=secs))
 
     @app.route('/api/net/mac-watch-reset', methods=['POST'])
     def net_mac_watch_reset():
@@ -26184,8 +31038,11 @@ def register_network_diagnostics(app, logger=None):
             return _bad('Invalid interface')
         iface = iface or _capture_iface()
         secs = _clamp_int(request.args.get('seconds'), 20, 8, 60)
-        _log(f"net/ptp-watch iface={iface or 'default-route'} secs={secs}")
-        return jsonify(do_ptp_watch(interface=iface, seconds=secs))
+        profile = (request.args.get('profile') or 'auto').strip().lower()
+        if profile not in ptpwatch.PTP_PROFILES:
+            return _bad('Unknown PTP profile')
+        _log(f"net/ptp-watch iface={iface or 'default-route'} secs={secs} profile={profile}")
+        return jsonify(do_ptp_watch(interface=iface, seconds=secs, profile=profile))
 
     @app.route('/api/net/smtp-watch', methods=['GET'])
     def net_smtp_watch():
@@ -26208,6 +31065,147 @@ def register_network_diagnostics(app, logger=None):
                  if p.isdigit()][:8]
         _log(f"net/ftp-watch iface={iface or 'default-route'} secs={secs}")
         return jsonify(do_ftp_watch(interface=iface, seconds=secs, ports=ports or None))
+
+    @app.route('/api/net/modbus-watch', methods=['GET'])
+    def net_modbus_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        iface = iface or _capture_iface()
+        secs = _clamp_int(request.args.get('seconds'), 20, 5, 60)
+        ot = None
+        if 'ot' in request.args:            # present (even empty) = save this list
+            ot = [s for s in re.split(r'[,\s]+', request.args.get('ot') or '') if s][:16]
+            if not all(re.fullmatch(r'[0-9A-Fa-f:.]+(/\d{1,3})?', s) for s in ot):
+                return _bad('Invalid OT subnet (use CIDR, e.g. 10.20.0.0/24)')
+        _log(f"net/modbus-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_modbus_watch(interface=iface, seconds=secs, ot_subnets=ot))
+
+    @app.route('/api/net/modbus-baseline', methods=['GET', 'POST'])
+    def net_modbus_baseline():
+        action, ot = 'get', None
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = data.get('action') if data.get('action') in ('arm', 'reset', 'config') \
+                else 'get'
+            ot = [str(s) for s in (data.get('ot') or [])][:16]
+        _log(f"net/modbus-baseline {action}")
+        return jsonify(do_modbus_baseline(action, ot_subnets=ot))
+
+    @app.route('/api/net/radius-watch', methods=['GET'])
+    def net_radius_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 20, 5, 50)
+        _log(f"net/radius-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_radius_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/lldp-watch', methods=['GET'])
+    def net_lldp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 30, 5, 65)
+        _log(f"net/lldp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_lldp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/lldp-baseline', methods=['GET', 'POST'])
+    def net_lldp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = data.get('action') if data.get('action') in ('trust', 'reset') \
+                else 'get'
+        _log(f"net/lldp-baseline {action}")
+        return jsonify(do_lldp_baseline(action))
+
+    @app.route('/api/net/oam-watch', methods=['GET'])
+    def net_oam_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 30, 5, 65)
+        _log(f"net/oam-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_oam_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/oam-reset', methods=['POST'])
+    def net_oam_reset():
+        data = request.get_json(silent=True) or {}
+        iface = (data.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        _log(f"net/oam-reset {iface or 'all'}")
+        return jsonify(do_oam_reset(iface))
+
+    @app.route('/api/net/cfm-watch', methods=['GET'])
+    def net_cfm_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 30, 5, 65)
+        ceiling = _cfmw_ceiling(request.args.get('md_ceiling'))
+        _log(f"net/cfm-watch iface={iface or 'default-route'} secs={secs} ceiling={ceiling}")
+        return jsonify(do_cfm_watch(interface=iface, seconds=secs, md_ceiling=ceiling))
+
+    @app.route('/api/net/cfm-reset', methods=['POST'])
+    def net_cfm_reset():
+        data = request.get_json(silent=True) or {}
+        iface = (data.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        _log(f"net/cfm-reset {iface or 'all'}")
+        return jsonify(do_cfm_reset(iface))
+
+    @app.route('/api/net/cfm-ring', methods=['GET', 'POST'])
+    def net_cfm_ring():
+        if request.method == 'GET':
+            return jsonify(do_cfm_ring('list'))
+        data = request.get_json(silent=True) or {}
+        action = (data.get('action') or 'list').strip()
+        if action not in ('declare', 'remove', 'clear', 'list'):
+            return _bad('Invalid action')
+        spec = data.get('spec')
+        if spec is not None and len(str(spec)) > 300:
+            return _bad('Ring specification too long')
+        _log(f"net/cfm-ring {action}")
+        return jsonify(do_cfm_ring(action, spec))
+
+    @app.route('/api/net/cfm-evc', methods=['GET', 'POST'])
+    def net_cfm_evc():
+        if request.method == 'GET':
+            return jsonify(do_cfm_evc('list'))
+        data = request.get_json(silent=True) or {}
+        action = (data.get('action') or 'list').strip()
+        if action not in ('declare', 'remove', 'clear', 'list'):
+            return _bad('Invalid action')
+        spec = data.get('spec')
+        if spec is not None and len(str(spec)) > 300:
+            return _bad('EVC specification too long')
+        _log(f"net/cfm-evc {action}")
+        return jsonify(do_cfm_evc(action, spec))
+
+    @app.route('/api/net/ble-watch', methods=['GET'])
+    def net_ble_watch():
+        # Passive BLE monitor via an external nRF/Bluefruit LE sniffer (device-gated).
+        device = (request.args.get('device') or '').strip() or None
+        if device is not None and not re.fullmatch(r'[\w./:+-]{1,128}', device):
+            return _bad('Invalid device')
+        secs = _clamp_int(request.args.get('seconds'), 20, 5, 120)
+        _log(f"net/ble-watch device={device or 'autodetect'} secs={secs}")
+        return jsonify(do_ble_watch(device=device, seconds=secs))
+
+    @app.route('/api/net/ble-watch/baseline', methods=['GET', 'POST'])
+    def net_ble_baseline():
+        # Manage the BLE Watch trusted-device list: "Trust current" (merge the
+        # last scan's seen devices) and "Clear list" (empty it).
+        action, devices = 'get', None
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = data.get('action') if data.get('action') in ('trust', 'clear') else 'get'
+            devices = data.get('devices')
+        _log(f"net/ble-watch/baseline {action}")
+        return jsonify(do_ble_baseline(action, devices))
 
     @app.route('/api/net/srmpls-watch', methods=['GET'])
     def net_srmpls_watch():
@@ -26240,6 +31238,24 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/dns-watch iface={iface or 'default-route'} secs={secs}")
         return jsonify(do_dns_watch(interface=iface, seconds=secs))
 
+    @app.route('/api/net/rip-watch', methods=['GET'])
+    def net_rip_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 20, 5, 50)
+        _log(f"net/rip-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_rip_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/rip-baseline', methods=['GET', 'POST'])
+    def net_rip_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = data.get('action') if data.get('action') in ('arm', 'reset') else 'get'
+        _log(f"net/rip-baseline {action}")
+        return jsonify(do_rip_baseline(action))
+
     @app.route('/api/net/isis-watch', methods=['GET'])
     def net_isis_watch():
         iface = (request.args.get('interface') or '').strip() or None
@@ -26248,6 +31264,15 @@ def register_network_diagnostics(app, logger=None):
         secs = _clamp_int(request.args.get('seconds'), 20, 5, 50)
         _log(f"net/isis-watch iface={iface or 'default-route'} secs={secs}")
         return jsonify(do_isis_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/pim-watch', methods=['GET'])
+    def net_pim_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 20, 5, 50)
+        _log(f"net/pim-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_pim_watch(interface=iface, seconds=secs))
 
     @app.route('/api/net/isis-baseline', methods=['GET', 'POST'])
     def net_isis_baseline():
@@ -26275,6 +31300,18 @@ def register_network_diagnostics(app, logger=None):
             action = 'reset' if (data.get('action') == 'reset') else 'get'
         _log(f"net/stp-baseline {action}")
         return jsonify(do_stp_baseline(action))
+
+    @app.route('/api/net/mrp-watch', methods=['GET'])
+    def net_mrp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 20, 5, 50)
+        kv = [int(v) for v in re.split(r'[,\s]+', request.args.get('known_vlans') or '')
+              if v.strip().isdigit()]
+        _log(f"net/mrp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_mrp_watch(interface=iface, seconds=secs,
+                                    known_vlans=kv or None))
 
     @app.route('/api/net/dtp-watch', methods=['GET'])
     def net_dtp_watch():
@@ -26427,6 +31464,16 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/apc-guard iface={iface or 'default-route'} secs={secs}")
         return jsonify(do_apc_guard(interface=iface, seconds=secs, cards=cards,
                                     forget=forget))
+
+    @app.route('/api/net/liebert-guard', methods=['GET'])
+    def net_liebert_guard():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 20, 5, 60)
+        port = _clamp_int(request.args.get('port'), 80, 1, 65535)
+        _log(f"net/liebert-guard iface={iface or 'default-route'} secs={secs} port={port}")
+        return jsonify(do_liebert_guard(interface=iface, seconds=secs, port=port))
 
     @app.route('/api/net/dell-guard', methods=['GET', 'POST'])
     def net_dell_guard():
@@ -27024,6 +32071,142 @@ def register_network_diagnostics(app, logger=None):
         return jsonify(sdr_spectrum.selftest())
 
     # ------------------------------------------------------------------
+    # True-RF spectrum / waterfall via an ESP-SDR node (esp_sdr.py).
+    # An ESP32 running the ESP-SDR firmware (espargos.net/espsdr) streams
+    # on-chip FFT power spectra over its native USB serial link. Same
+    # receive-only, frame-ring shape as the HackRF/RTL sweeps, so the RF
+    # Waterfall page streams it through the identical consumer. On an
+    # ESP32-S3 the useful band is ~2.2-2.7 GHz (the 2.4 GHz ISM band).
+    # ------------------------------------------------------------------
+    @app.route('/api/net/esp/status', methods=['GET'])
+    def net_esp_status():
+        _log("net/esp/status")
+        return jsonify(esp_sdr.status())
+
+    @app.route('/api/net/esp/start', methods=['POST'])
+    def net_esp_start():
+        data = request.get_json(silent=True) or {}
+        band = (data.get('band') or '2.4').strip()
+        # Optional zoom span (Hz) -> MHz. A valid span sets centre + sample rate
+        # and overrides the named band, so skip band validation when present.
+        lo_mhz = hi_mhz = None
+        try:
+            if data.get('lo_hz') is not None and data.get('hi_hz') is not None:
+                lo_mhz = float(data['lo_hz']) / 1e6
+                hi_mhz = float(data['hi_hz']) / 1e6
+        except (TypeError, ValueError):
+            return _bad('Invalid zoom span')
+        if lo_mhz is None and band not in esp_sdr.BANDS:
+            return _bad('Invalid band')
+        _log(f"net/esp/start band={band} zoom={lo_mhz}:{hi_mhz}")
+        kw = {}
+        if 'gain' in data:          # None/'hardware' = AGC; int = manual index
+            kw['gain'] = data.get('gain')
+        return jsonify(esp_sdr.start(band=band, lo_mhz=lo_mhz, hi_mhz=hi_mhz,
+                                     fft_bins=data.get('fft_bins'), **kw))
+
+    @app.route('/api/net/esp/stop', methods=['POST'])
+    def net_esp_stop():
+        _log("net/esp/stop")
+        return jsonify(esp_sdr.stop())
+
+    @app.route('/api/net/esp/frames', methods=['GET'])
+    def net_esp_frames():
+        try:
+            since = int(request.args.get('since', 0))
+        except (TypeError, ValueError):
+            return _bad('Invalid since')
+        return jsonify(esp_sdr.get_frames(since=since))
+
+    @app.route('/api/net/esp/selftest', methods=['GET'])
+    def net_esp_selftest():
+        _log("net/esp/selftest")
+        return jsonify(esp_sdr.selftest())
+
+    # Frequency trim (FOFS): the ESP32 has no TCXO, so its LO drifts a few ppm.
+    # GET reports the current trim; POST {auto:1} nulls it against the 2.4 GHz
+    # Wi-Fi channel centres; POST {khz:N} sets a manual LO offset in kHz.
+    @app.route('/api/net/esp/trim', methods=['GET', 'POST'])
+    def net_esp_trim():
+        if request.method == 'GET':
+            return jsonify(esp_sdr.trim_state())
+        data = request.get_json(silent=True) or {}
+        if data.get('hackrf'):
+            # Cross-reference the ESP against a TCXO HackRF: sweep the same 2.4 GHz
+            # band on the HackRF, build its max-hold, then correlate the ESP to it.
+            _log("net/esp/trim hackrf")
+            hk = sdr_spectrum.status()
+            if not (hk.get('detect') or {}).get('available'):
+                return jsonify({"ok": False, "error": "no HackRF detected — connect a HackRF "
+                                "(TCXO reference) to cross-calibrate the ESP"})
+            # A narrow ~40 MHz window (around Wi-Fi ch 6) gives the HackRF fine
+            # resolution so the cross-correlation lag is accurate; the full band
+            # is too coarse. Both radios measure this same window.
+            sdr_spectrum.start(lo_mhz=2420.0, hi_mhz=2460.0)
+            deadline = time.time() + 5.5                 # accumulate the HackRF max-hold
+            last = {}
+            while time.time() < deadline:
+                time.sleep(0.5)
+                last = sdr_spectrum.get_frames(0)
+            mh = last.get('max_hold')
+            bm = last.get('band_mhz')
+            sdr_spectrum.stop()
+            if not mh or not bm:
+                return jsonify({"ok": False, "error": "HackRF produced no spectrum — check the device"})
+            return jsonify(esp_sdr.calibrate_vs_reference(mh, bm[0], bm[1], label='HackRF'))
+        if data.get('tone'):
+            # Robust HackRF cross-calibration: the HackRF TRANSMITS a single CW
+            # pilot tone at a known frequency and the ESP locks onto that one
+            # strong carrier (immune to the ESP's own spurs that defeat the
+            # passive band-shape correlation above). Very low power — the ESP is
+            # centimetres away. Transmit only for the measurement, then stop.
+            _log("net/esp/trim tone")
+            # hackrf_info (via detect) can momentarily fail right after a prior
+            # TX while the device settles, so re-probe once before giving up.
+            def _hackrf_ready():
+                return bool((sdr_spectrum.status().get('detect') or {}).get('available'))
+            if not _hackrf_ready():
+                time.sleep(1.5)
+                if not _hackrf_ready():
+                    return jsonify({"ok": False, "error": "no HackRF detected — connect a HackRF "
+                                    "to transmit the pilot tone"})
+            try:
+                # Default 2480 MHz: above Wi-Fi ch1/6/11 and clear of the ESP's
+                # observed internal spurs, so the pilot sits in a quiet spot.
+                rf_mhz = float(data.get('rf_mhz') or 2480.0)
+            except (TypeError, ValueError):
+                return _bad('Invalid rf_mhz')
+            try:
+                tx_vga = int(data.get('tx_vga')) if data.get('tx_vga') is not None else 40
+            except (TypeError, ValueError):
+                return _bad('Invalid tx_vga')
+            rf_hz = rf_mhz * 1e6
+            tx_info = {}
+
+            def _tx_on():
+                r = sdr_spectrum.transmit_tone(rf_hz, tx_vga=tx_vga)
+                tx_info.update(r or {})
+                return r
+
+            # Baseline (tone off) vs tone (on) — calibrate_vs_tone drives the TX
+            # through these callbacks and differences the two, so the pilot is
+            # isolated from ambient Wi-Fi / ESP spurs on the chosen frequency.
+            res = esp_sdr.calibrate_vs_tone(rf_hz, tx_on=_tx_on, tx_off=sdr_spectrum.tx_tone_stop)
+            if isinstance(res, dict):
+                res.setdefault('rf_mhz', rf_mhz)
+                if tx_info:
+                    res['tx'] = {"rf_hz": tx_info.get('rf_hz'), "tx_vga": tx_info.get('tx_vga'),
+                                 "amp": tx_info.get('amp')}
+            return jsonify(res)
+        if data.get('auto'):
+            _log("net/esp/trim auto")
+            return jsonify(esp_sdr.auto_trim())
+        if 'khz' in data:
+            _log(f"net/esp/trim khz={data.get('khz')}")
+            return jsonify(esp_sdr.set_fofs(data.get('khz')))
+        return _bad('Pass {"tone":true}, {"hackrf":true}, {"auto":true}, or {"khz":N}')
+
+    # ------------------------------------------------------------------
     # Sub-GHz true-RF power sweep / waterfall via an RTL-SDR (rtl_sdr.py).
     # The HackRF block above covers the 2.4/5/6 GHz Wi-Fi bands; this covers
     # the 433/868/915 MHz ISM bands the HackRF view doesn't target. Same
@@ -27470,6 +32653,14 @@ def register_network_diagnostics(app, logger=None):
                         snr_db=_fl(a.get('snr_db')) or 12.0,
                         nfft=int(_fl(a.get('nfft')) or 512))
 
+    @app.route('/api/net/rtl/analyze/survey', methods=['GET'])
+    def net_rtl_analyze_survey():
+        a = request.args
+        return _analyze(sigmf_analyzer.survey, name=a.get('name', ''),
+                        snr_db=_fl(a.get('snr_db')) or 12.0,
+                        nfft=int(_fl(a.get('nfft')) or 1024),
+                        max_carriers=int(_fl(a.get('max_carriers')) or 200))
+
     @app.route('/api/net/rtl/analyze/constellation_demod', methods=['GET'])
     def net_rtl_analyze_constellation_demod():
         a = request.args
@@ -27713,6 +32904,16 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/mesh/send to={data.get('to')} via={data.get('via')}")
         return jsonify(meshtastic_node.send_text(data.get('text'), dest=data.get('to'),
                                                  channel=data.get('channel', 0), via=data.get('via', 'auto')))
+
+    @app.route('/api/net/mesh/traceroute', methods=['POST'])
+    def net_mesh_traceroute():
+        data = request.get_json(silent=True) or {}
+        _log(f"net/mesh/traceroute to={data.get('id')}")
+        return jsonify(meshtastic_node.traceroute(data.get('id'), hop_limit=data.get('hop_limit')))
+
+    @app.route('/api/net/mesh/traceroute/result', methods=['GET'])
+    def net_mesh_traceroute_result():
+        return jsonify(meshtastic_node.traceroute_result(request.args.get('id')))
 
     @app.route('/api/net/mesh/selftest', methods=['GET'])
     def net_mesh_selftest():
@@ -28852,6 +34053,71 @@ def _cli(argv=None):
     fw_.add_argument('--ports', default='21', help='FTP control ports (default 21)')
     fw_.add_argument('--json', action='store_true', help='emit JSON')
 
+    ow_ = sub.add_parser('oam-watch',
+                         help='passive 802.3ah Link OAM scan: loopback blackhole, forged '
+                              'failure flags, re-peering, MIB reads, malformed OAMPDUs')
+    ow_.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    ow_.add_argument('--seconds', '-s', type=int, default=30, help='capture window (5-65)')
+    ow_.add_argument('--pcap', default=None, help='replay a pcap instead of capturing')
+    ow_.add_argument('--json', action='store_true', help='emit JSON')
+
+    cw_ = sub.add_parser('cfm-watch',
+                         help='passive 802.1ag CFM / Y.1731 scan: forged APS protection '
+                              'switching, AIS/LCK, CCM forgery, linktrace sweeps, malformed CFM')
+    cw_.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    cw_.add_argument('--seconds', '-s', type=int, default=30, help='capture window (5-65)')
+    cw_.add_argument('--pcap', default=None, help='replay a pcap instead of capturing')
+    cw_.add_argument('--md-ceiling', type=int, default=None,
+                     help='highest legitimate MD level at this tap (0-7); arms CFM-021')
+    cw_.add_argument('--json', action='store_true', help='emit JSON')
+
+    cr_ = sub.add_parser('cfm-ring',
+                         help='declare / list / remove ERPS (G.8032) rings so CFM Watch '
+                              'can police ring topology (Class R, CFM-192..209)')
+    cr_.add_argument('action', nargs='?', default='list',
+                     choices=['list', 'declare', 'remove', 'clear'])
+    cr_.add_argument('spec', nargs='?', default=None,
+                     help='VLAN[,rpl=MAC][,nodes=MAC/MAC][,role=major|sub][,name=LABEL]')
+    cr_.add_argument('--json', action='store_true', help='emit JSON')
+
+    ce_ = sub.add_parser('cfm-evc',
+                         help='declare / list / remove E-LMI EVCs (MEF 16) so CFM Watch '
+                              'can police the CE-VLAN/EVC cross-plane (Class L, CFM-250..254)')
+    ce_.add_argument('action', nargs='?', default='list',
+                     choices=['list', 'declare', 'remove', 'clear'])
+    ce_.add_argument('spec', nargs='?', default=None,
+                     help='REFERENCE,vlan=VLAN[,name=LABEL]')
+    ce_.add_argument('--json', action='store_true', help='emit JSON')
+
+    lw_ = sub.add_parser('lldp-watch',
+                         help='passive LLDP (802.1AB) scan: malformed-TLV CVE shapes, '
+                              'vulnerable-family screening, flood / forged neighbour')
+    lw_.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    lw_.add_argument('--seconds', '-s', type=int, default=30, help='capture window (5-65)')
+    lw_.add_argument('--pcap', default=None,
+                     help='replay a pcap instead of capturing (baseline not used or saved)')
+    lw_.add_argument('--json', action='store_true', help='emit JSON')
+
+    mw_ = sub.add_parser('modbus-watch',
+                         help='passive Modbus/TCP posture scan (off-baseline writes, '
+                              'FC8 listen-only, UMAS/ModiPwn, libmodbus framing)')
+    mw_.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    mw_.add_argument('--seconds', '-s', type=int, default=20, help='capture window (5-60)')
+    mw_.add_argument('--pcap', default=None,
+                     help='replay a pcap instead of capturing (fresh baseline, not saved)')
+    mw_.add_argument('--learn', type=float, default=None,
+                     help='learning window seconds for --pcap (default 3600)')
+    mw_.add_argument('--ot-subnet', action='append', default=None,
+                     help='declared OT subnet (enables MBW-040); repeatable')
+    mw_.add_argument('--json', action='store_true', help='emit JSON')
+
+    bw_ = sub.add_parser('ble-watch',
+                         help='passive BLE attack monitor (needs an nRF/Bluefruit LE sniffer)')
+    bw_.add_argument('--device', '-i', default=None, help='sniffer serial device (default: autodetect)')
+    bw_.add_argument('--replay', default=None, help='replay a BLE pcap instead of a live sniffer')
+    bw_.add_argument('--seconds', '-s', type=int, default=20, help='capture window (5-120)')
+    bw_.add_argument('--json', action='store_true', help='emit JSON')
+
     dwst = sub.add_parser('dns-passive-selftest',
                           help='self-test the passive DNS detectors (no root)')
     dwst.add_argument('--json', action='store_true', help='emit JSON')
@@ -28883,6 +34149,15 @@ def _cli(argv=None):
 
     stst = sub.add_parser('stp-selftest', help='self-test the STP/BPDU detectors (no root)')
     stst.add_argument('--json', action='store_true', help='emit JSON')
+
+    mrw = sub.add_parser('mrp-watch', help='passive MVRP/MMRP/GVRP/GMRP registration scan')
+    mrw.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    mrw.add_argument('--seconds', '-s', type=int, default=20, help='capture window (5-50)')
+    mrw.add_argument('--known-vlans', default=None, help='operator VLAN baseline, comma-separated (scoping only)')
+    mrw.add_argument('--json', action='store_true', help='emit JSON')
+
+    mrst = sub.add_parser('mrp-selftest', help='self-test the MRP (MVRP/MMRP/GVRP/GMRP) detectors (no root)')
+    mrst.add_argument('--json', action='store_true', help='emit JSON')
 
     dt = sub.add_parser('dtp-watch', help='passive DTP / VLAN-hopping scan (Cisco)')
     dt.add_argument('--iface', '-i', default=None, help='interface (default: route)')
@@ -28936,11 +34211,15 @@ def _cli(argv=None):
                            ('comware', 'HPE Comware / Huawei VRF-hopping (MPLS)'),
                            ('mikrotik', 'MikroTik RouterOS (CCR/CRS)'),
                            ('aruba', 'HPE Aruba ArubaOS (PAPI)'),
-                           ('apc', 'APC / Schneider NMC (Ripple20)')):
+                           ('apc', 'APC / Schneider NMC (Ripple20)'),
+                           ('liebert', 'Vertiv Liebert power cards (RomPager / RDU101)')):
         gp = sub.add_parser('%s-guard' % _gname,
                             help='passive %s CVE guard (posture/exposure/attack)' % _ghelp)
         gp.add_argument('--iface', '-i', default=None, help='interface (default: route)')
         gp.add_argument('--seconds', '-s', type=int, default=20, help='capture window (5-40; APC 5-60)')
+        if _gname == 'liebert':
+            gp.add_argument('--port', '-p', type=int, default=80,
+                            help='HTTP port of the card web UI to judge (default 80)')
         if _gname == 'apc':
             gp.add_argument('--cards', default=None,
                             help="declared NMCs: 'ADDR[=MAC],...' (replaces the saved list)")
@@ -29521,6 +34800,104 @@ def _cli(argv=None):
                 print(f"  {x}")
         return 0 if r.get('success') else 1
 
+    if args.cmd == 'oam-watch':
+        r = do_oam_watch(interface=args.iface, seconds=args.seconds, pcap=args.pcap)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"verdict: {r['verdict']}  ({r['packet_count']} OAMPDUs, "
+                  f"{len(r['peers'])} peer(s))")
+            for f in r['findings']:
+                print(f"  [{f['code']}] {f['severity'].upper():8} {f['name']} | {f['src']} "
+                      f"x{f['count']} | {f['detail']}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'cfm-watch':
+        r = do_cfm_watch(interface=args.iface, seconds=args.seconds, pcap=args.pcap,
+                         md_ceiling=args.md_ceiling)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"verdict: {r['verdict']}  ({r['packet_count']} CFM frames, "
+                  f"{len(r['inventory']['meps'])} MEP(s))")
+            for f in r['findings']:
+                cve = f" {','.join(f['cves'])}" if f['cves'] else ''
+                print(f"  [{f['code']}] {f['severity'].upper():8} {f['name']}{cve} | "
+                      f"{f['src'] or f['context']} x{f['count']} | {f['detail']}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'cfm-ring':
+        r = do_cfm_ring(args.action, args.spec)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            rings = r.get('rings') or []
+            if not rings:
+                print('no ERPS rings declared')
+            for rg in rings:
+                if isinstance(rg, dict):
+                    print(f"  {rg.get('name', '?')}: {rg['spec']}"
+                          + ('' if rg.get('ok', True) else f"  (INVALID: {rg.get('error')})"))
+                else:
+                    print(f"  {rg}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'cfm-evc':
+        r = do_cfm_evc(args.action, args.spec)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            evcs = r.get('evcs') or []
+            if not evcs:
+                print('no E-LMI EVCs declared')
+            for ev in evcs:
+                if isinstance(ev, dict):
+                    print(f"  {ev.get('name', '?')}: {ev['spec']}"
+                          + ('' if ev.get('ok', True) else f"  (INVALID: {ev.get('error')})"))
+                else:
+                    print(f"  {ev}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'lldp-watch':
+        r = do_lldp_watch(interface=args.iface, seconds=args.seconds, pcap=args.pcap,
+                          persist=not args.pcap)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"verdict: {r['verdict']}  ({r['packet_count']} LLDP frames, "
+                  f"{len(r['neighbours'])} neighbour(s), enforce={r['enforce']})")
+            for f in r['findings']:
+                print(f"  [{f['code']}] {f['severity'].upper():8} {f['name']} | {f['src']} "
+                      f"x{f['count']}" + (f"  {' '.join(f['cves'])}" if f['cves'] else ''))
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'modbus-watch':
+        r = do_modbus_watch(interface=args.iface, seconds=args.seconds,
+                            ot_subnets=args.ot_subnet, pcap=args.pcap,
+                            learn_seconds=args.learn, persist=not args.pcap)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"verdict: {r['verdict']}  ({r['adus']} Modbus ADUs, "
+                  f"{r['slaves']} slave/unit pairs, learning={r['learning']})")
+            for f in r['findings']:
+                print(f"  [{f['code']}] {f['severity'].upper():6} {f['name']} | {f['af']} "
+                      f"{f['master']} -> {f['slave']} unit {f['unit']} x{f['count']} "
+                      f"| {f['detail']}" + (f"  {' '.join(f['cves'])}" if f['cves'] else ''))
+        return 0 if r.get('success') else 1
+
     if args.cmd == 'ftp-watch':
         ports = [int(p) for p in re.split(r'[,\s]+', args.ports or '21') if p.isdigit()]
         r = do_ftp_watch(interface=args.iface, seconds=args.seconds, ports=ports or None)
@@ -29532,6 +34909,20 @@ def _cli(argv=None):
             print(f"FTP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
                   f"({r['packet_count']} frames, {r['sessions']} session(s), "
                   f"{len(r['findings'])} finding(s))")
+            for x in r.get('reasons', []):
+                print(f"  {x}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'ble-watch':
+        r = do_ble_watch(device=args.device, seconds=args.seconds, replay=args.replay)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"BLE Watch [{r['device']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['packet_count']} PDUs, {len(r['devices'])} device(s), "
+                  f"{r['alerts']} alert(s))")
             for x in r.get('reasons', []):
                 print(f"  {x}")
         return 0 if r.get('success') else 1
@@ -29660,20 +35051,19 @@ def _cli(argv=None):
         elif not r.get('success'):
             print(f"error: {r.get('error')}")
         else:
+            sm = r.get('summary', {})
             print(f"STP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
-                  f"({r['packet_count']} BPDUs, {r['bridge_count']} bridge(s), "
-                  f"{r['instance_count']} instance(s); {r['tcn_count']} TCN)")
+                  f"({sm.get('bpdus', 0)} BPDUs, {sm.get('segments', 0)} segment(s), "
+                  f"{sm.get('msti', 0)} MSTI; {sm.get('findings', 0)} finding(s))")
             if r.get('learned'):
                 print("  (baseline learned this run)")
-            for inst in r.get('instances', []):
-                mark = '' if inst['status'] in ('known', 'learned') else f" [{inst['status']}]"
-                print(f"  {inst['proto'].upper()} vlan/inst {inst['vlan']}: root "
-                      f"{inst['root_prio']}.{inst['root_mac']} via {inst['advertised_by']}{mark}")
-            for b in r.get('bridges', []):
-                tag = '' if b['baseline'] else ' *NEW*'
-                print(f"    bridge {b['mac']} ({b['proto']}){tag}")
-            for rs in r.get('reasons', []):
-                print(f"  - {rs}")
+            for f in r.get('findings', []):
+                vlan = '' if f.get('vlan') in (None, '') else f" vlan={f['vlan']}"
+                print(f"  [{f['code']}] {f['severity'].upper()}{vlan}: {f['summary']}"
+                      + (f" (x{f['count']})" if f.get('count', 1) > 1 else ''))
+            for s in r.get('segments', []):
+                print(f"    segment vlan/inst {s['vlan']}: root {s['root']} "
+                      f"({s['bridges']} bridge(s), {s['bpdus']} BPDUs, {s['encap']})")
         return 0 if r.get('success') else 1
 
     if args.cmd == 'stp-selftest':
@@ -29682,15 +35072,42 @@ def _cli(argv=None):
             print(json.dumps(r, indent=2))
         else:
             for s in r['scenarios']:
-                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
-                      f"expect={s['expect']} got={s['got']}")
-            sc = r['scapy']
-            if sc.get('ran'):
-                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
-                      f"root_prio={sc.get('root_prio')} verdict={sc.get('verdict')}")
-            else:
-                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
-            print(f"STP self-test: {'OK' if r['success'] else 'FAILED'}")
+                if not s['pass'] or not s['name'].startswith('stpwatch check'):
+                    print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                          f"expect={s['expect']} got={s['got']}")
+            print(f"STP self-test: {'OK' if r['success'] else 'FAILED'} "
+                  f"({sum(1 for s in r['scenarios'] if s['pass'])}/{len(r['scenarios'])})")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'mrp-watch':
+        kv = [int(v) for v in re.split(r'[,\s]+', args.known_vlans or '') if v.strip().isdigit()]
+        r = do_mrp_watch(interface=args.iface, seconds=args.seconds, known_vlans=kv or None)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            sm = r.get('summary', {})
+            print(f"MRP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({sm.get('frames', 0)} frame(s), {sm.get('findings', 0)} finding(s); "
+                  f"{', '.join(sm.get('protocols', [])) or 'none'})")
+            for f in r.get('findings', []):
+                src = f" src {f['src']}" if f.get('src') else ''
+                print(f"  [{f['code']}] {f['severity'].upper()} {f['proto']}: {f['title']}"
+                      + (f" (x{f['count']})" if f.get('count', 1) > 1 else '') + src)
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'mrp-selftest':
+        r = _mrp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                if not s['pass'] or not s['name'].startswith('mrpwatch check'):
+                    print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                          f"expect={s['expect']} got={s['got']}")
+            print(f"MRP self-test: {'OK' if r['success'] else 'FAILED'} "
+                  f"({sum(1 for s in r['scenarios'] if s['pass'])}/{len(r['scenarios'])})")
         return 0 if r['success'] else 1
 
     if args.cmd == 'dtp-watch':
@@ -29912,12 +35329,15 @@ def _cli(argv=None):
         'mikrotik-guard': (do_mikrotik_guard, 'MikroTik'),
         'aruba-guard': (do_aruba_guard, 'Aruba'),
         'apc-guard': (do_apc_guard, 'APC'),
+        'liebert-guard': (do_liebert_guard, 'Liebert'),
     }
     if args.cmd in _GUARD_CLI:
         fn, label = _GUARD_CLI[args.cmd]
         kw = {'interface': args.iface, 'seconds': args.seconds}
         if args.cmd == 'comware-guard':
             kw['role'] = getattr(args, 'role', 'unknown')
+        if args.cmd == 'liebert-guard':
+            kw['port'] = args.port
         if args.cmd == 'apc-guard':
             kw['cards'] = args.cards
             kw['forget'] = args.forget
@@ -29946,6 +35366,7 @@ def _cli(argv=None):
         'mikrotik-guard-selftest': (_mikrotik_selftest, 'MikroTik'),
         'aruba-guard-selftest': (_aruba_selftest, 'Aruba'),
         'apc-guard-selftest': (_apc_selftest, 'APC'),
+        'liebert-guard-selftest': (_liebert_selftest, 'Liebert'),
     }
     if args.cmd in _GUARD_SELFTEST_CLI:
         fn, label = _GUARD_SELFTEST_CLI[args.cmd]

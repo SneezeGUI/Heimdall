@@ -14,6 +14,8 @@ import sys
 import json
 import csv
 import glob
+import hmac
+import secrets
 import collections
 import signal
 import logging
@@ -35,7 +37,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Tuple
 from contextlib import contextmanager
 from email.utils import format_datetime
-from flask import Flask, render_template, jsonify, request, send_from_directory, Response, make_response, g, session, redirect
+from flask import Flask, render_template, jsonify, request, send_from_directory, send_file, Response, make_response, g, session, redirect
 from flask_socketio import SocketIO, emit, disconnect
 try:
     from flask_cors import CORS  # type: ignore
@@ -159,6 +161,17 @@ _CSP_VALUE = os.environ.get('RAGNAR_CSP', _DEFAULT_CSP).strip()
 
 @app.after_request
 def _apply_security_headers(response):
+    # Persist the kiosk bypass token as a cookie once the local kiosk presents it
+    # in the URL, so the SPA's later XHRs (no query string) keep the bypass. Only
+    # set when the request actually proved the token (check_authentication gated
+    # g._set_kiosk_cookie on _request_has_kiosk_token), so a tailnet request can
+    # never trigger it.
+    if getattr(g, '_set_kiosk_cookie', False):
+        try:
+            response.set_cookie(_KIOSK_COOKIE, _kiosk_token(), max_age=31536000,
+                                httponly=True, samesite='Lax', path='/')
+        except Exception:
+            pass
     # Content-Security-Policy — mitigates XSS / data injection.
     if _CSP_VALUE and 'Content-Security-Policy' not in response.headers:
         response.headers['Content-Security-Policy'] = _CSP_VALUE
@@ -847,6 +860,64 @@ def _remote_share_push_url(address):
     return address.rstrip('/') + '/api/mesh/files/push'
 
 
+# ---------------------------------------------------------------------------
+# Kiosk loopback auth-bypass token
+# ---------------------------------------------------------------------------
+# The on-screen kiosk (chromium -> localhost) skips login. We must NOT let that
+# bypass reach a tailnet visitor proxied through `tailscale serve`, which also
+# arrives on 127.0.0.1. A tailnet request is indistinguishable from a local one
+# by source address alone, so we gate the bypass on a secret the LOCAL kiosk
+# holds (a file on the box) and a tailnet peer cannot. The kiosk wrapper opens
+# the UI with ?kiosk_token=<secret>; we then set a cookie so the SPA's later
+# requests carry it. This is what lets kiosk + Tailscale HTTPS publishing run at
+# the same time without exposing an unauthenticated UI to the tailnet.
+_KIOSK_TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'data', 'kiosk_token')
+_KIOSK_COOKIE = 'ragnar_kiosk'
+
+
+def _kiosk_token():
+    """The local kiosk's shared secret (read-or-create under data/).
+
+    World-readable on purpose: the token only gates the LOOPBACK bypass, and any
+    local user already has shell on the box, so it adds no local attack surface.
+    Its sole job is to deny the bypass to a tailnet visitor (via `tailscale
+    serve`) who reaches loopback but can't read a file on the device.
+    """
+    try:
+        with open(_KIOSK_TOKEN_PATH) as f:
+            tok = f.read().strip()
+        if tok:
+            return tok
+    except OSError:
+        pass
+    tok = secrets.token_hex(32)
+    try:
+        os.makedirs(os.path.dirname(_KIOSK_TOKEN_PATH), exist_ok=True)
+        tmp = _KIOSK_TOKEN_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            f.write(tok + '\n')
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, _KIOSK_TOKEN_PATH)
+    except OSError:
+        pass
+    return tok
+
+
+def _request_has_kiosk_token():
+    """True when the request carries the local kiosk secret (cookie or query).
+
+    A `tailscale serve` request from the tailnet reaches Flask on loopback too,
+    but never carries this token, so it does not get the bypass. Constant-time
+    comparison so the token can't be probed by timing.
+    """
+    tok = _kiosk_token()
+    if not tok:
+        return False
+    supplied = request.cookies.get(_KIOSK_COOKIE) or request.args.get('kiosk_token') or ''
+    return bool(supplied) and hmac.compare_digest(str(supplied), tok)
+
+
 @app.before_request
 def check_authentication():
     """Enforce authentication on all endpoints when auth is configured."""
@@ -903,11 +974,18 @@ def check_authentication():
         if request.method == 'POST' and path in write_api:
             return
 
-    # Kiosk loopback bypass: any request originating from the Pi itself
-    # (the on-screen kiosk runs chromium pointed at localhost) bypasses auth.
-    # Anyone with local access already has shell on the device, so this
-    # adds no attack surface vs. the existing network-facing auth.
-    if request.remote_addr in ('127.0.0.1', '::1') and shared_data.config.get('kiosk_enabled'):
+    # Kiosk loopback bypass: the on-screen kiosk (chromium -> localhost) skips
+    # login. Scoped to the LOCAL kiosk by a secret token (see _kiosk_token) so a
+    # tailnet visitor proxied through `tailscale serve` — who also arrives on
+    # 127.0.0.1 but cannot hold the token — is NOT bypassed and must log in.
+    # That is what lets kiosk mode and Tailscale HTTPS publishing coexist.
+    if (request.remote_addr in ('127.0.0.1', '::1')
+            and shared_data.config.get('kiosk_enabled')
+            and _request_has_kiosk_token()):
+        # The kiosk wrapper passes the token in the URL; persist it as a cookie
+        # so the SPA's subsequent XHRs (which drop the query string) stay bypassed.
+        if request.args.get('kiosk_token') and not request.cookies.get(_KIOSK_COOKIE):
+            g._set_kiosk_cookie = True
         return
 
     # Mesh machine auth: let a *peer Ragnar* reach this node's mesh endpoints
@@ -944,6 +1022,14 @@ def check_authentication():
         peer_scan_write = request.method == 'POST' and (
             path == '/api/mesh/scan/start'
             or path.startswith('/api/mesh/scan/cancel/'))
+        # Packet capture the "worker" role accepts, same shape as scan writes:
+        # start a bounded capture on this unit, and cancel one. Exact-path
+        # allowlisted (cancel by prefix + id); the capture itself is bounded in
+        # pcap_capture.py and the operator's own capture routes
+        # (/api/mesh/peer-capture/*) stay session-only.
+        peer_capture_write = request.method == 'POST' and (
+            path == '/api/mesh/capture/start'
+            or path.startswith('/api/mesh/capture/cancel/'))
         # The fleet-update fan-out: a peer's "Update mesh" lands here to run this
         # unit's own git update. Exact-path allowlisted like the control write, and
         # the handler only ever runs git_updater against this checkout — a peer
@@ -953,8 +1039,8 @@ def check_authentication():
         # Exact-path allowlisted; the handler itself only ever writes into the
         # inbox (never a live path) and can be turned off (mesh_file_receive).
         peer_file_push = request.method == 'POST' and path == '/api/mesh/files/push'
-        if (peer_read or peer_control or peer_scan_write or peer_update
-                or peer_file_push) and _is_mesh_peer_request():
+        if (peer_read or peer_control or peer_scan_write or peer_capture_write
+                or peer_update or peer_file_push) and _is_mesh_peer_request():
             return
 
         # Share-only guest role. A device carrying the SHARE tag (tag:ragnar-share)
@@ -2150,7 +2236,8 @@ _NI_CLEAN = {'clean', 'unknown', 'ok', 'none', 'hardened', 'learned', 'n/a',
              'no-traffic', 'disabled', 'not-applicable',
              'randomization',       # mac: privacy-MAC inventory is benign, not an alert
              'fhrp',                # mac: HSRP/VRRP/GLBP virtual-MAC inventory is expected
-             'observed'}            # guards: a vendor device seen, no CVE-relevant finding
+             'observed',            # guards: a vendor device seen, no CVE-relevant finding
+             'learning'}            # modbus: master baseline still being learned
 _NI_CRITICAL = {
     'hijacked', 'spoofed', 'rogue', 'starvation', 'compromised',        # dns/arp/dhcp
     'root-hijack', 'bpdu-flood',                                        # stp
@@ -2164,11 +2251,13 @@ _NI_CRITICAL = {
     'rogue-redirect', 'rogue-ra', 'rogue-irdp',                         # ipv6/icmp
     'cdpwn',                                                            # cdp (Armis CDPwn CVE exploit shape)
     'autokey-exploit',                                                 # ntp (CVE-2014-9295 crypto_recv overflow signature)
+    'crash-exploit',                                                   # ntp (oversize CVE-2016-9312 / mode-6 count overrun CVE-2019-6444/6443)
     'lag-hijack',                                                      # lacp (aggregation takeover: identity manip + member disruption)
     'zerologon', 'dcsync', 'credential-exposure',                     # rpc-netlogon (CVE-2020-1472 chain / DCSync / DPAPI backup-key / WinRM basic)
     'failover-manipulation',                                           # bfd (forged teardown / forced AdminDown / illegal state regression -> induced reconvergence)
     'segment-injection',                                               # sr-mpls (MPLS/SRH on a customer-facing port = label-injection / VRF-hopping primitive)
     'attack',                                                          # vendor guards: an exploitation primitive observed on the wire
+    'plc-abuse',                                                       # modbus (off-baseline write / Force Listen Only / ModiPwn sequence)
 }
 
 
@@ -2249,6 +2338,7 @@ def _net_integrity_check_once():
         ('stp', 'STP', lambda: watch(nd.do_stp_watch, interface=cap_iface)),
         ('dtp', 'DTP', lambda: watch(nd.do_dtp_watch, interface=cap_iface)),
         ('cdp', 'CDP', lambda: watch(nd.do_cdp_watch, interface=cap_iface)),
+        ('lldp', 'LLDP', lambda: watch(nd.do_lldp_watch, interface=cap_iface)),
         ('vtp', 'VTP', lambda: watch(nd.do_vtp_watch, interface=cap_iface)),
         ('igmp', 'IGMP', lambda: watch(nd.do_igmp_watch, interface=cap_iface)),
         ('ipv6', 'IPv6', lambda: watch(nd.do_ipv6_watch, interface=cap_iface)),
@@ -2269,6 +2359,8 @@ def _net_integrity_check_once():
         ('ssh', 'SSH', lambda: watch(nd.do_ssh_watch, interface=cap_iface)),
         ('telnet', 'Telnet', lambda: watch(nd.do_telnet_watch, interface=cap_iface)),
         ('lacp', 'LACP', lambda: watch(nd.do_lacp_watch, interface=cap_iface)),
+        ('oam', 'Link OAM', lambda: watch(nd.do_oam_watch, interface=cap_iface)),
+        ('cfm', 'CFM / Y.1731', lambda: watch(nd.do_cfm_watch, interface=cap_iface)),
         ('rpc', 'RPC', lambda: watch(nd.do_rpc_watch, interface=cap_iface)),
         ('bfd', 'BFD', lambda: watch(nd.do_bfd_watch, interface=cap_iface)),
         ('srmpls', 'SR-MPLS', lambda: watch(nd.do_sr_mpls_watch, interface=cap_iface)),
@@ -2276,6 +2368,7 @@ def _net_integrity_check_once():
         ('dns_passive', 'DNS', lambda: watch(nd.do_dns_watch, interface=cap_iface)),
         ('ftp', 'FTP', lambda: watch(nd.do_ftp_watch, interface=cap_iface)),
         ('smtp', 'SMTP', lambda: watch(nd.do_smtp_watch, interface=cap_iface)),
+        ('modbus', 'Modbus', lambda: watch(nd.do_modbus_watch, interface=cap_iface)),
     ]
 
     # LAN-only vendor switch/router guards: only auto-run when a genuine wired
@@ -3662,7 +3755,10 @@ _cyd_bridge = cyd_serial_bridge.CydSerialBridge(
 )
 try:
     import serial_claims
-    serial_claims.register('cyd', lambda: getattr(shared_data, 'cyd_serial_active_port', None))
+    # Hard claim only once a CYD has answered; while the bridge is still
+    # listening the claim is soft, so a sniffer / Meshtastic node is handed back.
+    serial_claims.register(cyd_serial_bridge.CLAIM_OWNER, lambda: _cyd_bridge.held_port(True))
+    serial_claims.register(cyd_serial_bridge.PROBE_OWNER, lambda: _cyd_bridge.held_port(False))
 except Exception as _claims_exc:  # pragma: no cover - never block startup
     logger.debug(f"[cyd] serial claim registration failed: {_claims_exc}")
 try:
@@ -4762,6 +4858,21 @@ def _mesh_local_features():
         watchtower['reason'] = f'unavailable ({exc})'
     features['watchtower'] = watchtower
 
+    # Live packet capture — bounded tcpdump-to-pcap, pulled over the mesh. Unlike
+    # the Traffic analyzer (text stats only), this writes real .pcap files; the
+    # block reports what interfaces exist, whether a capture is running, and the
+    # recent captures so the node page can offer a Download for each.
+    capture = {'available': False, 'reason': 'Packet capture is unavailable (tcpdump not installed).'}
+    try:
+        cap = get_capture_manager()
+        if cap and cap.available():
+            capture = dict({'available': True}, **cap.summary())
+        elif cap:
+            capture['reason'] = cap.unavailable_reason() or capture['reason']
+    except Exception as exc:
+        capture['reason'] = f'unavailable ({exc})'
+    features['capture'] = capture
+
     # Mark which subsystems a mesh peer may start/stop remotely, and each one's
     # current running state, so a peer's popup can show a Start or a Stop button
     # that reflects reality. "External threat detection" maps to the continuous
@@ -5666,6 +5777,306 @@ def mesh_peer_control():
         return jsonify({'success': False, 'error': f'Mesh command failed: {exc}'}), 500
 
 
+# ============================================================================
+# Live packet capture (PCAP) over the mesh.
+#
+# Two layers, mirroring the scan-delegation split:
+#   * worker routes under /api/mesh/capture/* run ON this unit — the GETs are
+#     peer-readable (any tagged peer, relayed by the hub) and the two writes
+#     (start, cancel) are added to the peer-write allowlist in before_request,
+#     exactly like /api/mesh/scan/*;
+#   * operator routes under /api/mesh/peer-capture/* are session-only and relay
+#     to a chosen unit on the operator's behalf (the browser can't dial a peer).
+# The capture itself is strictly bounded in pcap_capture.py, so a remote start
+# can never run away with a peer's disk or CPU.
+# ============================================================================
+_capture_manager = None
+
+
+def get_capture_manager():
+    """The shared bounded-capture manager (lazy import; None if unavailable)."""
+    global _capture_manager
+    if _capture_manager is None:
+        try:
+            import pcap_capture
+            _capture_manager = pcap_capture.get_capture_manager()
+        except Exception as exc:
+            logger.debug(f"[mesh] capture manager unavailable: {exc}")
+            return None
+    return _capture_manager
+
+
+@app.route('/api/mesh/capture/start', methods=['POST'])
+def mesh_capture_start():
+    """Worker: start a bounded capture on THIS unit. Peer-write allowlisted
+    (relayed by the hub) and also reachable by the local operator."""
+    cap = get_capture_manager()
+    if not cap:
+        return jsonify({'success': False, 'error': 'Packet capture is unavailable on this unit.'}), 503
+    d = request.get_json(silent=True) or {}
+    res = cap.start(interface=d.get('interface'), seconds=d.get('seconds'),
+                    max_packets=d.get('max_packets'), max_bytes=d.get('max_bytes'),
+                    bpf=d.get('filter'), snaplen=d.get('snaplen'))
+    return jsonify(res), (200 if res.get('success') else 400)
+
+
+@app.route('/api/mesh/capture/cancel/<cid>', methods=['POST'])
+def mesh_capture_cancel(cid):
+    """Worker: stop a running capture early. Peer-write allowlisted."""
+    cap = get_capture_manager()
+    if not cap:
+        return jsonify({'success': False, 'error': 'Packet capture is unavailable.'}), 503
+    return jsonify(cap.cancel(cid))
+
+
+@app.route('/api/mesh/capture/status/<cid>', methods=['GET'])
+def mesh_capture_status(cid):
+    """Worker (peer-readable GET): one capture's live state."""
+    cap = get_capture_manager()
+    if not cap:
+        return jsonify({'success': False, 'error': 'Packet capture is unavailable.'}), 503
+    return jsonify(cap.status(cid))
+
+
+@app.route('/api/mesh/capture/list', methods=['GET'])
+def mesh_capture_list():
+    """Worker (peer-readable GET): interfaces + recent captures on this unit."""
+    cap = get_capture_manager()
+    if not cap:
+        return jsonify({'success': False, 'error': 'Packet capture is unavailable.'}), 503
+    return jsonify(cap.list())
+
+
+@app.route('/api/mesh/capture/view/<cid>', methods=['GET'])
+def mesh_capture_view(cid):
+    """Worker (peer-readable GET): decode a finished capture to a packet list +
+    summary, so the result shows on screen (not only as a download)."""
+    cap = get_capture_manager()
+    if not cap:
+        return jsonify({'success': False, 'error': 'Packet capture is unavailable.'}), 503
+    try:
+        limit = int(request.args.get('limit') or 0) or None
+    except (TypeError, ValueError):
+        limit = None
+    return jsonify(cap.view(cid, limit=limit))
+
+
+@app.route('/api/mesh/capture/download/<cid>', methods=['GET'])
+def mesh_capture_download(cid):
+    """Worker (peer-readable GET): stream a finished capture's .pcap. The hub
+    relays this to the operator's browser (see peer-capture/download)."""
+    cap = get_capture_manager()
+    if not cap:
+        return jsonify({'success': False, 'error': 'Packet capture is unavailable.'}), 503
+    path = cap.path_for(cid)
+    if not path:
+        return jsonify({'success': False, 'error': 'No downloadable capture for that id.'}), 404
+    return send_file(path, as_attachment=True, download_name=os.path.basename(path),
+                     mimetype='application/vnd.tcpdump.pcap')
+
+
+def _mesh_capture_resolve_peer(node_id):
+    """(self_bool, peer_node_or_None, error_or_None) for an operator capture
+    call aimed at `node_id` — same resolution the peer-control relay uses."""
+    state = mesh_manager.status()
+    tag = _mesh_tag()
+    self_node = state.get('self') or {}
+    if node_id and node_id == str(self_node.get('id', '')):
+        return True, None, None
+    peer = next((p for p in state.get('peers', [])
+                 if str(p.get('id', '')) == node_id and tag in p.get('tags', [])), None)
+    if not peer:
+        return False, None, 'No such tagged mesh unit — refresh and try again.'
+    return False, peer, None
+
+
+@app.route('/api/mesh/peer-capture/start', methods=['POST'])
+def mesh_peer_capture_start():
+    """Operator: start a capture on a chosen unit (self or a peer, relayed)."""
+    if not mesh_available or not _mesh_enabled():
+        return jsonify({'success': False, 'error': 'Mesh is not enabled on this unit.'}), 400
+    d = request.get_json(silent=True) or {}
+    node_id = (d.get('node_id') or '').strip()
+    body = {k: d.get(k) for k in ('interface', 'seconds', 'max_packets', 'max_bytes', 'filter', 'snaplen')}
+    try:
+        is_self, peer, err = _mesh_capture_resolve_peer(node_id)
+        if err:
+            return jsonify({'success': False, 'error': err}), 404
+        if is_self:
+            cap = get_capture_manager()
+            if not cap:
+                return jsonify({'success': False, 'error': 'Packet capture is unavailable on this unit.'}), 503
+            res = cap.start(interface=body.get('interface'), seconds=body.get('seconds'),
+                            max_packets=body.get('max_packets'), max_bytes=body.get('max_bytes'),
+                            bpf=body.get('filter'), snaplen=body.get('snaplen'))
+            return jsonify(res), (200 if res.get('success') else 400)
+        reply = mesh_manager.post_peer(peer, '/api/mesh/capture/start', body,
+                                       port=_mesh_node_port(), timeout=20)
+        if not reply.get('reachable', True) and reply.get('error'):
+            return jsonify({'success': False, 'error': reply.get('error')}), 502
+        reply.pop('reachable', None)
+        return jsonify(reply), (200 if reply.get('success') else 400)
+    except Exception as exc:
+        logger.error(f"[mesh] peer-capture start on {node_id!r} failed: {exc}")
+        return jsonify({'success': False, 'error': f'Capture command failed: {exc}'}), 500
+
+
+@app.route('/api/mesh/peer-capture/cancel', methods=['POST'])
+def mesh_peer_capture_cancel():
+    """Operator: stop a capture on a chosen unit."""
+    if not mesh_available or not _mesh_enabled():
+        return jsonify({'success': False, 'error': 'Mesh is not enabled on this unit.'}), 400
+    d = request.get_json(silent=True) or {}
+    node_id = (d.get('node_id') or '').strip()
+    cid = (d.get('id') or '').strip()
+    try:
+        is_self, peer, err = _mesh_capture_resolve_peer(node_id)
+        if err:
+            return jsonify({'success': False, 'error': err}), 404
+        if is_self:
+            cap = get_capture_manager()
+            return jsonify(cap.cancel(cid) if cap else {'success': False, 'error': 'unavailable'})
+        reply = mesh_manager.post_peer(peer, f'/api/mesh/capture/cancel/{cid}', {},
+                                       port=_mesh_node_port(), timeout=12)
+        reply.pop('reachable', None)
+        return jsonify(reply)
+    except Exception as exc:
+        logger.error(f"[mesh] peer-capture cancel on {node_id!r} failed: {exc}")
+        return jsonify({'success': False, 'error': f'Capture command failed: {exc}'}), 500
+
+
+@app.route('/api/mesh/peer-capture/status', methods=['GET'])
+def mesh_peer_capture_status():
+    """Operator: one capture's live state on a chosen unit."""
+    node_id = (request.args.get('node_id') or '').strip()
+    cid = (request.args.get('id') or '').strip()
+    try:
+        is_self, peer, err = _mesh_capture_resolve_peer(node_id)
+        if err:
+            return jsonify({'success': False, 'error': err}), 404
+        if is_self:
+            cap = get_capture_manager()
+            return jsonify(cap.status(cid) if cap else {'success': False, 'error': 'unavailable'})
+        reply = mesh_manager.poll_peer(peer, port=_mesh_node_port(), timeout=8,
+                                       path=f'/api/mesh/capture/status/{cid}')
+        reply.pop('reachable', None)
+        return jsonify(reply)
+    except Exception as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 500
+
+
+@app.route('/api/mesh/peer-capture/list', methods=['GET'])
+def mesh_peer_capture_list():
+    """Operator: interfaces + recent captures on a chosen unit."""
+    node_id = (request.args.get('node_id') or '').strip()
+    try:
+        is_self, peer, err = _mesh_capture_resolve_peer(node_id)
+        if err:
+            return jsonify({'success': False, 'error': err}), 404
+        if is_self:
+            cap = get_capture_manager()
+            return jsonify(cap.list() if cap else {'success': False, 'error': 'unavailable'})
+        reply = mesh_manager.poll_peer(peer, port=_mesh_node_port(), timeout=10,
+                                       path='/api/mesh/capture/list')
+        reply.pop('reachable', None)
+        return jsonify(reply)
+    except Exception as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 500
+
+
+@app.route('/api/mesh/peer-capture/view', methods=['GET'])
+def mesh_peer_capture_view():
+    """Operator: decoded packet list + summary for a capture on a chosen unit."""
+    node_id = (request.args.get('node_id') or '').strip()
+    cid = (request.args.get('id') or '').strip()
+    limit = (request.args.get('limit') or '').strip()
+    try:
+        is_self, peer, err = _mesh_capture_resolve_peer(node_id)
+        if err:
+            return jsonify({'success': False, 'error': err}), 404
+        if is_self:
+            cap = get_capture_manager()
+            try:
+                lim = int(limit) or None
+            except ValueError:
+                lim = None
+            return jsonify(cap.view(cid, limit=lim) if cap else {'success': False, 'error': 'unavailable'})
+        path = f'/api/mesh/capture/view/{cid}' + (f'?limit={limit}' if limit else '')
+        reply = mesh_manager.poll_peer(peer, port=_mesh_node_port(), timeout=35, path=path)
+        reply.pop('reachable', None)
+        return jsonify(reply)
+    except Exception as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 500
+
+
+def _mesh_capture_name_for(node_id, is_self, peer):
+    """A download-safe Ragnar unit name for a capture file — the unit's Viking
+    name (then label / Tailscale short name), so a saved .pcap reads
+    `Bjorn-Ironside_<id>.pcap` instead of a raw node id."""
+    if is_self:
+        name = (_mesh_viking_name() or shared_data.config.get('mesh_site_label')
+                or _mesh_unit_name() or 'this-unit')
+    else:
+        with _mesh_lock:
+            h = dict((_mesh_peer_health or {}).get(node_id) or {})
+        name = (h.get('viking_name') or h.get('label') or (peer or {}).get('short_name')
+                or (peer or {}).get('hostname') or 'unit')
+    name = re.sub(r'[^A-Za-z0-9._-]+', '-', str(name)).strip('-')
+    return name[:40] or 'unit'
+
+
+@app.route('/api/mesh/peer-capture/download', methods=['GET'])
+def mesh_peer_capture_download():
+    """Operator: download a finished capture. For self, serve the file; for a
+    peer, stream it back over the tailnet (WireGuard) to the browser. The saved
+    file is named after the Ragnar unit it came from."""
+    node_id = (request.args.get('node_id') or '').strip()
+    cid = (request.args.get('id') or '').strip()
+    if not re.match(r'^[0-9a-fA-F]{1,16}$', cid or ''):
+        return jsonify({'success': False, 'error': 'Bad capture id.'}), 400
+    try:
+        is_self, peer, err = _mesh_capture_resolve_peer(node_id)
+        if err:
+            return jsonify({'success': False, 'error': err}), 404
+        name = _mesh_capture_name_for(node_id, is_self, peer)
+        if is_self:
+            cap = get_capture_manager()
+            path = cap.path_for(cid) if cap else None
+            if not path:
+                return jsonify({'success': False, 'error': 'No downloadable capture.'}), 404
+            return send_file(path, as_attachment=True, download_name=f'{name}_{cid}.pcap',
+                             mimetype='application/vnd.tcpdump.pcap')
+
+        # Peer: open the worker download over the tailnet and stream it through.
+        import urllib.request
+        path = f'/api/mesh/capture/download/{cid}'
+        url = mesh_manager.peer_url(peer, _mesh_node_port(), path)
+        headers = {'User-Agent': 'Ragnar-Mesh'}
+        headers.update(mesh_manager.auth_headers('GET', path))
+        req = urllib.request.Request(url, headers=headers)
+        resp = urllib.request.urlopen(req, timeout=30)
+        if getattr(resp, 'status', 200) != 200:
+            resp.close()
+            return jsonify({'success': False, 'error': f'Peer returned HTTP {resp.status}.'}), 502
+        fname = f'{name}_{cid}.pcap'
+
+        def _stream():
+            try:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                resp.close()
+
+        return Response(_stream(), mimetype='application/vnd.tcpdump.pcap',
+                        headers={'Content-Disposition': f'attachment; filename="{fname}"'})
+    except Exception as exc:
+        logger.error(f"[mesh] peer-capture download {cid!r} on {node_id!r} failed: {exc}")
+        return jsonify({'success': False, 'error': f'Capture download failed: {exc}'}), 502
+
+
 def _mesh_local_update() -> dict:
     """Run THIS unit's git update for a mesh fan-out, and report it compactly.
 
@@ -5916,6 +6327,123 @@ def mesh_diagnose():
     return jsonify({'success': True, 'result': result})
 
 
+def _mesh_known_node_ips():
+    """Every tailnet address of a node this unit knows in the mesh (self + each
+    tagged peer). A probe target must be in this set — see mesh_probe(). We take
+    all of a node's addresses, not just the primary, so a peer reached on its
+    IPv6 address is still recognised as itself."""
+    ips = set()
+    if not mesh_available:
+        return ips
+    try:
+        state = mesh_manager.status()
+    except Exception:
+        return ips
+    tag = _mesh_tag()
+    for node in list(state.get('peers', [])) + ([state.get('self')] if state.get('self') else []):
+        if not node or (node is not state.get('self') and tag not in node.get('tags', [])):
+            continue
+        for a in ([node.get('ip')] + list(node.get('ips') or [])):
+            if a:
+                ips.add(a)
+    return ips
+
+
+def _mesh_parse_traceroute(text):
+    """Parse `traceroute -n` text into [{hop, ip, rtt_ms}] so the UI can draw the
+    jumps instead of showing a wall of text. A hop that never answered (`* * *`)
+    is kept with ip=None so the gap is visible rather than silently dropped."""
+    hops = []
+    for line in (text or '').splitlines():
+        line = line.strip()
+        m = re.match(r'^(\d+)\s+(.*)$', line)
+        if not m:
+            continue
+        hop_no = int(m.group(1))
+        rest = m.group(2)
+        ip = None
+        ipm = re.search(r'(\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]{2,}:[0-9a-fA-F:]*)', rest)
+        if ipm and ipm.group(1) != '*':
+            ip = ipm.group(1)
+        rttm = re.search(r'([\d.]+)\s*ms', rest)
+        hops.append({'hop': hop_no, 'ip': ip,
+                     'rtt_ms': float(rttm.group(1)) if rttm else None})
+    return hops
+
+
+def _mesh_run_probe(kind, ip):
+    """Run a traceroute or ping from THIS unit to `ip` (already validated as a
+    known mesh node). Returns a structured result; never raises."""
+    is_v6 = ':' in ip
+    if kind == 'ping':
+        cmd = ['ping', '-6' if is_v6 else '-4', '-n', '-c', '4', '-w', '8', ip]
+        timeout = 14
+    else:
+        cmd = ['traceroute', '-6' if is_v6 else '-4', '-n',
+               '-q', '1', '-w', '2', '-m', '15', ip]
+        timeout = 60
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        out = (proc.stdout or '') + (proc.stderr or '')
+    except FileNotFoundError:
+        return {'error': f'{cmd[0]} is not installed on this unit.',
+                'missing_tool': cmd[0], 'raw': ''}
+    except subprocess.TimeoutExpired:
+        return {'error': f'{kind} timed out after {timeout}s.', 'raw': ''}
+    except Exception as exc:
+        return {'error': f'{type(exc).__name__} while running {kind}.', 'raw': ''}
+
+    result = {'kind': kind, 'target': ip, 'raw': out.strip()}
+    if kind == 'trace':
+        hops = _mesh_parse_traceroute(out)
+        result['hops'] = hops
+        answered = [h for h in hops if h['ip']]
+        result['hop_count'] = len(answered)
+    else:
+        m = re.search(r'(\d+) packets transmitted, (\d+) received.*?([\d.]+)% packet loss',
+                      out, re.S)
+        if m:
+            result['transmitted'] = int(m.group(1))
+            result['received'] = int(m.group(2))
+            result['loss_pct'] = float(m.group(3))
+        rtt = re.search(r'=\s*([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)\s*ms', out)
+        if rtt:
+            result['rtt_min'] = float(rtt.group(1))
+            result['rtt_avg'] = float(rtt.group(2))
+            result['rtt_max'] = float(rtt.group(3))
+    return result
+
+
+@app.route('/api/mesh/probe', methods=['POST'])
+def mesh_probe():
+    """Run a live network probe (traceroute / ping) from THIS unit to a mesh
+    node, so the operator can see the path and reachability between units — how
+    many hops away a peer is, and whether the link is direct or via a relay.
+
+    Operator action (POST, session-gated). The target is pinned to an address
+    this unit already knows as a mesh node (self or a tagged peer): the probe is
+    a fleet tool, not a general traceroute box, and constraining the target to
+    the known roster keeps the route from being turned into an arbitrary network
+    scanner.
+    """
+    if not mesh_available:
+        return jsonify({'success': False, 'error': 'mesh_manager unavailable'}), 503
+    data = request.get_json(silent=True) or {}
+    ip = (data.get('ip') or '').strip()
+    kind = (data.get('kind') or 'trace').strip().lower()
+    if kind not in ('trace', 'ping'):
+        return jsonify({'success': False, 'error': 'Unknown probe kind.'}), 400
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return jsonify({'success': False, 'error': 'Invalid peer address.'}), 400
+    if ip not in _mesh_known_node_ips():
+        return jsonify({'success': False,
+                        'error': 'That address is not a known mesh node.'}), 400
+    result = _mesh_run_probe(kind, ip)
+    return jsonify(dict({'success': True}, **result))
+
+
 @app.route('/api/mesh/install', methods=['POST'])
 def mesh_install():
     """Install the Tailscale client on this unit from the web UI.
@@ -5986,21 +6514,13 @@ def mesh_serve():
     # and is how units are actually reached. HTTPS is opt-in.
     use_https = bool(data.get('https', False))
 
-    # Refuse the one combination that silently disables authentication.
-    # `tailscale serve` proxies from tailscaled, so every request reaches Flask
-    # from 127.0.0.1 — and the kiosk bypass grants unauthenticated access to
-    # exactly that address. Together they would expose the full UI, no login, to
-    # every device on the tailnet. Neither setting is wrong alone; the pair is.
-    if enable and shared_data.config.get('kiosk_enabled'):
-        return jsonify({
-            'success': False,
-            'message': ('Kiosk mode is enabled, which grants unauthenticated '
-                        'access to loopback requests. Publishing over Tailscale '
-                        'Serve would route every tailnet visitor through '
-                        'loopback and bypass the login. Disable kiosk mode '
-                        'first, or reach this node directly on port '
-                        f'{_mesh_node_port()} instead.'),
-        }), 409
+    # Kiosk mode and publishing used to be mutually exclusive: `tailscale serve`
+    # proxies every tailnet request from 127.0.0.1, and the kiosk bypass used to
+    # trust *any* loopback request — so the pair exposed the full UI, no login,
+    # to the tailnet. That hole is closed: the bypass is now scoped to the local
+    # kiosk's secret token (see _request_has_kiosk_token), which a tailnet
+    # visitor proxied through serve cannot hold, so they still have to log in.
+    # Publishing with kiosk on is therefore safe and allowed.
 
     ok, message = mesh_manager.serve_web(port=_mesh_node_port(), enable=enable,
                                          use_https=use_https)
@@ -6026,6 +6546,40 @@ def mesh_routes():
         message += ('  Routes still need approving in the Tailscale admin '
                     'console before peers can use them.')
     return jsonify({'success': ok, 'message': message}), (200 if ok else 400)
+
+
+@app.route('/api/mesh/pi-connect/signin', methods=['POST'])
+def mesh_pi_connect_signin():
+    """Sign in to Raspberry Pi Connect with an auth key (non-interactive).
+
+    The operator generates a key at connect.raspberrypi.com and pastes it; we
+    run `rpi-connect signin -auth-key` for the login user (enabling linger so it
+    works headless). No browser device-flow, no terminal. The key is never
+    logged or echoed back.
+    """
+    if not mesh_available:
+        return jsonify({'success': False, 'error': 'mesh_manager unavailable'}), 503
+    data = request.get_json(silent=True) or {}
+    auth_key = (data.get('auth_key') or '').strip()
+    if not auth_key:
+        return jsonify({'success': False, 'message': 'An auth key is required.'}), 400
+    r = mesh_manager.pi_connect_signin(auth_key)
+    return jsonify({'success': bool(r.get('ok')),
+                    'signed_in': bool(r.get('signed_in')),
+                    'message': r.get('detail') or r.get('error') or ''}), \
+        (200 if r.get('ok') else 400)
+
+
+@app.route('/api/mesh/pi-connect/signout', methods=['POST'])
+def mesh_pi_connect_signout():
+    """Sign out of Raspberry Pi Connect on this node."""
+    if not mesh_available:
+        return jsonify({'success': False, 'error': 'mesh_manager unavailable'}), 503
+    r = mesh_manager.pi_connect_signout()
+    return jsonify({'success': bool(r.get('ok')),
+                    'signed_in': bool(r.get('signed_in')),
+                    'message': r.get('detail') or r.get('error') or ''}), \
+        (200 if r.get('ok') else 400)
 
 
 @app.route('/api/rusense/geofence', methods=['GET'])
@@ -6659,6 +7213,14 @@ PWN_INSTALL_SCRIPT = os.path.join(shared_data.currentdir, 'scripts', 'install_pw
 PWN_SERVICE_FILE = '/etc/systemd/system/pwnagotchi.service'
 PWN_CONFIG_FILE = '/etc/pwnagotchi/config.toml'
 PWN_LAUNCHER_PATH = '/usr/bin/pwnagotchi-launcher'
+# Bettercap service layer that Pwnagotchi mode drives over its REST API. Without
+# these, a swap to Pwnagotchi hangs forever on "waiting for bettercap API to be
+# available ..." (GitHub #896), so the health check treats them as critical.
+PWN_BETTERCAP_SERVICE_FILE = '/etc/systemd/system/bettercap.service'
+PWN_BETTERCAP_LAUNCHER_PATH = '/usr/bin/bettercap-launcher'
+# monstart/monstop create the mon0 monitor interface the launcher/caplet bind to.
+PWN_MONSTART_PATH = '/usr/bin/monstart'
+PWN_MONSTOP_PATH = '/usr/bin/monstop'
 # One-shot boot flags written by the Pwnagotchi web UI (MANU/AUTO buttons) or by
 # Ragnar. The launcher consumes them on read. The persistent file keeps every
 # Pwnagotchi launch in manual mode until the Ragnar toggle is turned off.
@@ -7169,7 +7731,26 @@ _PWN_COMPONENT_SPEC = (
     ('launcher', 'pwnagotchi-launcher wrapper', True),
     ('binary', 'pwnagotchi executable', True),
     ('runtime', 'pwnagotchi + pydrive2 import (launches without exit-code)', True),
+    # Bettercap service layer. Pwnagotchi does not sniff Wi-Fi itself — it drives
+    # a local bettercap over its REST API and blocks forever on "waiting for
+    # bettercap API to be available ..." until that API answers, so a missing
+    # service layer is a swap-blocking critical gap even though every
+    # pwnagotchi-side piece above reads healthy (GitHub #896).
+    ('bettercap_binary', 'bettercap executable', True),
+    ('bettercap_service', 'bettercap.service unit (serves the API Pwnagotchi waits on)', True),
+    ('bettercap_launcher', 'bettercap-launcher wrapper (creates mon0 + runs bettercap)', True),
+    ('monitor_scripts', 'monstart/monstop monitor-interface helpers', True),
 )
+
+
+def _pwn_bettercap_binary_ok() -> bool:
+    """True when a bettercap executable the launcher can exec is present."""
+    if shutil.which('bettercap'):
+        return True
+    return any(
+        os.path.isfile(p) and os.access(p, os.X_OK)
+        for p in ('/usr/bin/bettercap', '/usr/local/bin/bettercap')
+    )
 
 
 def _pwnagotchi_component_health() -> dict:
@@ -7195,6 +7776,14 @@ def _pwnagotchi_component_health() -> dict:
         'launcher': launcher_ok,
         'binary': binary_ok,
         'runtime': runtime_ok,
+        'bettercap_binary': _pwn_bettercap_binary_ok(),
+        'bettercap_service': os.path.exists(PWN_BETTERCAP_SERVICE_FILE),
+        'bettercap_launcher': (os.path.isfile(PWN_BETTERCAP_LAUNCHER_PATH)
+                               and os.access(PWN_BETTERCAP_LAUNCHER_PATH, os.X_OK)),
+        'monitor_scripts': all(
+            os.path.isfile(p) and os.access(p, os.X_OK)
+            for p in (PWN_MONSTART_PATH, PWN_MONSTOP_PATH)
+        ),
     }
 
     labels = {key: label for key, label, _critical in _PWN_COMPONENT_SPEC}
@@ -7762,6 +8351,7 @@ KIOSK_SERVICE_FILE = '/etc/systemd/system/ragnar-kiosk.service'
 KIOSK_INSTALL_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scripts', 'install_kiosk.sh')
 KIOSK_UNINSTALL_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scripts', 'uninstall_kiosk.sh')
 KIOSK_AUTOSTART_REL = '.config/autostart/ragnar-kiosk.desktop'
+KIOSK_WRAPPER_DST = '/usr/local/bin/ragnar-kiosk-run'
 
 
 def _kiosk_capability() -> tuple[bool, str]:
@@ -8050,6 +8640,75 @@ def _kiosk_install_and_start() -> bool:
     return False
 
 
+def _kiosk_enable_existing() -> bool:
+    """Start an already-installed service kiosk without re-running the installer.
+
+    Toggling the kiosk off now leaves it installed (see _kiosk_stop_disable), so
+    turning it back on is just `enable --now` — instant, no apt, no file regen.
+    Mirrors the service-start tail of _kiosk_install_and_start (reset the tripped
+    start limit, enable+start, then confirm it stayed up)."""
+    _kiosk_task_set(phase='starting')
+    _run_systemctl(['reset-failed', KIOSK_SERVICE])
+    enable_proc = _run_systemctl(['enable', '--now', KIOSK_SERVICE])
+    if enable_proc.returncode != 0:
+        err = enable_proc.stderr.strip() or enable_proc.stdout.strip() or 'unknown error'
+        logger.error(f"[kiosk] re-enable failed: {err}")
+        _kiosk_task_set(phase='failed',
+                        error=f'Could not start the kiosk service: {err}{_kiosk_failure_detail()}')
+        return False
+    time.sleep(5)
+    state = _systemctl_state_label('ragnar-kiosk')
+    if state not in ('active', 'activating'):
+        logger.error(f"[kiosk] service did not stay up after re-enable (state={state})")
+        _kiosk_task_set(
+            phase='failed',
+            error=f'The kiosk service started and then stopped ({state}).{_kiosk_failure_detail()}')
+        return False
+    logger.info("[kiosk] existing service re-enabled")
+    return True
+
+
+def _kiosk_stop_disable() -> bool:
+    """Turn the kiosk OFF without uninstalling it.
+
+    Toggling off used to run the full uninstaller — delete the systemd unit, the
+    wrapper, the tty1 autologin and the sudoers rule — which is heavy churn and
+    was the teardown that left the console black. Instead we stop it and leave it
+    installed but inert, so turning it back on is an instant `enable --now` with
+    no reinstall. A real removal is still available via scripts/uninstall_kiosk.sh
+    (with --purge for the apt packages)."""
+    _kiosk_task_set(phase='stopping')
+    # Close any running kiosk chromium + its on-screen exit-button helper.
+    subprocess.run(['sudo', 'pkill', '-f', 'ragnar-kiosk-chromium'],
+                   capture_output=True, timeout=10, check=False)
+    subprocess.run(['sudo', 'pkill', '-f', 'ragnar_kiosk_exit_button.py'],
+                   capture_output=True, timeout=10, check=False)
+    mode = _kiosk_mode()
+    if mode == 'service':
+        # Stop + disable: no run now, no start on boot, but the unit/wrapper/
+        # xorg.conf/autologin all stay on disk. Then switch the display off the
+        # kiosk's now-dead tty7 back to the tty1 console, so "off" lands on the
+        # CLI instead of a black screen.
+        _run_systemctl(['disable', '--now', KIOSK_SERVICE])
+        subprocess.run(
+            ['sudo', '-n', 'sh', '-c',
+             'command -v chvt >/dev/null 2>&1 && chvt 1 2>/dev/null || true'],
+            capture_output=True, timeout=10, check=False)
+        logger.info("[kiosk] service stopped and disabled (left installed)")
+        return True
+    if mode == 'autostart':
+        # No service to disable — the per-user .desktop entry is what relaunches
+        # the kiosk on each login, so remove just those (keep the wrapper and the
+        # apt packages). The live session's chromium was already killed above.
+        for p in _kiosk_autostart_paths():
+            subprocess.run(['sudo', '-n', 'rm', '-f', p],
+                           capture_output=True, timeout=10, check=False)
+            logger.info(f"[kiosk] removed autostart entry {p}")
+        return True
+    logger.info("[kiosk] disable requested but no kiosk is installed")
+    return True
+
+
 def _dispatch_kiosk_change(prev_enabled: bool, new_enabled: bool, settings_changed: bool) -> None:
     """Background worker: install/start/stop the kiosk to match config.
     Handles both modes (autostart .desktop entry on Pi OS Desktop, systemd
@@ -8057,19 +8716,22 @@ def _dispatch_kiosk_change(prev_enabled: bool, new_enabled: bool, settings_chang
     _kiosk_task_set(busy=True, phase='starting', error=None, started=time.time())
     try:
         if new_enabled and not prev_enabled:
-            _kiosk_install_and_start()
+            # Fast path: a service kiosk left installed-but-disabled (the new
+            # "off" keeps it on disk) just needs re-enabling — instant, no apt,
+            # no file regen. Guard on the wrapper existing too, so a partial
+            # install falls through to the self-healing full installer.
+            if (not settings_changed
+                    and _kiosk_mode() == 'service'
+                    and os.path.exists(KIOSK_WRAPPER_DST)):
+                _kiosk_enable_existing()
+            else:
+                _kiosk_install_and_start()
         elif prev_enabled and not new_enabled:
-            _kiosk_task_set(phase='removing')
-            # Kill any running kiosk chromium first (autostart mode)
-            subprocess.run(['sudo', 'pkill', '-f', 'ragnar-kiosk-chromium'],
-                           capture_output=True, timeout=10, check=False)
-            # Tear down both possible artifacts via the uninstaller script
-            logger.info(f"[kiosk] running uninstaller: {KIOSK_UNINSTALL_SCRIPT}")
-            subprocess.run(
-                ['sudo', 'bash', KIOSK_UNINSTALL_SCRIPT],
-                capture_output=True, text=True, timeout=300, check=False
-            )
-            logger.info("[kiosk] kiosk removed")
+            # Turn off WITHOUT uninstalling: stop + disable (service) or drop the
+            # autostart entry (desktop), leaving everything else installed so the
+            # next enable is instant. A full removal stays available via
+            # scripts/uninstall_kiosk.sh.
+            _kiosk_stop_disable()
         elif new_enabled and settings_changed:
             _kiosk_task_set(phase='restarting')
             mode = _kiosk_mode()
@@ -8205,15 +8867,25 @@ def _execute_pwn_mode_switch(target_mode: str) -> None:
         # the sequence in its own transient cgroup, fully outside ragnar.service,
         # so it survives ragnar's cgroup teardown.
         try:
+            # Gate only the first start on ragnar actually stopping (so pwnagotchi
+            # never fights ragnar for the display/GPIO), then run every start
+            # best-effort with `;`/`|| true`. Chaining the starts with `&&` used
+            # to leave the box in BOTH modes down: if `start bettercap` exit-coded
+            # (e.g. the unit was missing — GitHub #896), the `&&` short-circuited
+            # and pwnagotchi.service never started, stranding a stopped ragnar.
+            # bettercap is ordered first because pwnagotchi connects to its API,
+            # but pwnagotchi's launcher waits/retries for that API, so starting
+            # pwnagotchi even if bettercap lagged is safe.
             subprocess.Popen(
                 ['systemd-run', '--no-block', '--collect',
                  '--unit=ragnar-to-pwnagotchi-swap',
                  'bash', '-c',
-                 'systemctl stop ragnar.service'
-                 ' && python3 -OO /home/ragnar/Ragnar/wipe_epd.py 2>/dev/null; true'
-                 ' && systemctl start bettercap.service'
-                 ' && systemctl start pwnagotchi.service'
-                 ' && systemctl start ragnar-swap-button.service'],
+                 'systemctl stop ragnar.service && {'
+                 ' python3 -OO /home/ragnar/Ragnar/wipe_epd.py 2>/dev/null || true;'
+                 ' systemctl start bettercap.service || true;'
+                 ' systemctl start pwnagotchi.service || true;'
+                 ' systemctl start ragnar-swap-button.service || true;'
+                 ' }'],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -10178,10 +10850,10 @@ def wifi_config_alt():
 
 
 def _any_sdr_present():
-    """True if a HackRF or RTL-SDR is currently detected. Uses each backend's
-    status() (which reports from cache while a capture streams, so this never
-    knocks a running sweep off the USB bus). Best-effort — any probe error
-    reads as 'not present'."""
+    """True if a HackRF, RTL-SDR or ESP-SDR is currently detected. Uses each
+    backend's status() (which reports from cache while a capture streams, so
+    this never knocks a running sweep off the USB bus). Best-effort — any probe
+    error reads as 'not present'."""
     try:
         import sdr_spectrum
         if bool((sdr_spectrum.status().get('detect') or {}).get('available')):
@@ -10194,31 +10866,30 @@ def _any_sdr_present():
             return True
     except Exception:
         pass
+    try:
+        import esp_sdr
+        if bool((esp_sdr.status().get('detect') or {}).get('available')):
+            return True
+    except Exception:
+        pass
     return False
 
 
-# RF Waterfall page — real HackRF + RTL-SDR waterfall, with a synthetic demo
-# fallback. Reached from the "RF Waterfall page" button in the WiFi Spectrum
-# Analyzer (which appears once a radio is detected), or directly.
+# RF Waterfall page — real HackRF + RTL-SDR + ESP-SDR waterfall, with a synthetic
+# demo fallback. Reached from the always-visible "RF Waterfall page" button in
+# Signal Intelligence, or directly.
 @app.route('/rf-waterfall')
 @app.route('/demo/rf-waterfall')  # back-compat alias
 def rf_waterfall_page():
-    """Serve the RF Waterfall page.
+    """Serve the RF Waterfall page — always, radio or not.
 
     Each scope streams true RF when its radio is connected (HackRF via
-    /api/net/sdr/*, RTL-SDR via /api/net/rtl/*) and falls back to a synthetic
-    feed while the "Enable RF Waterfall demo" config toggle (``sdr_demo``) is
-    on. The page is served when the demo toggle is on, or when a radio is
-    present (so the analyzer's button always lands somewhere), otherwise it
-    404s so it stays out of sight. Env ``RAGNAR_SDR_DEMO=1`` forces it on.
+    /api/net/sdr/*, RTL-SDR via /api/net/rtl/*, ESP-SDR via /api/net/esp/*).
+    A panel whose radio is absent collapses on the page itself (and shows a
+    synthetic feed only while the "RF Waterfall demo" toggle, ``sdr_demo``, is
+    on), so the page no longer needs to hide behind device detection.
     Login is required (the route is not in the auth whitelist).
     """
-    env = os.environ.get('RAGNAR_SDR_DEMO', '').strip().lower()
-    enabled = (bool(shared_data.config.get('sdr_demo'))
-               or env in ('1', 'true', 'yes', 'on')
-               or _any_sdr_present())
-    if not enabled:
-        return ('Not Found', 404)
     return _no_store(make_response(send_from_directory('demos', 'rf_waterfall.html')))
 
 
@@ -10439,7 +11110,12 @@ def get_status():
 def get_config():
     """Get current configuration"""
     try:
-        return jsonify(shared_data.config)
+        cfg = dict(shared_data.config)
+        # Reflect the ACTUAL running mode (which entrypoint the service booted)
+        # so the Display selector can show "Headless" vs a driver accurately,
+        # regardless of what epd_type is stored. Computed, never persisted here.
+        cfg['display_enabled'] = not bool(getattr(shared_data, 'headless_mode', False))
+        return jsonify(cfg)
     except Exception as e:
         logger.error(f"Error getting config: {e}")
         return jsonify({'error': str(e)}), 500
@@ -10499,10 +11175,19 @@ def _apply_config_update(data):
         # where the config stores a driver ("epd2in13_V4"), so comparing the raw
         # value would read as a change on every save.
         restart_keys_changed = set()
+        headless_requested = False
         if epd_type_present:
-            from shared import resolve_epd_type
-            raw_epd = data['epd_type']
-            data['epd_type'] = resolve_epd_type(raw_epd, shared_data.config.get('epd_type'))
+            raw_epd = str(data['epd_type']).strip().lower()
+            if raw_epd in ('headless', 'none', ''):
+                # Switch OFF any display — back to the headless entrypoint. Keep
+                # the stored driver so re-enabling remembers it; just drop the
+                # key from this update so it isn't treated as a driver change.
+                headless_requested = True
+                epd_type_present = False
+                data.pop('epd_type', None)
+            else:
+                from shared import resolve_epd_type
+                data['epd_type'] = resolve_epd_type(data['epd_type'], shared_data.config.get('epd_type'))
         for key in CONFIG_RESTART_REQUIRED_KEYS:
             if key in data and data[key] != shared_data.config.get(key):
                 restart_keys_changed.add(key)
@@ -10615,16 +11300,39 @@ def _apply_config_update(data):
 
         # Only a key whose value is bound at process start, and that actually
         # CHANGED, is worth a restart. Everything else applies live.
-        if restart_keys_changed:
+        if headless_requested:
+            # Only bounce if we're actually in display mode now.
+            if not bool(getattr(shared_data, 'headless_mode', False)):
+                response['restart_required'] = True
+                response['restart_reason'] = 'display disabled'
+                ok, dmsg = _apply_display_mode('headless')
+                response['message'] = ('Switching to headless mode…'
+                                       if ok else f'Could not switch to headless: {dmsg}')
+            else:
+                response['message'] = 'Already headless — no display to disable.'
+        elif restart_keys_changed:
             changed = ', '.join(sorted(restart_keys_changed))
             response['restart_required'] = True
             response['restart_reason'] = changed
-            response['message'] = f'{changed} changed - restarting Ragnar service...'
-            def _delayed_restart():
-                time.sleep(2)  # Give the response time to reach the client
-                logger.info(f"Restarting Ragnar service for config change: {changed}")
-                subprocess.Popen(['systemctl', 'restart', 'ragnar.service'])
-            threading.Thread(target=_delayed_restart, daemon=True).start()
+            if 'epd_type' in restart_keys_changed:
+                # A changed display driver must switch the service onto the
+                # DISPLAY entrypoint (Ragnar.py), not just restart — on a box
+                # running the headless entrypoint a plain restart would come
+                # back up headless with the panel dark. _apply_display_mode
+                # rewrites the unit and schedules its own detached restart.
+                new_epd = shared_data.config.get('epd_type')
+                ok, dmsg = _apply_display_mode('display', new_epd, validate=False)
+                response['message'] = (
+                    f'Display set to {new_epd} — switching to display mode…'
+                    if ok else f'Could not switch to display mode: {dmsg}')
+                # Any other restart-bound keys are covered by the same restart.
+            else:
+                response['message'] = f'{changed} changed - restarting Ragnar service...'
+                def _delayed_restart():
+                    time.sleep(2)  # Give the response time to reach the client
+                    logger.info(f"Restarting Ragnar service for config change: {changed}")
+                    subprocess.Popen(['systemctl', 'restart', 'ragnar.service'])
+                threading.Thread(target=_delayed_restart, daemon=True).start()
         else:
             logger.debug("Config saved with no restart-bound change — applying live")
 
@@ -14153,6 +14861,12 @@ def wardriving_status():
         status = engine.get_status()
         status['enabled'] = True
         status['allow_backfill'] = bool(shared_data.config.get('wardriving_allow_backfill', False))
+        # Live ADS-B tally for the wardriving status card (cheap; no lsusb).
+        try:
+            import adsb
+            status['adsb'] = adsb.live_status()
+        except Exception:
+            pass
         return jsonify(status)
     except Exception as e:
         logger.error(f"Wardriving status error: {e}")
@@ -15752,6 +16466,370 @@ def wardrift_dashboard():
 
 
 # ---------------------------------------------------------------------------
+# ADS-B -> Wardrift (Aircraft Watch). The radar (adsb.py) logs the UNIQUE
+# aircraft seen each UTC day; this uploads that day's SBS log to Wardrift
+# through the SAME signed-in /v1/wardrive/logs endpoint the wardrive route uses
+# (Wardrift auto-detects the format and credits aircraft without making a ground
+# route). Each ICAO counts once per account per UTC day across uploads, so the
+# day's growing SBS can be re-sent safely. Like the wardrive one: a manual
+# upload button, an optional auto-upload (periodic while receiving), and a
+# Pushover summary once the upload has a final verdict.
+# ---------------------------------------------------------------------------
+_ADSB_WARDRIFT_LOCK = threading.Lock()
+_adsb_wardrift = {'worker': None, 'next_run': 0.0, 'started': 0.0}
+
+
+def _adsb_state_path():
+    import adsb
+    return os.path.join(adsb._DATA_DIR, 'wardrift.json')
+
+
+def _adsb_state_load():
+    try:
+        with open(_adsb_state_path()) as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _adsb_state_save(st):
+    try:
+        import adsb
+        os.makedirs(adsb._DATA_DIR, exist_ok=True)
+        tmp = _adsb_state_path() + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(st, f)
+        os.replace(tmp, _adsb_state_path())
+    except Exception as e:
+        logger.error(f"adsb wardrift state save failed: {e}")
+
+
+def _adsb_record(day, **fields):
+    with _ADSB_WARDRIFT_LOCK:
+        st = _adsb_state_load()
+        day_rec = st.setdefault(day, {})
+        day_rec.update(fields)
+        day_rec['at'] = time.time()
+        _adsb_state_save(st)
+        return dict(day_rec)
+
+
+def _upload_wardrift_adsb(sbs_text, token):
+    """POST the day's SBS log to Wardrift. Same async flow as the wardrive route:
+    a 202 with an upload_id that is judged a few minutes later."""
+    import requests
+    r = requests.post(_wardrift_base() + '/v1/wardrive/logs',
+                      headers={'Authorization': f'Bearer {token}'},
+                      files={'file': ('ragnar_adsb.sbs', sbs_text, 'text/plain')},
+                      timeout=180)
+    body = _wardrift_body(r)
+    if r.status_code == 401:
+        return {'ok': False, 'status': 401, 'error': 'Wardrift session expired - sign in again',
+                'response': body}
+    if r.status_code == 409 and body.get('error') == 'duplicate_route':
+        return {'ok': True, 'status': 409, 'duplicate': True, 'response': body}
+    return {'ok': bool(r.ok and (body.get('accepted', r.ok) or body.get('upload_id'))),
+            'status': r.status_code, 'response': body}
+
+
+def _adsb_upload_summary(day, rec, count):
+    """(title, message) for an ADS-B upload result."""
+    from datetime import datetime
+    try:
+        nice = datetime.strptime(day, '%Y%m%d').strftime('%d %b')
+    except ValueError:
+        nice = day
+    state = rec.get('state')
+    head = f'ADS-B {nice} · {count} aircraft today'
+    if state == 'ok':
+        credited = rec.get('aircraft')
+        extra = [f"{credited} credited" if credited else "0 credited (none new today)"]
+        if rec.get('exp'):
+            extra.append(f"+{rec['exp']} XP")
+        if rec.get('currency'):
+            extra.append(f"+{rec['currency']} currency")
+        title = 'Ragnar — ADS-B uploaded'
+        body = head + '\n' + ', '.join(extra)
+    elif state == 'duplicate':
+        title = 'Ragnar — ADS-B uploaded'
+        body = head + '\nAlready on Wardrift (no new credit)'
+    else:
+        title = 'Ragnar — ADS-B upload failed'
+        body = head + '\n' + (rec.get('message') or 'upload failed')
+    return title, body
+
+
+def _adsb_wardrift_follow(day, upload_id, token, notify):
+    """Poll the Wardrift upload to its verdict, store it, and (for auto-uploads)
+    send a Pushover summary. Runs in a background thread."""
+    import requests
+    import adsb
+    deadline = time.time() + 45 * 60
+    result = None
+    while time.time() < deadline:
+        time.sleep(20)
+        try:
+            r = requests.get(_wardrift_base() + '/v1/wardrive/uploads/' + upload_id,
+                             headers={'Authorization': f'Bearer {token}'}, timeout=20)
+            body = _wardrift_body(r)
+        except Exception:
+            continue
+        status = body.get('status')
+        if status in ('pending', 'processing'):
+            continue
+        if status == 'succeeded':
+            res = body.get('result') or {}
+            cap = res.get('capture') or {}
+            credited = int(res.get('adsb_count') or 0)          # eligible aircraft that counted today
+            detected = cap.get('aircraft_count')                # parsed from the file
+            if detected is None:
+                detected = res.get('accepted_signals')
+            result = _adsb_record(day, state='ok', upload_id=upload_id,
+                                  aircraft=credited, detected=detected,
+                                  exp=int(res.get('adsb_exp') or res.get('awarded_exp') or 0),
+                                  currency=int(res.get('adsb_currency') or res.get('awarded_currency') or 0),
+                                  message='')
+        elif status == 'failed':
+            result = _adsb_record(day, state='failed', upload_id=upload_id,
+                                  message=str(body.get('error') or 'Wardrift rejected the upload')[:300])
+        else:
+            result = _adsb_record(day, state='unknown', upload_id=upload_id,
+                                  message=f'unexpected status: {status}')
+        break
+    else:
+        result = _adsb_record(day, state='unknown', upload_id=upload_id,
+                              message='Wardrift never reported a result')
+    if notify and result is not None:
+        try:
+            po = _rusense_pushover()
+            if po is not None:
+                title, msg = _adsb_upload_summary(day, result, adsb.day_icao_count(day))
+                po.notify_adsb_upload(msg, title=title)
+        except Exception as e:
+            logger.error(f"adsb upload pushover failed: {e}")
+
+
+def _adsb_wardrift_upload(day=None, reason='manual', notify=None):
+    """Build the day's SBS and upload it. Returns a result dict. For auto-uploads
+    (reason='auto') a Pushover summary is sent once the verdict is in."""
+    import adsb
+    day = day or adsb._utc_today()
+    if notify is None:
+        notify = (reason == 'auto')
+    token = (shared_data.config.get('wardrift_session_token') or '').strip()
+    if not token:
+        return {'ok': False, 'error': 'Not signed in to Wardrift'}
+    count = adsb.day_icao_count(day)
+    if count == 0:
+        _adsb_record(day, state='skipped', message='No aircraft logged for this day')
+        return {'ok': False, 'error': 'No aircraft logged for this day', 'count': 0}
+    sbs = adsb.export_sbs(day)
+    res = _upload_wardrift_adsb(sbs, token)
+    body = res.get('response') or {}
+    if not res.get('ok'):
+        rec = _adsb_record(day, state='failed', count=count,
+                           message=res.get('error') or body.get('message') or f"HTTP {res.get('status')}")
+        return {'ok': False, 'error': rec['message'], 'count': count}
+    if res.get('duplicate'):
+        _adsb_record(day, state='duplicate', count=count)
+        return {'ok': True, 'duplicate': True, 'count': count}
+    upload_id = body.get('upload_id')
+    _adsb_record(day, state='processing', count=count, upload_id=upload_id, uploaded_count=count)
+    if upload_id:
+        threading.Thread(target=_adsb_wardrift_follow, args=(day, upload_id, token, notify),
+                         daemon=True, name='adsb-wardrift-follow').start()
+    return {'ok': True, 'processing': True, 'count': count, 'upload_id': upload_id}
+
+
+def _adsb_wardrift_worker():
+    import adsb
+    while True:
+        try:
+            cfg_on = bool(shared_data.config.get('adsb_wardrift_auto'))
+            try:
+                interval = max(5, int(shared_data.config.get('adsb_wardrift_interval_min', 30)))
+            except (TypeError, ValueError):
+                interval = 30
+            running = bool(adsb.status().get('running'))
+            if cfg_on and running and time.time() >= _adsb_wardrift['next_run']:
+                day = adsb._utc_today()
+                count = adsb.day_icao_count(day)
+                last = (_adsb_state_load().get(day) or {}).get('uploaded_count', 0)
+                if count > last and (shared_data.config.get('wardrift_session_token') or '').strip():
+                    logger.info(f"adsb auto-upload: {count} aircraft for {day} (was {last})")
+                    _adsb_wardrift_upload(day, reason='auto')
+                _adsb_wardrift['next_run'] = time.time() + interval * 60
+        except Exception as e:
+            logger.error(f"adsb wardrift worker error: {e}")
+        time.sleep(30)
+
+
+def _adsb_wardrift_start_worker():
+    w = _adsb_wardrift['worker']
+    if w is None or not w.is_alive():
+        _adsb_wardrift['worker'] = threading.Thread(target=_adsb_wardrift_worker, daemon=True,
+                                                    name='adsb-wardrift')
+        _adsb_wardrift['worker'].start()
+
+
+# --- ADS-B auto-start with wardriving ---------------------------------------
+# When the operator opts in, start the ADS-B radar as a wardrive begins and stop
+# it when the drive ends. The RTL-SDR is a single resource shared with the
+# sub-GHz tools, so we free it first (same hand-off as /api/net/adsb/start) and
+# only auto-stop a radar WE started — never one the operator started by hand.
+_adsb_autostarted = {'on': False}
+
+
+def _free_rtl_sdr_for_adsb():
+    """Best-effort: release the RTL-SDR from any sub-GHz consumer so dump1090
+    can open it. Each stop is optional — a missing module is simply skipped."""
+    for mod, fns in (('rtl_sdr', ('power_stop', 'ism_stop')), ('pager', ('stop',)),
+                     ('acars', ('stop',)), ('vdl2', ('stop',)), ('radio', ('stop',)),
+                     ('vor', ('stop',)), ('aprs', ('stop',))):
+        try:
+            m = __import__(mod)
+            for fn in fns:
+                try:
+                    getattr(m, fn)()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+def _adsb_autostart_on_wardrive_start(_session_id):
+    if not shared_data.config.get('wardriving_autostart_adsb'):
+        return
+    try:
+        import adsb
+        if adsb.live_status().get('running'):
+            return                      # already on (operator-started) — don't claim it
+        _free_rtl_sdr_for_adsb()
+        res = adsb.start()
+        if res.get('ok'):
+            _adsb_autostarted['on'] = True
+            logger.info("ADS-B radar auto-started with wardriving")
+        else:
+            logger.warning(f"ADS-B auto-start failed: {res.get('error')}")
+    except Exception as e:
+        logger.error(f"ADS-B auto-start error: {e}")
+
+
+def _adsb_autostop_on_wardrive_finish(_session_id):
+    if not _adsb_autostarted.get('on'):
+        return                          # we didn't start it — leave it alone
+    _adsb_autostarted['on'] = False
+    try:
+        import adsb
+        adsb.stop()
+        logger.info("ADS-B radar auto-stopped with wardriving")
+    except Exception as e:
+        logger.error(f"ADS-B auto-stop error: {e}")
+
+
+try:
+    import wardriving as _wardriving_mod
+    if _adsb_autostart_on_wardrive_start not in _wardriving_mod.SESSION_STARTED_HOOKS:
+        _wardriving_mod.SESSION_STARTED_HOOKS.append(_adsb_autostart_on_wardrive_start)
+    if _adsb_autostop_on_wardrive_finish not in _wardriving_mod.SESSION_FINISHED_HOOKS:
+        _wardriving_mod.SESSION_FINISHED_HOOKS.append(_adsb_autostop_on_wardrive_finish)
+except Exception as _adsb_hook_exc:  # pragma: no cover
+    logger.error(f"ADS-B auto-start hook registration failed: {_adsb_hook_exc}")
+
+
+@app.route('/api/adsb/wardrift', methods=['GET', 'POST'])
+def adsb_wardrift():
+    """ADS-B -> Wardrift status / settings.
+
+    GET  -> signed-in state, today's unique aircraft, recent per-day results,
+            and the auto-upload settings.
+    POST -> save auto (bool) / interval_min (int). Uses the shared Wardrift
+            sign-in; there is no separate key.
+    """
+    try:
+        import adsb
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            if 'auto' in data:
+                shared_data.config['adsb_wardrift_auto'] = bool(data['auto'])
+            if 'interval_min' in data:
+                try:
+                    shared_data.config['adsb_wardrift_interval_min'] = min(max(int(data['interval_min']), 5), 1440)
+                except (TypeError, ValueError):
+                    return jsonify({'error': 'interval_min must be minutes (5-1440)'}), 400
+            if 'autostart' in data:
+                shared_data.config['wardriving_autostart_adsb'] = bool(data['autostart'])
+            shared_data.save_config()
+            if shared_data.config.get('adsb_wardrift_auto'):
+                _adsb_wardrift['next_run'] = 0.0
+                _adsb_wardrift_start_worker()
+        today = adsb._utc_today()
+        st = _adsb_state_load()
+        days = []
+        for d in adsb.available_days()[:7]:
+            rec = st.get(d) or {}
+            days.append({'day': d, 'aircraft': adsb.day_icao_count(d),
+                         'state': rec.get('state'), 'message': rec.get('message', ''),
+                         'exp': rec.get('exp'), 'at': rec.get('at')})
+        return jsonify({
+            'signed_in': bool((shared_data.config.get('wardrift_session_token') or '').strip()),
+            'username': shared_data.config.get('wardrift_username', ''),
+            'today': today,
+            'today_aircraft': adsb.day_icao_count(today),
+            'auto': bool(shared_data.config.get('adsb_wardrift_auto', False)),
+            'interval_min': int(shared_data.config.get('adsb_wardrift_interval_min', 30)),
+            'autostart': bool(shared_data.config.get('wardriving_autostart_adsb', False)),
+            'pushover_ready': _pushover_ready(),
+            'days': days,
+        })
+    except Exception as e:
+        logger.error(f"adsb wardrift config error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/adsb/wardrift/upload', methods=['POST'])
+def adsb_wardrift_upload():
+    """Upload a day's aircraft to Wardrift (body: {"day": "YYYYMMDD"} optional)."""
+    try:
+        import adsb
+        data = request.get_json(silent=True) or {}
+        day = str(data.get('day') or adsb._utc_today())
+        if not re.match(r'^\d{8}$', day):
+            return jsonify({'error': 'day must be YYYYMMDD'}), 400
+        res = _adsb_wardrift_upload(day, reason='manual')
+        if not res.get('ok'):
+            code = 422 if res.get('count') == 0 else (401 if 'signed in' in (res.get('error') or '') else 502)
+            return jsonify({'success': False, **res}), code
+        return jsonify({'success': True, **res})
+    except Exception as e:
+        logger.error(f"adsb wardrift upload error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/adsb/export')
+def adsb_export():
+    """Download a day's aircraft as an SBS/BaseStation log (?day=YYYYMMDD)."""
+    try:
+        import adsb
+        day = str(request.args.get('day') or adsb._utc_today())
+        if not re.match(r'^\d{8}$', day):
+            return jsonify({'error': 'day must be YYYYMMDD'}), 400
+        sbs = adsb.export_sbs(day)
+        if not sbs:
+            return jsonify({'error': 'No aircraft logged for this day'}), 404
+        from flask import Response
+        return Response(sbs, mimetype='text/plain', headers={
+            'Content-Disposition': f'attachment; filename="ragnar_adsb_{day}.sbs"'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+if shared_data.config.get('adsb_wardrift_auto'):
+    _adsb_wardrift_start_worker()
+
+
+
+# ---------------------------------------------------------------------------
 # Wardrift mesh reporter - Ragnar as the uplink for a Meshtastic node.
 #
 # Stock Meshtastic firmware can't call Wardrift itself, so Ragnar reads the
@@ -16128,6 +17206,111 @@ def wardriving_gps_enable():
     except Exception as e:
         logger.error(f"Wardriving GPS enable error: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+_piglet_sync_port = None
+_piglet_sync_lock = threading.Lock()
+
+
+def _piglet_sync_on_port(port, hello_wait_s=20.0):
+    """Sync one port directly (engine not holding it). One sync at a time,
+    under a 'piglet-sync' serial claim. Returns the summary, or None when
+    another sync is already running."""
+    global _piglet_sync_port
+    import piglet_sync
+    import serial_claims
+    engine = _get_wardriving_engine()
+    with _piglet_sync_lock:
+        if _piglet_sync_port:
+            return None
+        _piglet_sync_port = port
+    serial_claims.register('piglet-sync', lambda: _piglet_sync_port)
+    try:
+        engine.piglet_sync_status = {'state': 'running', 'port': port, 'at': time.time()}
+        try:
+            summary = piglet_sync.sync_port(port, engine.data_dir, hello_wait_s=hello_wait_s)
+        except Exception as e:
+            summary = {'supported': False, 'error': str(e)}
+        if summary.get('supported'):
+            summary.update({'state': 'done', 'port': port, 'at': time.time()})
+            engine.piglet_sync_status = summary
+            if summary.get('imported'):
+                logger.info(f"Piglet sync on {port}: {len(summary['imported'])} drive(s) imported")
+        return summary
+    finally:
+        _piglet_sync_port = None
+        serial_claims.unregister('piglet-sync')
+
+
+def _piglet_port_busy(port):
+    """Held by the wardriving listener, another component, or a sync."""
+    import serial_claims
+    engine = _get_wardriving_engine()
+    if engine._running:
+        # The wardriving USB monitor attaches new ESP32s itself and syncs a
+        # Piglet on connect; opening the port here too would split its stream.
+        return True
+    return bool(_piglet_sync_port) or serial_claims.is_claimed(port, exclude_owner='piglet-sync')
+
+
+@app.route('/api/wardriving/piglet/sync', methods=['GET', 'POST'])
+def wardriving_piglet_sync():
+    """Import a Piglet's solo-drive CSVs from its SD card over USB serial.
+
+    GET  → the last sync result.
+    POST → sync now: through the wardriving listener when it already holds
+           the Piglet, otherwise by opening each free Espressif USB port
+           until one answers the Piglet SerialSync protocol (firmware v2.60+).
+    A Piglet is also synced automatically when plugged in (PlugWatcher below).
+    """
+    try:
+        engine = _get_wardriving_engine()
+        if request.method == 'GET':
+            return jsonify(getattr(engine, 'piglet_sync_status', None) or {'state': 'idle'})
+        if engine._running:
+            ports = engine.request_piglet_sync()
+            if ports:
+                engine.piglet_sync_status = {'state': 'queued', 'port': ports[0], 'at': time.time()}
+                return jsonify({'queued': True, 'ports': ports})
+        if _piglet_sync_port:
+            return jsonify({'error': f'A sync is already running on {_piglet_sync_port}'}), 409
+        import glob as _g
+        import serial_claims
+        candidates = [p for p in sorted(_g.glob('/dev/ttyACM*') + _g.glob('/dev/ttyUSB*'))
+                      if engine._port_is_espressif(p) and not serial_claims.is_claimed(p)]
+        if not candidates:
+            return jsonify({'error': 'No free ESP32 USB port found — is the Piglet plugged in?'}), 404
+
+        def _worker():
+            for port in candidates:
+                summary = _piglet_sync_on_port(port)
+                if summary and summary.get('supported'):
+                    return
+            engine.piglet_sync_status = {
+                'state': 'error', 'at': time.time(),
+                'error': 'No Piglet answered (needs Piglet firmware v2.60+ with serial sync)'}
+
+        threading.Thread(target=_worker, daemon=True, name='piglet-sync').start()
+        return jsonify({'started': True, 'ports': candidates})
+    except Exception as e:
+        logger.error(f"Piglet sync error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+def _start_piglet_plug_watcher():
+    """Sync a Piglet the moment it's plugged in, wardriving or not."""
+    try:
+        import piglet_sync
+        piglet_sync.PlugWatcher(
+            enabled=lambda: bool(shared_data.config.get('wardriving_piglet_sync', True)),
+            busy=_piglet_port_busy,
+            run=_piglet_sync_on_port,
+        ).start()
+    except Exception as e:
+        logger.warning(f"Piglet plug-in watcher not started: {e}")
+
+
+_start_piglet_plug_watcher()
+
 
 @app.route('/api/wardriving/import', methods=['POST'])
 def wardriving_import_csv():
@@ -19232,11 +20415,19 @@ def network_threat_sweep():
         if _req_iface:
             try:
                 import wifi_analyzer as _wa
-                _valid = {i.get('iface') for i in _wa.list_wifi_interfaces()}
+                _valid = [i.get('iface') for i in _wa.list_wifi_interfaces()]
             except Exception:
-                _valid = set()
-            if _req_iface in _valid and re.match(r'^[a-zA-Z0-9._-]+$', _req_iface):
-                iface = _req_iface
+                _valid = []
+            # Hand the subprocess the interface name taken from the trusted
+            # system list (not the request string) so the command argument can
+            # never be attacker-controlled — CWE-78 allowlist. The request value
+            # is only ever compared, never passed through.
+            iface = next(
+                (name for name in _valid
+                 if name and name == _req_iface
+                 and re.match(r'^[a-zA-Z0-9._-]+$', name)),
+                iface,
+            )
 
         # Trigger a fresh scan
         subprocess.run(
@@ -19905,6 +21096,100 @@ def get_wifi_networks():
             'known': []
         }), 500
 
+# Display drivers that may be requested from the portal / web UI. Mirrors the
+# captive-portal dropdown and docs/ragnar-os ragnar.conf list. Used to validate
+# an operator-supplied value before it reaches set_display_mode.sh.
+_VALID_DISPLAY_DRIVERS = {
+    'epd2in13', 'epd2in13_V2', 'epd2in13_V3', 'epd2in13_V4', 'epd2in13b_V4',
+    'epd2in7', 'epd2in7_V2', 'epd2in9_V2', 'epd3in7', 'epd4in26',
+    'gc9a01', 'st7735s', 'ili9486', 'ili9488', 'whisplay', 'ssd1306', 'lcd1602',
+    'max7219_4panel', 'max7219_8panel',
+}
+
+DISPLAY_MODE_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'scripts', 'set_display_mode.sh')
+
+
+def _apply_display_mode(mode, epd_type=None, validate=True, restart=True):
+    """Switch ragnar.service between 'headless' and 'display' mode out-of-band.
+
+    Runs the shared helper (scripts/set_display_mode.sh) with --no-restart, then
+    schedules a DETACHED restart via a transient systemd timer. The timer is
+    owned by PID 1, outside ragnar.service's cgroup, so it survives this very
+    service being stopped — letting the current HTTP request return first.
+
+    `validate` strict-checks epd_type against the portal dropdown's known set
+    (use for untrusted operator input). The web UI passes a value already
+    normalised by resolve_epd_type, so it validates only the character set to
+    bar shell/path tricks, not the exact membership. Returns (ok, message).
+    """
+    if mode not in ('headless', 'display'):
+        return False, 'invalid display mode'
+    cmd = ['bash', DISPLAY_MODE_SCRIPT, mode]
+    if mode == 'display':
+        if not epd_type:
+            return False, 'no display driver given'
+        if validate and epd_type not in _VALID_DISPLAY_DRIVERS:
+            return False, f'unknown display driver: {epd_type!r}'
+        if not re.fullmatch(r'[A-Za-z0-9_]+', epd_type):
+            return False, f'invalid display driver name: {epd_type!r}'
+        cmd.append(epd_type)
+    cmd.append('--no-restart')
+    try:
+        subprocess.run(cmd, timeout=30, check=False)
+    except Exception as e:
+        logger.error(f"set_display_mode.sh failed: {e}")
+        return False, str(e)
+    if not restart:
+        # Persist-only: the unit + config are rewritten, but the service is not
+        # bounced. The new mode takes effect on the next start/reboot. Used when
+        # the caller is mid-flow (e.g. onboarding) and will restart/reboot later.
+        logger.info(f"Display mode -> {mode} ({epd_type or 'n/a'}); persisted, no restart")
+        return True, 'display mode persisted'
+    # Detached restart so this request can finish before the service bounces.
+    try:
+        subprocess.Popen(
+            ['systemd-run', '--on-active=3', '--timer-property=AccuracySec=200ms',
+             'systemctl', 'restart', 'ragnar.service'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        try:
+            subprocess.Popen(['systemctl', 'restart', '--no-block', 'ragnar.service'],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            logger.warning(f"Could not schedule service restart after display switch: {e}")
+    logger.info(f"Display mode -> {mode} ({epd_type or 'n/a'}); service restart scheduled")
+    return True, 'display mode switching'
+
+
+def _save_wifi_profile(ssid, password=None):
+    """Persist a NetworkManager Wi-Fi profile (autoconnect) BEFORE the live
+    connect attempt, so a flaky single-radio AP->client hand-off never loses the
+    operator's credentials — a reboot then auto-joins. Idempotent.
+    """
+    try:
+        exists = subprocess.run(['nmcli', '-t', '-f', 'NAME', 'con', 'show', ssid],
+                                capture_output=True, text=True, timeout=15).returncode == 0
+        if exists:
+            if password:
+                subprocess.run(['sudo', 'nmcli', 'con', 'modify', ssid,
+                                'wifi-sec.key-mgmt', 'wpa-psk', 'wifi-sec.psk', password],
+                               capture_output=True, timeout=15)
+            subprocess.run(['sudo', 'nmcli', 'con', 'modify', ssid,
+                            'connection.autoconnect', 'yes'], capture_output=True, timeout=15)
+        else:
+            cmd = ['sudo', 'nmcli', 'con', 'add', 'type', 'wifi', 'con-name', ssid,
+                   'ssid', ssid, 'connection.autoconnect', 'yes']
+            if password:
+                cmd += ['wifi-sec.key-mgmt', 'wpa-psk', 'wifi-sec.psk', password]
+            subprocess.run(cmd, capture_output=True, timeout=15)
+        logger.info(f"Saved Wi-Fi profile for '{ssid}' (autoconnect) before live connect")
+        return True
+    except Exception as e:
+        logger.warning(f"Could not pre-save Wi-Fi profile '{ssid}': {e}")
+        return False
+
+
 @app.route('/api/wifi/connect', methods=['POST'])
 def connect_wifi():
     """Connect to a Wi-Fi network"""
@@ -19917,19 +21202,33 @@ def connect_wifi():
         password = data.get('password')
         priority = data.get('priority', 1)
         save_network = data.get('save', True)
-        
+        # Optional: enable an attached display as part of onboarding (from the
+        # captive portal's "Attached display" dropdown). 'headless'/empty = leave
+        # as-is. Applied only after a successful connect, so the screen comes up
+        # showing the real IP — and restarts the service out-of-band (below).
+        req_display = (data.get('display') or 'headless').strip()
+
         wifi_manager = getattr(shared_data, 'ragnar_instance', None)
         if not wifi_manager or not hasattr(wifi_manager, 'wifi_manager'):
             return jsonify({'success': False, 'error': 'Wi-Fi manager not available'}), 503
-        
+
         # Log the connection attempt
         logger.info(f"API: Attempting to connect to WiFi network: {ssid}")
-        
+
         # Check if currently in AP mode
         was_in_ap_mode = wifi_manager.wifi_manager.ap_mode_active
         if was_in_ap_mode:
             logger.info(f"API: Currently in AP mode, will stop AP before connecting to {ssid}")
-        
+
+        # Persist BEFORE the live attempt so nothing is lost if the (single-radio)
+        # AP->client hand-off flakes: a reboot alone then joins Wi-Fi and comes up
+        # in display mode. 1) save the Wi-Fi profile (autoconnect); 2) persist the
+        # display choice without restarting yet (we're mid-request).
+        _save_wifi_profile(ssid, password)
+        want_display = bool(req_display and req_display != 'headless')
+        if want_display:
+            _apply_display_mode('display', req_display, restart=False)
+
         # Try to connect
         success = wifi_manager.wifi_manager.connect_to_network(ssid, password)
         
@@ -19942,12 +21241,49 @@ def connect_wifi():
             message = 'Connected successfully'
             if is_ap_client_request():
                 message = 'Connected successfully! Ragnar will now use this network. You can disconnect from this AP.'
+
+            # We're online — if a display was requested, bounce into display mode
+            # (out-of-band) so the panel shows the connected IP.
+            if want_display:
+                ok, dmsg = _apply_display_mode('display', req_display)
+                if ok:
+                    message += ' Your display will show the IP once it restarts.'
+                else:
+                    logger.warning(f"Display enable requested but failed: {dmsg}")
+        elif was_in_ap_mode or is_ap_client_request():
+            logger.error(f"API: Failed to connect to {ssid} (live) during AP onboarding. Credentials are saved; rebooting to let NetworkManager auto-join.")
+            # ONBOARDING ONLY. On a single-radio board the AP->client hand-off can
+            # flake: wlan0 was just taken back from hostapd. The Wi-Fi profile (and
+            # display choice) are already persisted, so a reboot frees wlan0 of AP
+            # leftovers and NetworkManager auto-connects the saved profile, coming
+            # up in the chosen mode. Schedule it detached so this response returns
+            # first. This path runs ONLY from the captive portal / AP mode — never
+            # when configuring Wi-Fi from a normally-reachable session.
+            message = ('Saved. The AP will close and Ragnar will reboot to join '
+                       f'"{ssid}"' + (' and start your display' if want_display else '') +
+                       '. Give it ~1 minute, then reach it at http://ragnar.local:8000'
+                       + (' or read the IP off the screen.' if want_display else '.'))
+            try:
+                subprocess.Popen(
+                    ['systemd-run', '--on-active=5', '--timer-property=AccuracySec=200ms',
+                     'systemctl', 'reboot'],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # A reboot is the recovery path, so report success to the portal.
+                success = True
+            except Exception as e:
+                logger.error(f"Could not schedule reboot after saving Wi-Fi: {e}")
+                message = (f'Saved "{ssid}", but could not auto-reboot. Power-cycle '
+                           'Ragnar and it will join the network on boot.')
         else:
-            logger.error(f"API: Failed to connect to {ssid}")
-            message = 'Connection failed. Please check the password and try again.'
-            if was_in_ap_mode:
-                message += ' Note: AP mode was stopped to attempt connection.'
-        
+            # Configuring Wi-Fi from a normally-reachable session (dashboard over
+            # ethernet / existing Wi-Fi), NOT the captive portal. Do NOT reboot the
+            # box on a failed join — that was the old behaviour and it looked like
+            # "it reboots instead of connecting". The profile is saved; surface the
+            # error so the operator can fix the password / check range and retry.
+            logger.error(f"API: Failed to connect to {ssid} (live). Profile saved; not rebooting (not an AP-onboarding flow).")
+            message = (f'Could not connect to "{ssid}". The Wi-Fi profile was saved — '
+                       'check the password and that the network is in range, then try again.')
+
         return jsonify({
             'success': success,
             'message': message
@@ -24286,6 +25622,7 @@ def list_files_api():
                 {'name': 'backups', 'is_directory': True, 'path': '/backups'},
                 {'name': 'uploads', 'is_directory': True, 'path': '/uploads'},
                 {'name': 'console_scripts', 'is_directory': True, 'path': '/console_scripts'},
+                {'name': 'engagement_playbooks', 'is_directory': True, 'path': '/engagement_playbooks'},
                 {'name': 'rubber-ducky', 'is_directory': True, 'path': '/rubber-ducky'}
             ])
         
@@ -24326,6 +25663,12 @@ def list_files_api():
             try:
                 actual_path = _resolve_legacy_path('/console_scripts',
                     os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'console_scripts'), path)
+            except ValueError:
+                return jsonify({'error': 'Invalid path'}), 400
+        elif path == '/engagement_playbooks' or path.startswith('/engagement_playbooks/'):
+            try:
+                actual_path = _resolve_legacy_path('/engagement_playbooks',
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'engagement_playbooks'), path)
             except ValueError:
                 return jsonify({'error': 'Invalid path'}), 400
         elif path == '/rubber-ducky' or path.startswith('/rubber-ducky/'):
@@ -24436,6 +25779,12 @@ def preview_file_api():
             try:
                 actual_path = _resolve_legacy_path('/console_scripts',
                     os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'console_scripts'), file_path)
+            except ValueError:
+                return jsonify({'error': 'Invalid path'}), 400
+        elif file_path == '/engagement_playbooks' or file_path.startswith('/engagement_playbooks/'):
+            try:
+                actual_path = _resolve_legacy_path('/engagement_playbooks',
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'engagement_playbooks'), file_path)
             except ValueError:
                 return jsonify({'error': 'Invalid path'}), 400
         elif file_path == '/rubber-ducky' or file_path.startswith('/rubber-ducky/'):
@@ -24595,6 +25944,12 @@ def download_file_api():
                     os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'console_scripts'), file_path)
             except ValueError:
                 return jsonify({'error': 'Invalid file path'}), 400
+        elif file_path == '/engagement_playbooks' or file_path.startswith('/engagement_playbooks/'):
+            try:
+                actual_path = _resolve_legacy_path('/engagement_playbooks',
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'engagement_playbooks'), file_path)
+            except ValueError:
+                return jsonify({'error': 'Invalid file path'}), 400
         elif file_path == '/rubber-ducky' or file_path.startswith('/rubber-ducky/'):
             try:
                 actual_path = _resolve_legacy_path('/rubber-ducky',
@@ -24682,6 +26037,12 @@ def delete_file_api():
                     os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'console_scripts'), file_path)
             except ValueError:
                 return jsonify({'error': 'Invalid file path'}), 400
+        elif file_path == '/engagement_playbooks' or file_path.startswith('/engagement_playbooks/'):
+            try:
+                actual_path = _resolve_legacy_path('/engagement_playbooks',
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'engagement_playbooks'), file_path)
+            except ValueError:
+                return jsonify({'error': 'Invalid file path'}), 400
         elif file_path == '/rubber-ducky' or file_path.startswith('/rubber-ducky/'):
             try:
                 actual_path = _resolve_legacy_path('/rubber-ducky',
@@ -24728,6 +26089,9 @@ def _resolve_upload_target(target_path):
     if target_path == '/console_scripts' or target_path.startswith('/console_scripts/'):
         return _resolve_legacy_path('/console_scripts',
             os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'console_scripts'), target_path)
+    if target_path == '/engagement_playbooks' or target_path.startswith('/engagement_playbooks/'):
+        return _resolve_legacy_path('/engagement_playbooks',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'engagement_playbooks'), target_path)
     raise ValueError('Invalid upload path')
 
 
@@ -24759,6 +26123,9 @@ def _resolve_readable_path(file_path):
     if file_path == '/console_scripts' or file_path.startswith('/console_scripts/'):
         return _resolve_legacy_path('/console_scripts',
             os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'console_scripts'), file_path)
+    if file_path == '/engagement_playbooks' or file_path.startswith('/engagement_playbooks/'):
+        return _resolve_legacy_path('/engagement_playbooks',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'engagement_playbooks'), file_path)
     if file_path == '/rubber-ducky' or file_path.startswith('/rubber-ducky/'):
         return _resolve_legacy_path('/rubber-ducky',
             os.path.join(os.path.dirname(os.path.abspath(__file__)), 'files', 'rubber-ducky'), file_path)
@@ -25920,6 +27287,202 @@ def format_bytes(bytes_value):
 # SYSTEM MONITORING ENDPOINTS
 # ============================================================================
 
+@app.route('/api/edition')
+def get_edition_api():
+    """Report the running base OS / Ragnar edition (the Ulfberht "hidden switch").
+
+    On a standard Raspberry Pi OS build this returns edition='standard' and the
+    UI shows nothing extra. On the security-distro (Ulfberht) base it reports
+    the detected offensive toolset and Nexmon onboard-Wi-Fi capability."""
+    try:
+        import ragnar_edition
+        return jsonify(ragnar_edition.detect())
+    except Exception as e:
+        return jsonify({
+            "edition": "standard",
+            "edition_name": "Ragnar OS",
+            "is_ulfberht": False,
+            "is_security_distro": False,
+            "tools": [],
+            "tool_count": 0,
+            "error": str(e),
+        })
+
+
+# ============================================================================
+# ULFBERHT ENGAGEMENT ENGINE  (official Ulfberht image only -- marker-gated)
+# ============================================================================
+
+@app.route('/api/ulfberht/playbooks', methods=['GET', 'POST'])
+def ulfberht_playbooks_api():
+    """GET: list engagement playbooks (built-in + uploaded, with validity).
+    POST: create/overwrite a user playbook (JSON body: {name, playbook|content}).
+    Empty + enabled=false off the Ulfberht image."""
+    try:
+        import ulfberht_engine
+        if not ulfberht_engine.is_enabled():
+            return jsonify({"enabled": False, "playbooks": []})
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            # Generate-with-AI: Ragnar calls the AI configured in Settings -> AI
+            # (OpenAI or a self-hosted/Ollama endpoint), gets a playbook back,
+            # validates it, and returns the spec ready to Save. Nothing is saved
+            # here. Checked before the `tools` builder branch (the body carries
+            # `tools` too). Falls back to a copy-paste prompt when no AI is set up.
+            if data.get('ai_generate'):
+                prompt, err = ulfberht_engine.build_ai_prompt(
+                    data.get('name'), data.get('tools') or [], data.get('instruction') or '')
+                if err:
+                    return jsonify({"success": False, "error": err}), 400
+                ai = getattr(shared_data, 'ai_service', None)
+                if not ai:
+                    try:
+                        shared_data.initialize_ai_service()
+                        ai = getattr(shared_data, 'ai_service', None)
+                    except Exception:
+                        ai = None
+                if not ai or not ai.is_enabled():
+                    return jsonify({
+                        "success": False, "no_ai": True, "prompt": prompt,
+                        "error": "No AI is configured. Set an OpenAI token or a self-hosted "
+                                 "endpoint in Settings → AI, or copy the prompt into your own AI."}), 200
+                try:
+                    text = ai.complete(prompt)
+                except Exception as e:
+                    logger.warning(f"Ulfberht AI generation call failed: {e}")
+                    return jsonify({"success": False, "prompt": prompt,
+                                    "error": f"The AI call failed: {e}"}), 502
+                if not text or not str(text).strip():
+                    return jsonify({"success": False, "prompt": prompt,
+                                    "error": "The AI returned nothing — check the model/endpoint in Settings → AI."}), 502
+                spec, perr = ulfberht_engine.parse_ai_playbook(text)
+                if perr:
+                    return jsonify({"success": False, "raw": str(text)[:4000],
+                                    "error": f"The AI's reply wasn't a valid playbook: {perr}"}), 200
+                return jsonify({"success": True, "spec": spec})
+            # AI prompt generator: build a copy-paste prompt for the operator's own
+            # AI (no AI runs here, nothing is saved). Checked first because the body
+            # also carries `tools`, which would otherwise hit the builder branch.
+            if data.get('ai_prompt'):
+                prompt, err = ulfberht_engine.build_ai_prompt(
+                    data.get('name'), data.get('tools') or [], data.get('instruction') or '')
+                if err:
+                    return jsonify({"success": False, "error": err}), 400
+                return jsonify({"success": True, "prompt": prompt})
+            name = data.get('name') or (data.get('playbook') or {}).get('name') \
+                or (data.get('playbook') or {}).get('id')
+            # Arsenal builder: {name, tools:[bin,...]} -> generate a playbook.
+            # With preview:true, return the generated spec WITHOUT saving (the UI
+            # opens it in an editor to tweak, then POSTs it back as {playbook});
+            # otherwise build + save in one shot.
+            if isinstance(data.get('tools'), list):
+                if data.get('preview'):
+                    spec, err = ulfberht_engine.build_playbook_spec(
+                        name, data.get('tools'), data.get('description'))
+                    if err:
+                        return jsonify({"success": False, "error": err}), 400
+                    return jsonify({"success": True, "spec": spec})
+                res = ulfberht_engine.build_playbook_from_tools(
+                    name, data.get('tools'), data.get('description'))
+                return jsonify(res), (200 if res.get('success') else 400)
+            content = data.get('playbook', data.get('content'))
+            if content is None:
+                return jsonify({"success": False, "error": "Missing 'playbook' body."}), 400
+            res = ulfberht_engine.save_playbook(name, content)
+            return jsonify(res), (200 if res.get('success') else 400)
+        ulfberht_engine.ensure_examples()
+        return jsonify({"enabled": True, "playbooks": ulfberht_engine.list_playbooks(),
+                        "runs": ulfberht_engine.list_runs(),
+                        "catalog": ulfberht_engine.list_action_catalog()})
+    except Exception as e:
+        return jsonify({"enabled": False, "playbooks": [], "error": str(e)})
+
+
+@app.route('/api/ulfberht/playbooks/<playbook_id>', methods=['DELETE'])
+def ulfberht_playbook_delete_api(playbook_id):
+    """Delete an uploaded (user) playbook. Built-ins cannot be deleted."""
+    try:
+        import ulfberht_engine
+        if not ulfberht_engine.is_enabled():
+            return jsonify({"error": "not available"}), 403
+        res = ulfberht_engine.delete_playbook(playbook_id)
+        return jsonify(res), (200 if res.get('success') else 400)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/ulfberht/run', methods=['POST'])
+def ulfberht_run_api():
+    """Start an engagement run. The active/assessment phase runs when the caller
+    opts in per-run. It is authorized by the Ulfberht EDITION itself (the engine
+    is marker-locked to the official image) and is deliberately NOT tied to the
+    global 'enable_attacks' (auto-attacks) toggle — choosing the Ulfberht edition
+    is the authorization, so an operator can keep auto-attacks off and still run
+    a scoped active engagement."""
+    try:
+        import ulfberht_engine
+        if not ulfberht_engine.is_enabled():
+            return jsonify({"error": "Ulfberht engine is available only on the Ragnar OS Ulfberht image."}), 403
+        data = request.get_json(silent=True) or {}
+        active = bool(data.get('enable_active'))
+        # scope is a single IP/CIDR/host; targets is an optional list (e.g. from
+        # an uploaded targets file, one per line) and takes precedence. A wireless
+        # playbook ignores scope/targets and uses iface/bssid/channel instead.
+        run_id, err = ulfberht_engine.start_run(
+            data.get('playbook', ''), data.get('scope', ''),
+            enable_active=active, targets=data.get('targets'),
+            iface=data.get('iface'), bssid=data.get('bssid'), channel=data.get('channel'))
+        if err:
+            return jsonify({"error": err}), 400
+        return jsonify({"run_id": run_id, "active": active, "active_blocked": False})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/ulfberht/run/<run_id>')
+def ulfberht_run_status_api(run_id):
+    try:
+        import ulfberht_engine
+        if not ulfberht_engine.is_enabled():
+            return jsonify({"error": "not available"}), 403
+        run = ulfberht_engine.get_run(run_id)
+        if not run:
+            return jsonify({"error": "no such run"}), 404
+        run.pop('report_md', None)   # reports are large; fetched separately
+        run.pop('report_html', None)
+        return jsonify(run)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/ulfberht/report/<run_id>')
+def ulfberht_report_api(run_id):
+    try:
+        import ulfberht_engine
+        if not ulfberht_engine.is_enabled():
+            return jsonify({"error": "not available"}), 403
+        from flask import Response
+        fmt = (request.args.get('format') or 'md').lower()
+        if fmt == 'html':
+            html = ulfberht_engine.get_report(run_id, 'html')
+            if not html:
+                return jsonify({"error": "no such run"}), 404
+            headers = {}
+            if request.args.get('download'):
+                headers['Content-Disposition'] = \
+                    f'attachment; filename=engagement-{run_id}.html'
+            return Response(html, mimetype='text/html', headers=headers)
+        md = ulfberht_engine.get_report(run_id)
+        if md is None:
+            return jsonify({"error": "no such run"}), 404
+        if request.args.get('download'):
+            return Response(md, mimetype='text/markdown', headers={
+                'Content-Disposition': f'attachment; filename=engagement-{run_id}.md'})
+        return jsonify({"run_id": run_id, "report_md": md})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/system/status')
 def get_system_status_api():
     """Get comprehensive system status"""
@@ -25927,8 +27490,11 @@ def get_system_status_api():
         if not psutil_available:
             return jsonify({'error': 'System monitoring not available'}), 503
             
-        # CPU Information
-        cpu_percent = psutil.cpu_percent(interval=1)
+        # CPU Information — non-blocking cached sample (psutil.cpu_percent with a
+        # 1s interval would sleep the request thread for a full second, which is
+        # what made every click that hit this endpoint feel like a 1-2s hang).
+        import resource_monitor as _rm
+        cpu_percent = _rm.cpu_percent_nonblocking()
         cpu_count = psutil.cpu_count()
         cpu_freq = psutil.cpu_freq()
         
@@ -29779,32 +31345,53 @@ def list_ai_models():
             except Exception:
                 api_key = ''
 
-        from openai import OpenAI
-        client = OpenAI(
-            api_key=api_key or 'ragnar-local',
-            base_url=base_url,
-            timeout=10.0,
-            max_retries=0,
-        )
         try:
-            resp = client.models.list()
-        except Exception as e:
-            logger.warning(f"AI model listing failed for {base_url}: {e}")
-            return jsonify({
-                'success': False,
-                'error': f'Could not reach {base_url} — check the URL and that the server is running.{port_hint}'
-            }), 502
+            from openai import OpenAI
+            client = OpenAI(
+                api_key=api_key or 'ragnar-local',
+                base_url=base_url,
+                timeout=10.0,
+                max_retries=0,
+            )
+            try:
+                resp = client.models.list()
+            except Exception as e:
+                logger.warning(f"AI model listing failed for {base_url}: {e}")
+                return jsonify({
+                    'success': False,
+                    'error': f'Could not reach {base_url} — check the URL and that the server is running.{port_hint}'
+                }), 502
+            models = sorted({
+                getattr(m, 'id', None)
+                for m in (getattr(resp, 'data', None) or [])
+                if getattr(m, 'id', None)
+            })
+        except ImportError:
+            # openai SDK absent (lean / airgapped image) — talk to the
+            # OpenAI-compatible /models endpoint directly over HTTP so Connect
+            # still works. Mirrors the SDK's GET {base_url}/models.
+            import json as _json
+            from urllib.request import urlopen, Request
+            headers = {'Accept': 'application/json'}
+            if api_key:
+                headers['Authorization'] = f'Bearer {api_key}'
+            try:
+                req = Request(base_url.rstrip('/') + '/models', headers=headers)
+                with urlopen(req, timeout=10) as r:
+                    payload = _json.loads(r.read().decode('utf-8', 'replace'))
+                models = sorted({m.get('id') for m in (payload.get('data') or []) if m.get('id')})
+            except Exception as e:
+                logger.warning(f"AI model listing (HTTP fallback) failed for {base_url}: {e}")
+                return jsonify({
+                    'success': False,
+                    'error': f'Could not reach {base_url} — check the URL and that the server is running.{port_hint}'
+                }), 502
 
-        models = sorted({
-            getattr(m, 'id', None)
-            for m in (getattr(resp, 'data', None) or [])
-            if getattr(m, 'id', None)
-        })
         return jsonify({
             'success': True,
-            'models': models,
+            'models': models or [],
             'base_url': base_url,
-            'count': len(models),
+            'count': len(models or []),
         })
     except Exception as e:
         logger.error(f"Error listing AI models: {e}")
@@ -29904,8 +31491,8 @@ def discover_ai_endpoints():
     Every candidate is probed on :11434 concurrently; responders are returned
     with their model lists so the UI can offer them as one-click endpoints.
     """
-    from ai_service import normalize_base_url
     try:
+        from ai_service import normalize_base_url  # inside try: never 500 the page
         candidates = {}  # ip -> {name, os, source}
 
         # --- Tailnet peers (Ragnar Mesh already speaks Tailscale) ---

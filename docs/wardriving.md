@@ -643,6 +643,9 @@ Falls back to linear when either endpoint speed is NULL or both are zero. The ch
 | POST | `/api/wardriving/wardrift/signout` | Forget the Wardrift session token |
 | GET | `/api/wardriving/wardrift/dashboard` | Proxy of Wardrift `GET /v1/dashboard` (character level, EXP, currency, route stats) |
 | GET/POST | `/api/wardriving/wardrift/mesh` | Mesh-node reporter status (node, link, ports, last report) / settings: `enabled`, `key`, `conn` (`usb`\|`wifi`), `port`, `host`, `interval`, `report_now` |
+| GET/POST | `/api/adsb/wardrift` | ADS-B → Wardrift status (today's unique aircraft, recent days, Pushover readiness) / settings: `auto`, `interval_min` |
+| POST | `/api/adsb/wardrift/upload` | Upload a day's aircraft to Wardrift — body `{"day": "YYYYMMDD"}` (default today) |
+| GET | `/api/adsb/export?day=YYYYMMDD` | Download a day's aircraft as an SBS/BaseStation log |
 
 > **Mutually exclusive with On-Screen Network Diagnostic mode.** Both take over
 > the e-Paper panel and HAT keys, so starting wardriving turns Network Diagnostic
@@ -819,6 +822,42 @@ are marked *(not set up)*.
   `data/upload_history.json` and shown under **Recent uploads** in the card:
   ✓ uploaded (e.g. "431 readings saved, +285 XP"), ✕ failed with the reason,
   … still processing, – skipped.
+
+### ADS-B → Wardrift (Aircraft Watch)
+Separate from ground wardrives, the [ADS-B radar](#) (`/adsb-radar`, 1090 MHz
+via dump1090) can feed Wardrift's **Aircraft Watch** (detect 10 different
+aircraft in a UTC day). Ragnar's live radar only shows what is overhead now, so
+`adsb.py` also logs every **unique ICAO** it hears per UTC day to
+`data/adsb/day_YYYYMMDD.jsonl` (one row per aircraft, plus one enrichment row
+when a callsign first becomes known). The Wardriving tab's status row shows a
+live **Aircraft** card — the day's unique count climbing as the radar hears new
+planes, with how many are overhead now (or *radar off*) underneath. Both the
+**Wardriving tab** (upload card) and the ADS-B radar page's **Wardrift Aircraft
+Watch** card upload that day's aircraft:
+
+- **Same account, same endpoint.** It uses the Wardrift sign-in from the main
+  Settings (no separate key) and POSTs to the same `/v1/wardrive/logs` the
+  wardrive route uses. Ragnar exports the day as an **SBS/BaseStation** log
+  (`# timezone=UTC` header, one `MSG` row per aircraft); Wardrift auto-detects
+  the format, credits eligible aircraft (ICAO + observation time; **no receiver
+  GPS needed**) and does **not** create a ground route.
+- **Each ICAO counts once per account per UTC day** across all uploads, so the
+  day's growing log can be re-sent safely — repeats add nothing.
+- **Manual or auto.** The ↑ *Upload today* button sends the current day; the
+  *Auto-upload while receiving* toggle re-sends the day's aircraft every
+  `adsb_wardrift_interval_min` minutes (default 30) while the radar is running
+  and only when the unique count has grown.
+- **Auto-start the radar** (opt-in, *Start the ADS-B radar when a wardrive
+  begins*; `wardriving_autostart_adsb`). When a wardrive starts, Ragnar frees
+  the RTL-SDR from the sub-GHz tools and starts the ADS-B radar, then stops it
+  when the drive ends — but only a radar it started itself, never one you
+  started by hand, and never if a radar is already running. Lets the Aircraft
+  count climb through a drive with nothing to switch on.
+- **Verdict + Pushover.** Wardrift answers *pending* then decides; Ragnar
+  follows `GET /v1/wardrive/uploads/{id}` to the result and (for auto-uploads)
+  sends a Pushover summary — *Wardrive Aircraft upload* / `pushover_notify_adsb_upload`,
+  on by default.
+- **Download.** `GET /api/adsb/export?day=YYYYMMDD` returns the day's `.sbs`.
 
 **[Wardrift](https://wardrift.net)** (faction / territory wardriving game, API at
 `https://wardrift.net/v1`, overridable via the `wardrift_base_url` config key)
@@ -1069,11 +1108,12 @@ Piglet peripherals: I2C GPS (ATGM336H), SSD1306 OLED, SPI SD card module.
 
 ### How It Connects to Ragnar
 
-Piglet can talk to Ragnar **three ways** — all three coexist with each other and
+Piglet can talk to Ragnar **four ways** — all coexist with each other and
 with HuginnESP:
 
 | Path | When to use | Live? |
 |------|-------------|-------|
+| **USB sync of SD logs** (Piglet v2.60+) | After a solo drive: plug Piglet in, every finished drive on its SD card becomes a session | ❌ Offline |
 | **CSV import** (file upload) | After a standalone field trip where Piglet logged to its SD card | ❌ Offline |
 | **Live USB serial** (mode 3) | Piglet plugged into Ragnar — streams WigleWifi-1.4 CSV rows as it scans | ✅ Yes |
 | **Mesh Core via USB** (mode 5) | Piglet running in mesh `core` mode, plugged into Ragnar — relays its own scans **plus** every record received from mesh nodes | ✅ Yes |
@@ -1090,6 +1130,67 @@ Detection signal: the boot banner contains `Piglet`, `[CORE]`, or `WigleWifi-`.
 Once identified, no commands are sent — the parser just listens. The status bar
 chip reads **Piglet · /dev/ttyACM0**.
 
+#### USB sync of solo drives (Piglet v2.60+)
+
+A drive done with Piglet on its own only exists on its SD card. Piglet firmware
+with **SerialSync** (v2.60+, `SerialSync.cpp`) answers a small line protocol on
+the same USB port it streams on, and Ragnar's [`piglet_sync.py`](../piglet_sync.py)
+pulls the files:
+
+| Host → Piglet | Piglet → host |
+|---|---|
+| `@PIGLET HELLO` | `@PH <fw> <chip> <mac> sd=<0\|1>` |
+| `@PIGLET LIST` | `@PL BEGIN`, one `@PL F <path>\t<size>\t<active>\t<mtime>` per CSV in `/logs` and `/uploaded` (`mtime` from v2.61), `@PL END <n>` |
+| `@PIGLET GET <path> [offset]` | `@PG BEGIN <path> <size> <offset>`, `@PG D <seq> <crc32> <base64 of 144 B>` …, `@PG END <path> <size> <sent>` (or `@PG ERR <why>`) |
+
+- **When it runs:** automatically **as soon as a Piglet is plugged in**
+  (`wardriving_piglet_sync`, default on), and on demand with **Import from
+  Piglet (USB)** on the Import card (`POST /api/wardriving/piglet/sync`, `GET`
+  for the last result).
+  - **Wardriving running:** the wardriving listener syncs when it attaches the
+    Piglet.
+  - **Wardriving stopped:** a plug-in watcher (`PlugWatcher`) notices the new
+    Espressif native-USB device under `/dev/serial/by-id` and syncs it once per
+    plug-in. USB-UART bridge boards (CH340/CP210x), which reset when their port
+    is opened, are never probed, and ports held by other components (serial
+    claims) are left alone.
+  - Every direct sync holds a `piglet-sync` serial claim, and only one runs at
+    a time.
+- **Newest drive first:** Piglet v2.61+ adds each file's last-write time to
+  `LIST`. Piglet sets its clock from GPS, so finished drives carry real times,
+  and Ragnar fetches the newest first. Files with unknown times come next, and
+  files that failed before come last. A full card no longer makes today's drive
+  wait behind months of old ones.
+- **Failing files:**
+  - An SD read error (`@PG ERR read-error`, v2.61+) stops that file at once.
+  - A transfer that makes no progress after 2 resumes is abandoned.
+  - A failed file waits 6 hours before it's retried, and is skipped for good
+    after 3 failed syncs (reported as `unreadable`).
+  - If the port itself disappears, the sync stops instead of failing every
+    remaining file.
+- **Integrity:** every 144-byte chunk carries its own CRC32. A damaged or
+  missing chunk, or a stalled link, resumes the transfer at the last good byte
+  (up to 8 times per file) instead of failing it. Piglet mutes ESP-IDF logging
+  while serving, because Wi-Fi driver log lines landing inside a data line
+  corrupted it. Measured at about 140 KiB/s on an ESP32-C5 (2.8 MB in about 19 s).
+- **What becomes a session:** each finished CSV becomes its own session,
+  `session_<first FirstSeen, local>_piglet.db`, with `source` noted in
+  `session_info`. The file Piglet is writing right now is skipped, because its
+  rows already arrive over the live stream. Files with **no GPS positions**
+  (indoor logs, or everything logged before a fix) are skipped and remembered.
+- **No double imports:** imports are remembered per Piglet MAC and **file
+  name** in `data/wardriving/piglet_imports.json`. Piglet moves a file from
+  `/logs` to `/uploaded` after uploading it, so the name, not the path, is its
+  identity. A failed file is retried on the next sync.
+- **Real times:** the CSV import keeps each row's `FirstSeen` (UTC) instead of
+  stamping the import time, builds the session's GPS track from the positioned
+  rows (one point per 5 s), treats `0,0` as "no position", and gives rows logged
+  before Piglet had a clock (`1970-01-01`) the file's nearest valid time. This
+  applies to the manual **Import CSV** too.
+
+Older Piglet firmware simply doesn't answer `HELLO`; Ragnar waits ~20 s and
+carries on with the live stream.
+
 #### CSV import (offline)
 
 Same end result, file-based:
@@ -1097,7 +1198,7 @@ Same end result, file-based:
 1. Take Piglet out wardriving — it logs WiFi networks + GPS to SD card
 2. When home, download the CSV files via Piglet's web UI (connects to your WiFi) or remove the SD card
 3. Upload the CSV file(s) to Ragnar via **Import CSV** in the wardriving section (`POST /api/wardriving/import`)
-4. Ragnar imports all networks with GPS coordinates into the active session
+4. Ragnar imports all networks with GPS coordinates into the active session (or a new one), keeping each row's original `FirstSeen` time
 5. View the imported data on the map and in the network table
 
 ### What Gets Imported

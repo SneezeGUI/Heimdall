@@ -65,6 +65,12 @@ fi
 QS_SEP="?"
 if [[ "$KIOSK_URL" == *"?"* ]]; then QS_SEP="&"; fi
 FINAL_URL="${KIOSK_URL}${QS_SEP}kiosk=1"
+# Pass the local kiosk auth-bypass token so the on-screen browser skips login
+# (the server sets a cookie from it). A tailnet visitor proxied through
+# `tailscale serve` never holds this token, so it does not weaken published
+# access — it's what lets kiosk mode and Tailscale HTTPS publishing coexist.
+KIOSK_TOKEN="$(tr -d '[:space:]' < "$REPO_ROOT/data/kiosk_token" 2>/dev/null || true)"
+[[ -n "$KIOSK_TOKEN" ]] && FINAL_URL="${FINAL_URL}&kiosk_token=${KIOSK_TOKEN}"
 if [[ "$WARDRIVING_ENABLED" == "true" ]]; then
     FINAL_URL="${FINAL_URL}#wardriving"
 fi
@@ -266,31 +272,36 @@ done
 if [[ -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ]]; then
     echo "[kiosk-run] running inside existing session — launching chromium directly"
 
-    # Apply rotation via wlr-randr (labwc/wlroots) or xrandr (X session).
-    case "$KIOSK_ROTATION" in
-        90|180|270)
-            if [[ -n "${WAYLAND_DISPLAY:-}" ]] && command -v wlr-randr >/dev/null 2>&1; then
-                # wlr-randr's --transform takes: normal|90|180|270|flipped|flipped-90|...
-                OUTPUT="$(wlr-randr 2>/dev/null | awk '/^[^ ]/ {print $1; exit}')"
-                if [[ -n "$OUTPUT" ]]; then
-                    echo "[kiosk-run] wlr-randr: rotating $OUTPUT to $KIOSK_ROTATION"
-                    wlr-randr --output "$OUTPUT" --transform "$KIOSK_ROTATION" 2>&1 || true
-                fi
-            elif [[ -n "${DISPLAY:-}" ]] && command -v xrandr >/dev/null 2>&1; then
-                case "$KIOSK_ROTATION" in
-                    90) XROT=left ;; 180) XROT=inverted ;; 270) XROT=right ;;
-                esac
-                PRIMARY="$(xrandr --query 2>/dev/null | awk '/ connected/ {print $1; exit}')"
-                if [[ -n "$PRIMARY" ]]; then
-                    echo "[kiosk-run] xrandr: rotating $PRIMARY to $XROT"
-                    xrandr --output "$PRIMARY" --rotate "$XROT" 2>&1 || true
-                fi
-            else
-                echo "[kiosk-run] WARN: rotation requested but neither wlr-randr nor xrandr available"
-            fi
-            ;;
-        *) : ;;  # 0 = no rotation
-    esac
+    # Normalise the display before launching chromium: drive a SINGLE output at
+    # its preferred mode and apply the configured rotation. Done unconditionally
+    # — including 0° — so (a) selecting landscape after a rotation actually
+    # resets the screen instead of leaving it portrait, and (b) a two-output
+    # span can't leave the page filling only one panel ("left half, rest black").
+    if [[ -n "${WAYLAND_DISPLAY:-}" ]] && command -v wlr-randr >/dev/null 2>&1; then
+        # wlr-randr's --transform takes: normal|90|180|270|flipped|...
+        case "$KIOSK_ROTATION" in 90|180|270) WROT="$KIOSK_ROTATION" ;; *) WROT=normal ;; esac
+        OUTPUT="$(wlr-randr 2>/dev/null | awk '/^[^ ]/ {print $1; exit}')"
+        if [[ -n "$OUTPUT" ]]; then
+            echo "[kiosk-run] wlr-randr: $OUTPUT -> transform $WROT"
+            wlr-randr --output "$OUTPUT" --transform "$WROT" 2>&1 || true
+        fi
+    elif [[ -n "${DISPLAY:-}" ]] && command -v xrandr >/dev/null 2>&1; then
+        case "$KIOSK_ROTATION" in
+            90) XROT=left ;; 180) XROT=inverted ;; 270) XROT=right ;; *) XROT=normal ;;
+        esac
+        PRIMARY="$(xrandr --query 2>/dev/null | awk '/ connected/ {print $1; exit}')"
+        if [[ -n "$PRIMARY" ]]; then
+            # Turn off any OTHER connected output so X isn't spanning two panels.
+            for o in $(xrandr --query 2>/dev/null | awk '/ connected/ {print $1}'); do
+                [[ "$o" != "$PRIMARY" ]] && xrandr --output "$o" --off 2>/dev/null || true
+            done
+            echo "[kiosk-run] xrandr: $PRIMARY -> auto + rotate $XROT (other outputs off)"
+            xrandr --output "$PRIMARY" --auto --primary 2>/dev/null || true
+            xrandr --output "$PRIMARY" --rotate "$XROT" 2>/dev/null || true
+        fi
+    else
+        echo "[kiosk-run] WARN: no wlr-randr/xrandr — cannot set output/rotation"
+    fi
 
     if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then launch_osk wayland; else launch_osk x; fi
     launch_exit_hatch
@@ -364,10 +375,46 @@ case "$KIOSK_ROTATION" in
     270) ROT=right ;;
     *)   ROT=normal ;;
 esac
-PRIMARY="\$(xrandr --query 2>/dev/null | awk '/ connected/ {print \$1; exit}')"
-if [[ -n "\$PRIMARY" && "\$ROT" != "normal" ]]; then
-    xrandr --output "\$PRIMARY" --rotate "\$ROT" || true
-fi
+# Drive a single connected output at its preferred mode (so a two-panel span
+# can't leave the page on half the screen), then apply rotation — always, incl.
+# normal, so switching back to landscape actually resets the orientation.
+# Factored into a function so the hotplug watcher below re-runs it verbatim.
+_kiosk_apply_output() {
+    local primary o
+    primary="\$(xrandr --query 2>/dev/null | awk '/ connected/ {print \$1; exit}')"
+    [[ -z "\$primary" ]] && return 0
+    for o in \$(xrandr --query 2>/dev/null | awk '/ connected/ {print \$1}'); do
+        [[ "\$o" != "\$primary" ]] && xrandr --output "\$o" --off 2>/dev/null || true
+    done
+    xrandr --output "\$primary" --auto --primary 2>/dev/null || true
+    xrandr --output "\$primary" --rotate "\$ROT" 2>/dev/null || true
+}
+_kiosk_apply_output
+
+# Re-detect the display on hotplug. The call above configures the output ONCE, at
+# start. If the kiosk starts with no monitor attached (enabled headless, screen
+# plugged in later) that connector is never modeset and stays dark until the
+# kiosk is toggled off/on — exactly the "plug it in, no picture" report. A bare
+# service Xorg (no desktop / display-manager) does not light a hot-plugged output
+# on its own. So watch the DRM connector state and re-run the setup when a
+# monitor appears, or whenever an output is connected but nothing is driving it
+# (which also recovers the dark screen if Xorg re-probes a fraction late). The
+# poll keeps this self-contained (no udev rule, no root) and ends with the X
+# server, since the guard xrandr call starts failing once X is gone.
+_kiosk_drm_state()     { cat /sys/class/drm/card*-*/status 2>/dev/null | tr '\n' ','; }
+_kiosk_has_connected() { xrandr --query 2>/dev/null | grep -q ' connected'; }
+_kiosk_has_active()    { xrandr --query 2>/dev/null | grep -qE ' connected.*[0-9]+x[0-9]+\+[0-9]+\+[0-9]+'; }
+(
+    last="\$(_kiosk_drm_state)"
+    while xrandr --query >/dev/null 2>&1; do
+        sleep 4
+        now="\$(_kiosk_drm_state)"
+        if [[ "\$now" != "\$last" ]] || { _kiosk_has_connected && ! _kiosk_has_active; }; then
+            last="\$now"
+            _kiosk_apply_output
+        fi
+    done
+) &
 
 # Plain openbox, deliberately not openbox-session. A kiosk wants a window
 # manager, not a desktop: openbox-session additionally runs every XDG autostart
@@ -379,6 +426,13 @@ if command -v openbox >/dev/null 2>&1; then
     openbox &
 elif command -v openbox-session >/dev/null 2>&1; then
     openbox-session &
+elif command -v matchbox-window-manager >/dev/null 2>&1; then
+    matchbox-window-manager -use_titlebar no &   # lightweight fallback WM
+else
+    # No window manager → chromium --kiosk cannot go full-screen and sits at its
+    # default ~945x1060 window (the dashboard fills only part of the display).
+    # install_kiosk.sh installs openbox; warn loudly so this is obvious in the log.
+    echo "[kiosk-run] WARN: no window manager found (openbox) — the kiosk cannot fill the screen. Run: sudo apt-get install -y openbox (install_kiosk.sh now does this)."
 fi
 
 if [[ "$KIOSK_HIDE_CURSOR" == "true" ]] && command -v unclutter >/dev/null 2>&1; then

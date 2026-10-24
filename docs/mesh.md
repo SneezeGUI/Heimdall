@@ -23,6 +23,9 @@ be logged into renders the mesh; so would any other.
 - [Fleet security findings](#fleet-security-findings)
   - [Mesh Health card](#mesh-health-card)
   - [Mesh Nodes list and the node page](#mesh-nodes-list-and-the-node-page)
+    - [Live packet capture (PCAP)](#live-packet-capture-pcap)
+    - [Filtering and sorting the list](#filtering-and-sorting-the-list)
+    - [Node actions: path, trace route, ping](#node-actions-path-trace-route-ping)
 - [Unit identity — the Viking army](#unit-identity--the-viking-army)
 - [Tailscale console: one-time setup](#tailscale-console-one-time-setup)
 - [Separate meshes on one tailnet](#separate-meshes-on-one-tailnet)
@@ -536,18 +539,32 @@ when:
 - `tailscaled` will not start after an update
 - you are debugging Tailscale itself
 
-Ragnar reports its state on the Mesh tab — installed, signed in, and therefore
-actually usable — but never enables it. Signing in requires an interactive
-browser flow that cannot be automated from the unit, and enabling a second
-remote-access path is an operator's decision, not a program's.
+Ragnar reports its state on the Mesh tab and can **sign you in from there** — no
+terminal. Paste a Raspberry Pi Connect **auth key** (generate one at
+[connect.raspberrypi.com](https://connect.raspberrypi.com) → your account → Auth
+keys) into the field under the Pi Connect card and click **Sign in**. Ragnar
+enables linger, turns the per-user service on, and runs `rpi-connect signin
+-auth-key …` (rpi-connect 2.12+) for the right login user — so it works on a
+headless box with nobody logged in. The key is sent once and never stored or
+logged. Enabling a second remote-access path is still your call, not automatic.
 
-Run these **as your login user (e.g. `pi`), not as root** — Connect is a
-per-user service:
+**Ragnar installs the `rpi-connect` binary for you** (`scripts/install_pi_connect.sh`,
+run by the installer and on every update) so the Mesh tab can sign in — you only
+supply the account. On Raspberry Pi OS it comes from the Pi apt repo; on the
+Kali/Ulfberht base, where that repo isn't present (and its SHA1-signed key is
+rejected by modern apt), Ragnar downloads the `rpi-connect-lite` `.deb` straight
+from the archive and verifies its SHA256 before installing — no third-party repo
+is added. It's ARM-only and a no-op on x86 (e.g. a WSL box). Sign-in stays your
+call, not automatic.
+
+Prefer the command line? Run these **as your login user (e.g. `pi`/`ragnar`),
+not as root** — Connect is a per-user service:
 
 ```sh
-sudo apt install rpi-connect
-rpi-connect on          # starts the per-user service
-rpi-connect signin      # open the link it prints to link your account
+sudo apt install rpi-connect        # Raspberry Pi OS; on Kali Ragnar already installed it
+rpi-connect on                       # starts the per-user service
+rpi-connect signin                   # interactive: open the link it prints
+rpi-connect signin -auth-key <KEY>   # or non-interactive, with a key
 rpi-connect status
 ```
 
@@ -637,7 +654,7 @@ The gate is deliberately narrow:
 
 | Property | Rule |
 |---|---|
-| Methods | Any `GET` for reads, plus a short **exact-path** write allowlist: `POST /api/mesh/control`, the scan-delegation writes, and `POST /api/mesh/update` |
+| Methods | Any `GET` for reads, plus a short **exact-path** write allowlist: `POST /api/mesh/control`, the scan-delegation writes, the packet-capture writes (`/api/mesh/capture/start`, `cancel/<id>`), and `POST /api/mesh/update` |
 | Paths | `/api/mesh/*` for reads; each write is matched by **exact path** so `join`/`leave`/`serve`/`peer-control`/`update-all` stay session-only. The other ~290 routes stay session-gated |
 | Identity | Must carry `mesh_tag` (default `tag:ragnar-mesh`) |
 | Source | Must be a real tailnet address (100.64/10 or `fd7a:115c:a1e0::/48`) |
@@ -891,6 +908,92 @@ live running state. The command is relayed server-side over the tailnet; see
 [Remote scan control](#remote-scan-control) for the security model. Any tagged
 unit can drive any other — the trust boundary is the mesh tag, so the way to
 keep a unit from being actuated remotely is simply not to tag it into the mesh.
+
+#### Live packet capture (PCAP)
+
+The node page also runs a **bounded packet capture** on a unit and streams the
+`.pcap` back to you — the real frames for Wireshark, next to the Traffic
+Analyzer's live stats (which only reads tcpdump as text and writes no file). Pick
+an **interface** (the list comes from that unit's own NICs), a **duration**, an
+optional **packet cap** and an optional **BPF filter** (`tcp port 443`, `host
+10.0.0.5`, …), and press **Start capture**. Progress (packets / bytes / elapsed)
+updates live; when it finishes, each capture offers **View** and **Download**.
+**View** expands a **collapsible box inline on that capture's row** (▸ View / ▾
+Hide) — so the packets open in place and the page never navigates away, which
+keeps it usable on a phone. The hub decodes the `.pcap` with `tcpdump -nr` over
+the tailnet and shows a **packet list** with a summary header (packets shown / of
+total, a per-protocol tally, and the top source addresses), so you can eyeball
+what was on the wire without leaving the page. Open panels survive the background
+mesh refresh (the fetched packets are cached per row), and **Download** pulls the
+raw file for Wireshark. Both are **named after the Ragnar unit** — the view header
+reads *Packets · <Viking name>* and the saved file is `<Viking-name>_<id>.pcap`
+(falling back to the site label or Tailscale short name).
+
+Every capture is **strictly bounded** (`pcap_capture.py`): it stops on the first
+of its time limit, packet count, or a hard byte ceiling (defaults 5 min / 100 MB
+/ one capture at a time), so a remote start can never run away with a peer's disk
+or CPU. Captures are retained briefly on the capturing unit (oldest pruned) so
+they can be re-fetched.
+
+It follows the same model as scan delegation: a *worker* layer on each unit
+(`POST /api/mesh/capture/start`, `cancel/<id>`; peer-readable
+`GET …/status/<id>`, `/list`, `/view/<id>`, `/download/<id>`) with the two writes
+on the exact-path peer allowlist, and an *operator* layer the browser talks to
+(`/api/mesh/peer-capture/*`, session-only) that relays to the chosen unit and —
+for a peer — streams the `.pcap` back (or relays the decoded view) over the
+tailnet (WireGuard). Because start is a tagged-peer write, the trust boundary is
+again the mesh tag: a unit you do not want captured from is one you do not tag
+into the mesh.
+
+#### Filtering and sorting the list
+
+Once there is more than one peer, a toolbar sits above the list (it stays hidden
+for a single node, where filtering earns nothing):
+
+- **Search** — matches a node's name, unit number (`3`, `03`, or `unit 03`), site
+  label, hostname, and any of its tailnet IPs.
+- **Status** — *All*, *Online*, *Needs attention*, *Unreachable*, or *Not polled*.
+  "Needs attention" uses the same test as the **Mesh Health** summary: unreachable,
+  offline, a node-key warning/expiry, undervoltage, or a high/critical finding.
+- **Sort** — by name, unit number, worst **severity**, open **alerts**, or **CPU**.
+
+All of it runs in the browser over the roster already polled server-side, so
+filtering and sorting a large fleet costs **no round-trip** and stays instant on a
+Pi Zero. A *Showing X of Y* counter tracks the result, and **Reset** clears it.
+Your own unit is never filtered out — it keeps its own card above the list.
+
+#### Node actions: path, trace route, ping
+
+The node page has an **Actions** bar that probes the peer **from the unit you are
+looking at** (the same server-side-origin model as everything else here, so it
+works however you reached this UI):
+
+- **Tailnet path** — shown inline from the already-polled data (no probe): whether
+  the link to this peer is a **direct** WireGuard path or **relayed via a DERP**
+  relay (with the relay region), plus the node's tailnet addresses. This is the
+  quick "am I going direct or bouncing through a relay?" read.
+- **Trace route** — runs `traceroute` from this unit to the peer and draws the
+  **hops** ("the jumps"): hop number, address, and RTT, with a hop-count badge.
+  On the tailnet a healthy peer is usually **1 hop** (direct); more hops, or a
+  dead hop (`* no reply`), show where the path actually goes.
+- **Ping** — a 4-probe reachability check with loss and min/avg/max RTT.
+- **Diagnose** / **Copy IP** — the existing connection classifier (down / filtered
+  / auth / wrong-service), and a one-click copy of the tailnet address.
+
+For an **unreachable** node the same **Trace route** and **Ping** buttons appear
+next to **Diagnose** on its banner, so you can see exactly where the path dies.
+
+Every **Trace route**, **Ping** and **Diagnose** result shows on the page *and*
+carries a **⬇ Download** link that saves the same result as a plain-text report
+(the parsed summary plus, for trace/ping, the raw `traceroute`/`ping` output).
+It is built client-side from the result already in the browser — no re-run and no
+server round-trip — so you can attach a probe to a ticket without retyping it.
+
+The probe endpoint is `POST /api/mesh/probe` (`{ip, kind: "trace"|"ping"}`),
+session-gated like the other operator actions. The target is **pinned to the known
+mesh roster** server-side — a probe only runs against an address this unit already
+knows as self or a tagged peer — so the route is a fleet tool, not a general
+traceroute box that could be pointed at arbitrary hosts.
 
 ## File transfer
 

@@ -248,6 +248,29 @@ if ! pip3 install --break-system-packages --upgrade -r requirements.txt; then
     done < requirements.txt
 fi
 
+# flask-socketio: Debian/Kali apt ships 5.6.0, which crashes the web terminal's
+# /terminal Socket.IO namespace on Flask 3.1+ ("AttributeError: property
+# 'session' of 'RequestContext' object has no setter"). 5.6.1 fixes it, but the
+# apt package has no dist-info RECORD so the `pip --upgrade -r requirements.txt`
+# above cannot replace it — install 5.6.1 alongside with --ignore-installed
+# (/usr/local precedes /usr/lib on the import path, so it wins).
+if ! python3 -c 'import sys,importlib.metadata as m; v=tuple(int(x) for x in m.version("flask-socketio").split(".")[:3]); sys.exit(0 if v>=(5,6,1) else 1)' 2>/dev/null; then
+    echo -e "  Ensuring flask-socketio >= 5.6.1 (apt ships a build that breaks the web terminal)..."
+    pip3 install --break-system-packages --ignore-installed "flask-socketio>=5.6.1" >/dev/null 2>&1 \
+        || echo -e "  ${YELLOW}!${NC} Could not ensure flask-socketio >= 5.6.1 (web terminal may not work)"
+fi
+
+# openai SDK: the AI Insights / self-hosted-endpoint features need it, but the
+# installer only WARNS if its install fails, so some images shipped without it
+# (symptom: /api/ai/models + /api/ai/discover return HTTP 500). The pull above
+# only reinstalls requirements.txt when that file changed, so heal it here on
+# every update if it is missing. Cheap no-op when already present.
+if ! python3 -c 'import openai' 2>/dev/null; then
+    echo -e "  Ensuring the openai SDK (AI Insights / self-hosted endpoints)..."
+    pip3 install --break-system-packages --ignore-installed "openai>=2.0.0" >/dev/null 2>&1 \
+        || echo -e "  ${YELLOW}!${NC} Could not install openai (AI features will show a clear message until it is)"
+fi
+
 echo -e "${BLUE}Step 5.1: Checking package system health...${NC}"
 # apt refuses every operation while a previous dpkg run is unfinished
 # ("E: dpkg was interrupted, you must manually run 'dpkg --configure -a'").
@@ -314,6 +337,27 @@ if ! command -v rtl_test >/dev/null 2>&1; then
     else
         echo -e "  ${YELLOW}⚠${NC} Could not install rtl-sdr/rtl-433 — RTL-SDR features stay disabled until they're present"
     fi
+fi
+# Keep ModemManager off Espressif USB serial/JTAG devices (VID 303a): the ESP-SDR
+# node (RF Waterfall) and ESP32 GPS/wardrive nodes enumerate as a ttyACM "USB
+# JTAG/serial debug unit" that MM mistakes for a cellular modem and probes with
+# AT commands + DTR/RTS toggles — that resets the chip and wedges a running SDR
+# capture. Tag them ID_MM_DEVICE_IGNORE (real LTE modems keep working). Mirrors
+# install_ragnar.sh so update-only boxes get it too.
+_mm_esp=/etc/udev/rules.d/99-ragnar-espsdr.rules
+if ! grep -q "ID_MM_DEVICE_IGNORE" "$_mm_esp" 2>/dev/null; then
+    cat > "$_mm_esp" << 'EOF'
+# Ragnar: ModemManager must not probe Espressif USB serial/JTAG devices
+# (ESP-SDR, ESP32 GPS/wardrive nodes). AT-command probing wedges them.
+SUBSYSTEM=="tty", ACTION=="add", ATTRS{idVendor}=="303a", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="303a", ENV{ID_MM_DEVICE_IGNORE}="1"
+EOF
+    chmod 644 "$_mm_esp"
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules 2>/dev/null || true
+        udevadm trigger --subsystem-match=tty 2>/dev/null || true
+    fi
+    echo -e "  ${GREEN}✓${NC} ModemManager set to ignore Espressif serial devices (ESP-SDR / ESP32 nodes)"
 fi
 # uhubctl lets the SDR self-healer cut a USB port's 5 V for a few seconds — the
 # software equivalent of replugging a dongle that is stuck on the bus.
@@ -583,6 +627,14 @@ if [ -f /etc/systemd/system.conf ]; then
     echo -e "  ${GREEN}✓${NC} systemd watchdog set (RuntimeWatchdogSec=15)"
 fi
 
+echo -e "${BLUE}Step 6.62: Unblocking radios (rfkill)...${NC}"
+# A deployed box (or a freshly flashed image) can come up with Wi-Fi/Bluetooth
+# soft-blocked; ragnar.service now unblocks every boot, but heal it here too.
+if command -v rfkill >/dev/null 2>&1; then
+    rfkill unblock all >/dev/null 2>&1 || true
+    echo -e "  ${GREEN}✓${NC} rfkill unblock all"
+fi
+
 echo -e "${BLUE}Step 6.65: Pi 5 USB current limit...${NC}"
 # Pi 5 firmware caps all USB ports together at 600 mA unless a 5 V/5 A PD
 # supply is detected; a Wi-Fi adapter + SDR/GPS exceeds it and drops off USB.
@@ -678,6 +730,15 @@ KIOSK_WRAPPER_SRC="$ragnar_PATH/scripts/ragnar_kiosk_run.sh"
 if [ -f /usr/local/bin/ragnar-kiosk-run ] && [ -f "$KIOSK_WRAPPER_SRC" ]; then
     install -m 0755 "$KIOSK_WRAPPER_SRC" /usr/local/bin/ragnar-kiosk-run
     echo -e "  ${GREEN}✓${NC} Kiosk wrapper refreshed from repo"
+    # The kiosk needs a window manager (openbox) for chromium --kiosk to go
+    # full-screen. A distro that ships X but not openbox (Kali) left it missing,
+    # so the kiosk filled only part of the screen. Ensure it on existing
+    # service-mode kiosks so update-only boxes get the fix too. Idempotent.
+    if [ -f /etc/systemd/system/ragnar-kiosk.service ] && ! command -v openbox >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openbox >/dev/null 2>&1 \
+            && echo -e "  ${GREEN}✓${NC} Installed openbox (kiosk window manager — fixes half-screen)" \
+            || echo -e "  ${YELLOW}⚠${NC} Could not install openbox (kiosk may not fill the screen)"
+    fi
     # Seed the on-screen keyboard so touchscreen typing works on existing kiosk
     # installs too (not just fresh installs). Best-effort, guarded, idempotent:
     # squeekboard for the Wayland/autostart path, matchbox-keyboard for the X
@@ -719,6 +780,33 @@ DROPIN
         systemctl daemon-reload 2>/dev/null || true
         echo -e "  ${GREEN}✓${NC} Kiosk restart-loop cap applied (drop-in)"
     fi
+    # Heal existing service-mode kiosks on update: re-run the (idempotent)
+    # installer so the Pi 5 / Xorg display fixes — vc4 PrimaryGPU xorg.conf, VT
+    # activation (chvt in the unit), video/render/input/tty groups, Chromium
+    # (not firefox), and /home ownership — reach boxes that just `git pull` +
+    # update, not only fresh or web-UI installs. Best-effort: a kiosk hiccup must
+    # never fail the whole update. Only the service (Pi OS Lite) path needs this;
+    # desktop/autostart installs re-provision harmlessly in autostart mode.
+    KIOSK_INSTALL_SRC="$ragnar_PATH/scripts/install_kiosk.sh"
+    if [ -f /etc/systemd/system/ragnar-kiosk.service ] && [ -f "$KIOSK_INSTALL_SRC" ]; then
+        if bash "$KIOSK_INSTALL_SRC" >/dev/null 2>&1; then
+            echo -e "  ${GREEN}✓${NC} Kiosk re-provisioned with latest display fixes"
+        else
+            echo -e "  ${YELLOW}⚠${NC} Kiosk re-provision needs attention (run: sudo bash scripts/install_kiosk.sh)"
+        fi
+    fi
+fi
+
+# Console safety net (runs whether or not a kiosk is installed). A past kiosk
+# uninstall — or a Ragnar OS image built to boot straight into the kiosk — could
+# leave getty@tty1 masked/disabled, so turning the kiosk off left the box on a
+# black screen with no CLI and no login console after reboot. Unmask + enable is
+# a no-op on a normal box (tty1's getty is enabled by default) and brings the
+# login console back on the next boot where it had gone missing. We don't restart
+# or chvt here, to avoid disturbing an operator's live console during an update.
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl unmask getty@tty1.service >/dev/null 2>&1 || true
+    systemctl enable getty@tty1.service >/dev/null 2>&1 || true
 fi
 
 echo -e "${BLUE}Step 6.5: Validating actions.json configuration...${NC}"
@@ -866,6 +954,30 @@ if [ -f "$(dirname "$0")/cellular_uplink.py" ]; then
         echo -e "  ${GREEN}✓${NC} Cellular fallback hooks in place"
     else
         echo -e "  ${YELLOW}⚠${NC} Cellular fallback hook install failed (the service retries at start)"
+    fi
+fi
+
+echo -e "${BLUE}Step 6.98: Letting NetworkManager own wlan0...${NC}"
+# The legacy wlan stack (dhcpcd, standalone wpa_supplicant.service, hostapd,
+# dnsmasq) fights NetworkManager for wlan0 when left enabled — on a fresh image
+# it leaves the interface down after the AP portal's hand-off to client mode.
+# Disable them so only NM drives the radio; hostapd/dnsmasq are started on
+# demand by Ragnar's WiFi manager for AP mode. Idempotent and a no-op where NM
+# has already won. Mirrors install_ragnar.sh.
+if systemctl list-unit-files NetworkManager.service >/dev/null 2>&1; then
+    _changed=false
+    for _unit in dhcpcd wpa_supplicant hostapd dnsmasq; do
+        if systemctl is-enabled "$_unit" >/dev/null 2>&1; then
+            systemctl stop "$_unit" 2>/dev/null || true
+            systemctl disable "$_unit" 2>/dev/null || true
+            _changed=true
+        fi
+    done
+    systemctl unmask hostapd 2>/dev/null || true
+    if [ "$_changed" = true ]; then
+        echo -e "  ${GREEN}✓${NC} Disabled legacy wlan services — NetworkManager now owns wlan0"
+    else
+        echo -e "  ${GREEN}✓${NC} NetworkManager already owns wlan0 — nothing to do"
     fi
 fi
 

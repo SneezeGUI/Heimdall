@@ -5,6 +5,7 @@ browse than search.
 
 ## Getting started
 - [Install Guide](INSTALL.md) — the full installation walkthrough
+- [Ragnar OS image](ragnar-os.md) — prebuilt Raspberry Pi image, flash-and-go
 - [Updating Ragnar](updates.md) — updating from the web UI or the terminal
 - [Docker Guide](DOCKER.md) — headless web UI in a container
 - [AP Mode](RagnarAP.md) — getting the box onto a network
@@ -36,6 +37,7 @@ browse than search.
 - [CYD firmware & flashing](cyd-firmware.md) — build and flash the ESP32 CYD companion node firmware
 - [WiFi Defense (WIDS)](wifi-defense.md) — passive 802.11 intrusion detection
 - [Wardriving](wardriving.md) — WiFi/BLE/cell logging with GPS recovery
+- [Wardrive firmware comparison](wardrivecomparison.md) — Huginn vs Piglet measured on one ESP32-C5
 - [Diagnostics panel](diagnostics.md) — radios / power / GPS sky view + Starview observatory
 - [Cellular modem](cell.md) · [SDR / Sub-GHz](sdr-subghz.md) · [RF Waterfall](rf-waterfall.md) · [RF Waterfall — capability guide](rf-waterfall-guide.md) · [AirSnitch](airsnitch.md)
 

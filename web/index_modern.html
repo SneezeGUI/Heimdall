@@ -804,6 +804,14 @@
                             <span class="uppercase tracking-wide">Pentest</span>
                         </span>
                     </button>
+                    <button id="ulfberht-nav-btn" onclick="showTab('engagements')"
+                            class="nav-btn px-3 py-1.5 rounded-lg transition-colors text-[15px] whitespace-nowrap ulfberht-nav-btn hidden"
+                            data-tab="engagements">
+                        <span class="flex items-center space-x-1">
+                            <span class="text-red-400">⚔️</span>
+                            <span>Engagements</span>
+                        </span>
+                    </button>
                     <button onclick="showTab('threat-intel')" class="nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap" data-tab="threat-intel">
                         Threat Intel
                     </button>
@@ -881,6 +889,7 @@
                         data-tab="pentest">
                     Pentest
                 </button>
+                <button onclick="showTab('engagements')" data-tab="engagements" class="ulfberht-nav-btn hidden block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">⚔️ Engagements</button>
                 <button onclick="showTab('threat-intel')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Threat Intel</button>
                 <button onclick="showTab('traffic')" data-tab="traffic" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700 traffic-feature hidden">Traffic Analysis</button>
                 <button onclick="showTab('adv-vuln')" data-tab="adv-vuln" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Adv Scan</button>
@@ -1039,7 +1048,7 @@
                 <div class="flex items-center justify-between gap-4 mb-3">
                     <div class="min-w-0">
                         <h3 class="text-lg font-semibold">Watchtower</h3>
-                        <p class="text-xs text-gray-400">Live findings from the passive watcher daemons — ARP Guard · NDP (IPv6) · Wi-Fi · Legacy Wi-Fi · WPS · Cert · SNMP · IS-IS · IGMP · Dell Guard (OS10 SSRF) · Cisco/Juniper/Arista/Comware/MikroTik/Aruba/APC guards · IPsec/IKE Watch (plus any other watcher writing JSONL)</p>
+                        <p class="text-xs text-gray-400">Live findings from the passive watcher daemons — ARP Guard · NDP (IPv6) · Wi-Fi · Legacy Wi-Fi · WPS · Cert · SNMP · IS-IS · IGMP · Dell Guard (OS10 SSRF) · Cisco/Juniper/Arista/Comware/MikroTik/Aruba/APC/Liebert guards · IPsec/IKE Watch (plus any other watcher writing JSONL)</p>
                     </div>
                     <div class="shrink-0 flex items-center gap-2">
                         <button onclick="watchtowerClear()" title="Clear the alerts shown here. The watchers keep their place in each log, so only genuinely new findings re-appear." class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs whitespace-nowrap">Clear</button>
@@ -1876,12 +1885,12 @@
                 <div class="glass rounded-xl p-3 sm:p-4 mb-6">
                     <div id="net-layer-bar" class="flex flex-wrap items-center gap-1">
                         <button id="net-layer-btn-overview" data-layer="overview" onclick="showNetLayer('overview')" class="net-layer-btn px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold transition-colors whitespace-nowrap bg-Ragnar-600 text-white">Overview</button>
-                        <button id="net-layer-btn-l7" data-layer="l7" onclick="showNetLayer('l7')" class="net-layer-btn px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold transition-colors whitespace-nowrap text-slate-400 hover:bg-slate-700 hover:text-white">L7 Application <span class="opacity-60 font-normal">27</span></button>
+                        <button id="net-layer-btn-l7" data-layer="l7" onclick="showNetLayer('l7')" class="net-layer-btn px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold transition-colors whitespace-nowrap text-slate-400 hover:bg-slate-700 hover:text-white">L7 Application <span class="opacity-60 font-normal">30</span></button>
                         <button id="net-layer-btn-l6" data-layer="l6" onclick="showNetLayer('l6')" class="net-layer-btn px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold transition-colors whitespace-nowrap text-slate-400 hover:bg-slate-700 hover:text-white">L6 Presentation <span class="opacity-60 font-normal">2</span></button>
                         <button id="net-layer-btn-l5" data-layer="l5" onclick="showNetLayer('l5')" class="net-layer-btn px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold transition-colors whitespace-nowrap text-slate-400 hover:bg-slate-700 hover:text-white">L5 Session <span class="opacity-60 font-normal">2</span></button>
                         <button id="net-layer-btn-l4" data-layer="l4" onclick="showNetLayer('l4')" class="net-layer-btn px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold transition-colors whitespace-nowrap text-slate-400 hover:bg-slate-700 hover:text-white">L4 Transport <span class="opacity-60 font-normal">2</span></button>
-                        <button id="net-layer-btn-l3" data-layer="l3" onclick="showNetLayer('l3')" class="net-layer-btn px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold transition-colors whitespace-nowrap text-slate-400 hover:bg-slate-700 hover:text-white">L3 Network <span class="opacity-60 font-normal">14</span></button>
-                        <button id="net-layer-btn-l2" data-layer="l2" onclick="showNetLayer('l2')" class="net-layer-btn px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold transition-colors whitespace-nowrap text-slate-400 hover:bg-slate-700 hover:text-white">L2 Data Link <span class="opacity-60 font-normal">13</span></button>
+                        <button id="net-layer-btn-l3" data-layer="l3" onclick="showNetLayer('l3')" class="net-layer-btn px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold transition-colors whitespace-nowrap text-slate-400 hover:bg-slate-700 hover:text-white">L3 Network <span class="opacity-60 font-normal">16</span></button>
+                        <button id="net-layer-btn-l2" data-layer="l2" onclick="showNetLayer('l2')" class="net-layer-btn px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold transition-colors whitespace-nowrap text-slate-400 hover:bg-slate-700 hover:text-white">L2 Data Link <span class="opacity-60 font-normal">18</span></button>
                         <button id="net-layer-btn-l1" data-layer="l1" onclick="showNetLayer('l1')" class="net-layer-btn px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold transition-colors whitespace-nowrap text-slate-400 hover:bg-slate-700 hover:text-white">L1 Physical <span class="opacity-60 font-normal">1</span></button>
                     </div>
                     <p id="net-layer-desc" class="text-xs text-gray-400 mt-2">Cross-layer: the Network Integrity Monitor, Watchtower's unified alerts, the Detector Self-Test and offline PCAP analysis. Modules that act on more than one layer sit at the one they mostly watch.</p>
@@ -1893,8 +1902,8 @@
                         <!-- Visibility matrix reference (overview) -->
                         <details class="glass rounded-xl p-3 sm:p-4 md:col-span-2" ontoggle="netMatrixLoad(this)">
                             <summary class="cursor-pointer select-none text-sm font-semibold text-gray-300 hover:text-white">Module visibility matrix <span class="text-xs font-normal text-gray-500">— reference guide · every module by OSI layer × vantage tier</span></summary>
-                            <a href="/web/images/osi/matrix_full.jpg?v=20260930" target="_blank" rel="noopener" title="Open the full matrix">
-                                <img data-src="/web/images/osi/matrix_full.jpg?v=20260930" alt="Ragnar module visibility matrix: every module by OSI layer and vantage tier" class="block w-full h-auto rounded-lg mt-3">
+                            <a href="/web/images/osi/matrix_full.jpg?v=20261018-mikrotik-v3" target="_blank" rel="noopener" title="Open the full matrix">
+                                <img data-src="/web/images/osi/matrix_full.jpg?v=20261018-mikrotik-v3" alt="Ragnar module visibility matrix: every module by OSI layer and vantage tier" class="block w-full h-auto rounded-lg mt-3">
                             </a>
                             <p class="text-xs text-gray-500 mt-2">A clean verdict is only as wide as the tap: check a module's vantage tier before reading silence as safety. Each layer button above shows its own band of this matrix. Card letters are the vantage tier: <strong>A</strong> VLAN-wide · <strong>B</strong> link-local · <strong>C</strong> on-path unicast · <strong>D</strong> configured peer · <strong>E</strong> active / local · <strong>RF</strong> over-the-air. Tap the image to open it full-size.</p>
                         </details>
@@ -1935,7 +1944,7 @@
                             <div class="flex items-center justify-between gap-4">
                                 <div class="min-w-0">
                                     <h3 class="text-lg font-semibold">Watchtower <span class="text-xs font-normal text-gray-500">— unified watcher alerts</span></h3>
-                                    <p class="text-sm text-gray-400">One pane for the deep standalone watchers that each run as their own daemon — <strong>ARP&nbsp;Guard</strong>, <strong>NDP&nbsp;Watch</strong> (IPv6), <strong>Wi-Fi&nbsp;Watch</strong>, <strong>Legacy&nbsp;Wi-Fi</strong>, <strong>WPS&nbsp;Watch</strong>, <strong>Cert&nbsp;Watch</strong>, <strong>SNMP</strong>, <strong>IS-IS</strong>, <strong>IGMP</strong> and <strong>Dell&nbsp;Guard</strong> (OS10 SSRF-egress, <code>CVE-2025-22474</code>) — <strong>plus the in-app vendor CVE guards</strong> (<strong>Cisco</strong>, <strong>Juniper</strong>, <strong>Arista</strong>, <strong>Comware/VRF-hop</strong>, <strong>MikroTik/RouterOS</strong>, <strong>Aruba/PAPI</strong> and <strong>APC&nbsp;NMC/Ripple20</strong> — whose continuous <span class="font-mono">apcguard@</span> daemon streams here too), which now stream their findings into the same feed (any other watcher dropping a JSONL log in the watched dir is picked up automatically too). Watchtower tails each one's JSON-lines log, normalizes them into a single feed, and pages new <strong>high/critical</strong> findings through one deduped Pushover path. Read-only over the logs — it captures nothing itself. The standalone watchers each need their systemd unit running to appear here; the in-app guards feed it automatically whenever Extended Monitoring is on.</p>
+                                    <p class="text-sm text-gray-400">One pane for the deep standalone watchers that each run as their own daemon — <strong>ARP&nbsp;Guard</strong>, <strong>NDP&nbsp;Watch</strong> (IPv6), <strong>Wi-Fi&nbsp;Watch</strong>, <strong>Legacy&nbsp;Wi-Fi</strong>, <strong>WPS&nbsp;Watch</strong>, <strong>Cert&nbsp;Watch</strong>, <strong>SNMP</strong>, <strong>IS-IS</strong>, <strong>IGMP</strong> and <strong>Dell&nbsp;Guard</strong> (OS10 SSRF-egress, <code>CVE-2025-22474</code>) — <strong>plus the in-app vendor CVE guards</strong> (<strong>Cisco</strong>, <strong>Juniper</strong>, <strong>Arista</strong>, <strong>Comware/VRF-hop</strong>, <strong>MikroTik/RouterOS</strong>, <strong>Aruba/PAPI</strong>, <strong>APC&nbsp;NMC/Ripple20</strong> and <strong>Liebert/RomPager</strong> — whose continuous <span class="font-mono">apcguard@</span> and <span class="font-mono">liebert_guard@</span> daemons stream here too), which now stream their findings into the same feed (any other watcher dropping a JSONL log in the watched dir is picked up automatically too). Watchtower tails each one's JSON-lines log, normalizes them into a single feed, and pages new <strong>high/critical</strong> findings through one deduped Pushover path. Read-only over the logs — it captures nothing itself. The standalone watchers each need their systemd unit running to appear here; the in-app guards feed it automatically whenever Extended Monitoring is on.</p>
                                 </div>
                                 <label class="toggle-switch relative inline-flex items-center cursor-pointer shrink-0">
                                     <input type="checkbox" id="watchtower-enabled" class="sr-only peer" onchange="onWatchtowerToggled(this)">
@@ -1964,10 +1973,10 @@
                         <!-- Routing-scanner self-test + Scapy -->
                         <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
                             <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-                                <h3 class="text-lg font-semibold">Detector Self-Test <span class="text-xs font-normal text-gray-500">(IGMP · IPv6 · NDP · RA Guard · NTP · ICMP · SNMP · TLS · Cert · STP · SMB · Relay · LDAP · SSH · Telnet · DTP · CDP · VTP · EIGRP · IS-IS · FHRP · OSPF · ARP · MAC · DHCP · DNS · BGP · LACP · RPC · BFD · PTP · SR-MPLS · IPsec/IKE · DNS-Watch · Cisco · Juniper · Arista · Comware · MikroTik · Aruba · APC · Dell · speaker · OWD)</span></h3>
+                                <h3 class="text-lg font-semibold">Detector Self-Test <span class="text-xs font-normal text-gray-500">(IGMP · IPv6 · NDP · RA Guard · NTP · ICMP · SNMP · TLS · Cert · STP · SMB · Relay · LDAP · SSH · Telnet · DTP · CDP · VTP · MRP · EIGRP · IS-IS · PIM · RADIUS · RIP · FHRP · OSPF · ARP · MAC · DHCP · DNS · BGP · LACP · RPC · BFD · PTP · SR-MPLS · IPsec/IKE · DNS-Watch · Cisco · Juniper · Arista · Comware · MikroTik · Aruba · APC · Liebert · Dell · speaker · OWD · BGP-tap · BGPsec · BGP-SRTE)</span></h3>
                                 <div id="scapy-status" class="text-xs text-gray-400"></div>
                             </div>
-                            <p class="text-sm text-gray-400 mb-3 mt-1">Validates every passive detector by running each classifier against crafted attack captures — no root, no live traffic. Covers the routing/L2 scanners (IGMP, IPv6 first-hop, NDP, STP, DTP, CDP incl. <strong>CDPwn</strong> CVE screening, VTP, EIGRP, IS-IS, FHRP, OSPF), the host/AD detectors (SNMP, TLS, Cert, SMB, LDAP, Relay, <strong>SSH</strong> regreSSHion/Terrapin, <strong>Telnet</strong>, <strong>RPC/NetLogon</strong> incl. <strong>Zerologon</strong> / DCSync / WinRM), the link-aggregation integrity monitor (<strong>LACP</strong> LAG-hijack / flapping), the timing- and forwarding-plane watchers (<strong>BFD</strong> failover manipulation, <strong>PTP</strong> grandmaster takeover, <strong>SR-MPLS</strong> segment injection), the <strong>IPsec/IKE</strong> key-exchange posture detector (D(HE)at / weak DH groups, SWEET32, Aggressive Mode) — part of the cross-protocol <strong>D(HE)at</strong> (CVE-2002-20001) coverage that also names finite-field DH exposure in <strong>TLS</strong> and <strong>SSH</strong>, the vendor CVE guards (<strong>Cisco</strong>, <strong>Juniper</strong>, <strong>Arista</strong>, <strong>Comware</strong>, <strong>MikroTik</strong>, <strong>Aruba</strong>, <strong>APC</strong> (its vendored module's own 516-check tier plus the in-app capture adapter) and <strong>Dell</strong> — Dell Guard runs as a standalone daemon, so the panel exercises its offline classifier self-test), and the poisoning / rogue-device checks (<strong>ARP</strong> incl. HSRP/VRRP virtual-MAC awareness, <strong>MAC</strong> spoof/vendor-OUI/randomization incl. HSRP/VRRP virtual-MAC awareness, <strong>DHCP</strong> rogue-server/starvation, <strong>DNS</strong> poison parser/anchors). Installing <strong>Scapy</strong> adds an end-to-end leg that builds real packets, writes a pcap and parses it back through <span class="font-mono">tcpdump</span> (and Cert Watch grades a real local handshake), so the whole capture→parse→classify path is exercised. Recommended for a fully-validated security tool.</p>
+                            <p class="text-sm text-gray-400 mb-3 mt-1">Validates every passive detector by running each classifier against crafted attack captures — no root, no live traffic. Covers the routing/L2 scanners (IGMP, IPv6 first-hop, NDP, STP, DTP, CDP incl. <strong>CDPwn</strong> CVE screening, VTP, EIGRP, IS-IS, FHRP, OSPF), the host/AD detectors (SNMP, TLS, Cert, SMB, LDAP, Relay, <strong>SSH</strong> regreSSHion/Terrapin, <strong>Telnet</strong>, <strong>RPC/NetLogon</strong> incl. <strong>Zerologon</strong> / DCSync / WinRM), the link-aggregation integrity monitor (<strong>LACP</strong> LAG-hijack / flapping), the timing- and forwarding-plane watchers (<strong>BFD</strong> failover manipulation, <strong>PTP</strong> grandmaster takeover, <strong>SR-MPLS</strong> segment injection), the <strong>IPsec/IKE</strong> key-exchange posture detector (D(HE)at / weak DH groups, SWEET32, Aggressive Mode) — part of the cross-protocol <strong>D(HE)at</strong> (CVE-2002-20001) coverage that also names finite-field DH exposure in <strong>TLS</strong> and <strong>SSH</strong>, the vendor CVE guards (<strong>Cisco</strong>, <strong>Juniper</strong>, <strong>Arista</strong>, <strong>Comware</strong>, <strong>MikroTik</strong>, <strong>Aruba</strong>, <strong>APC</strong> (its vendored module's own 516-check tier plus the in-app capture adapter), <strong>Liebert</strong> (likewise, 198 checks plus live loopback) and <strong>Dell</strong> — Dell Guard runs as a standalone daemon, so the panel exercises its offline classifier self-test), and the poisoning / rogue-device checks (<strong>ARP</strong> incl. HSRP/VRRP virtual-MAC awareness, <strong>MAC</strong> spoof/vendor-OUI/randomization incl. HSRP/VRRP virtual-MAC awareness, <strong>DHCP</strong> rogue-server/starvation, <strong>DNS</strong> poison parser/anchors). Installing <strong>Scapy</strong> adds an end-to-end leg that builds real packets, writes a pcap and parses it back through <span class="font-mono">tcpdump</span> (and Cert Watch grades a real local handshake), so the whole capture→parse→classify path is exercised. Recommended for a fully-validated security tool.</p>
                             <div class="flex flex-wrap items-center gap-2">
                                 <button onclick="runRoutingSelftest()" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Run self-test</button>
                                 <button id="scapy-install-btn" onclick="installNetTool('scapy', this, runRoutingSelftest)" class="hidden bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Install the Scapy Python module for the end-to-end packet-crafting self-test">Install Scapy</button>
@@ -2021,13 +2030,13 @@
                 </div>
 
                 <!-- ===== L7 Application ===== -->
-                <div id="net-layer-l7" class="net-layer hidden" data-desc="DHCP, DNS, NTP, SNMP, Windows / AD, mail and file services, routing daemons and the vendor CVE guards.">
+                <div id="net-layer-l7" class="net-layer hidden" data-desc="DHCP, DNS, NTP, SNMP, Modbus, Windows / AD, mail and file services, routing daemons and the vendor CVE guards.">
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
                         <!-- Visibility matrix reference (l7) -->
                         <details class="glass rounded-xl p-3 sm:p-4 md:col-span-2" ontoggle="netMatrixLoad(this)">
                             <summary class="cursor-pointer select-none text-sm font-semibold text-gray-300 hover:text-white">Visibility matrix · L7 Application <span class="text-xs font-normal text-gray-500">— what a tap must see for each module here</span></summary>
-                            <a href="/web/images/osi/matrix_full.jpg?v=20260930" target="_blank" rel="noopener" title="Open the full matrix">
-                                <img data-src="/web/images/osi/matrix_l7.jpg?v=20260930" alt="Module visibility matrix, L7 Application band" class="block w-full h-auto rounded-lg mt-3">
+                            <a href="/web/images/osi/matrix_full.jpg?v=20261018-mikrotik-v3" target="_blank" rel="noopener" title="Open the full matrix">
+                                <img data-src="/web/images/osi/matrix_l7.jpg?v=20261018-mikrotik-v3" alt="Module visibility matrix, L7 Application band" class="block w-full h-auto rounded-lg mt-3">
                             </a>
                             <p class="text-xs text-gray-500 mt-2">Card letters are the vantage tier: <strong>A</strong> VLAN-wide · <strong>B</strong> link-local · <strong>C</strong> on-path unicast · <strong>D</strong> configured peer · <strong>E</strong> active / local · <strong>RF</strong> over-the-air. Tap the image for the full matrix (all layers).</p>
                         </details>
@@ -2048,8 +2057,8 @@
                         </div>
                         <!-- DNS Watch (passive DNS-response threat detector) -->
                         <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
-                            <h3 class="text-lg font-semibold mb-1">DNS Watch <span class="text-xs font-normal text-gray-500">(passive · port 53 · DNSSEC-CVE / cache-poisoning)</span></h3>
-                            <p class="text-xs text-amber-300/90 mb-2">Passive DNS-response threat detector — <strong>detection-only</strong>, never transmits (unlike the active <strong>DNS Doctor</strong> under this layer's active tools, which queries resolvers). Observes DNS answers on port 53 and flags weaknesses in the record structure: <strong>KeyTrap</strong> (<code>CVE-2023-50387</code> — colliding DNSKEY key-tags / RRSIG bursts that force a validator into quadratic crypto), <strong>NSEC3</strong> over-iteration (<code>CVE-2023-50868</code>), <strong>NXNSAttack</strong> referral amplification (<code>CVE-2020-8616</code>), <strong>MaginotDNS</strong> out-of-bailiwick cache-poisoning (<code>CVE-2021-25220</code>), <strong>DNSBomb</strong> pulsing DoS (<code>CVE-2024-33655</code>), and <strong>SAD&nbsp;DNS</strong> off-path race / low source-port entropy (<code>CVE-2020-25705</code> / weak-PRNG <code>CVE-2025-40780</code>). It also catches <strong>malformed records aimed at resolver parsers</strong> — compression-pointer loops (Unbound/dnsmasq <code>CVE-2026-81642</code>), malformed DNSKEY rdata (<code>CVE-2025-8677</code>), RRSIG label overrun, NSEC/NSEC3 chain escape and NSEC+NSEC3 coexistence (BIND/PowerDNS DNSSEC-validation CVEs) — plus <strong>protocol abuse</strong> (SVCB AliasMode fan-out, duplicated EDNS options, duplicate-RR floods, TKEY queries) and an <strong>unsigned multi-message zone transfer</strong> (TSIG absent, <code>CVE-2026-19033</code>). <strong>Dual-stack</strong> (A + AAAA, byte-identical logic). Pure-Python parser; the rate/baseline-gated detectors (DNSBomb, NXNS burst, NSEC3-encloser) accumulate best over a longer capture. AST-enforced no-transmit.</p>
+                            <h3 class="text-lg font-semibold mb-1">DNS Watch <span class="text-xs font-normal text-gray-500">(passive · DNS 53 / mDNS 5353 / LLMNR 5355 / NBT-NS 137 / DoT-DoQ 853)</span></h3>
+                            <p class="text-xs text-amber-300/90 mb-2">Passive DNS-response threat detector — <strong>detection-only</strong>, never transmits (unlike the active <strong>DNS Doctor</strong> under this layer's active tools, which queries resolvers). Observes DNS answers on port 53 and flags weaknesses in the record structure: <strong>KeyTrap</strong> (<code>CVE-2023-50387</code> — colliding DNSKEY key-tags / RRSIG bursts that force a validator into quadratic crypto), <strong>NSEC3</strong> over-iteration (<code>CVE-2023-50868</code>), <strong>NXNSAttack</strong> referral amplification (<code>CVE-2020-8616</code>), <strong>MaginotDNS</strong> out-of-bailiwick cache-poisoning (<code>CVE-2021-25220</code>), <strong>DNSBomb</strong> pulsing DoS (<code>CVE-2024-33655</code>), and <strong>SAD&nbsp;DNS</strong> off-path race / low source-port entropy (<code>CVE-2020-25705</code> / weak-PRNG <code>CVE-2025-40780</code>). It also catches <strong>malformed records aimed at resolver parsers</strong> — compression-pointer loops (Unbound/dnsmasq <code>CVE-2026-81642</code>), malformed DNSKEY rdata (<code>CVE-2025-8677</code>), RRSIG label overrun, NSEC/NSEC3 chain escape and NSEC+NSEC3 coexistence (BIND/PowerDNS DNSSEC-validation CVEs) — plus <strong>protocol abuse</strong> (SVCB AliasMode fan-out, duplicated EDNS options, duplicate-RR floods, TKEY queries) and an <strong>unsigned multi-message zone transfer</strong> (TSIG absent, <code>CVE-2026-19033</code>). <strong>v6</strong> adds an <strong>mDNS tier</strong> on UDP/5353: a <strong>Matter/Thread service census</strong> (informational — the only plane that names those fabrics on the wire, never an alarm) and the RFC&nbsp;6762 / CERT&nbsp;VU#550620 <strong>scope family</strong> — a hop-limit&nbsp;≠&nbsp;255 violation, and off-link mDNS source / open-reflector detection (<code>CVE-2015-2809</code> / <code>CVE-2017-6520</code> / <code>CVE-2015-1892</code>), armed from the capture interface's own subnets. <strong>v7</strong> adds <strong>SIGRed</strong> (<code>CVE-2020-1350</code>, CVSS&nbsp;10.0, CISA&nbsp;KEV — an oversized SIG/KEY record), a <strong>DDNS</strong> tier (RFC&nbsp;2136 dynamic updates: an unsigned or TSIG-<em>bypassed</em> update the zone <em>accepted</em> — a completed auth bypass, <code>CVE-2017-3143</code> — plus the BIND GSS-TSIG overflows <code>CVE-2020-8622</code> / <code>CVE-2020-8625</code> / <code>CVE-2021-25216</code>), and an <strong>rDNS</strong> posture tier (private reverse-lookups leaking to a public resolver, and <code>ip6.arpa</code> reverse-tree enumeration). <strong>v8</strong> adds BIND <strong>IXFR</strong> SOA-owner-not-apex (<code>CVE-2021-25214</code>) and five link-local / transport <strong>posture</strong> tiers — it captures <strong>LLMNR</strong> (5355), <strong>NBT-NS</strong> (137), <strong>encrypted DNS</strong> (DoT/DoQ 853) and unicast <strong>DNS-SD</strong>, flagging the vulnerable <em>query</em> (the <strong>WPAD</strong> MS16-077 fallback over NBT-NS, <code>CVE-2016-3213</code> / <code>CVE-2016-3236</code>; LLMNR/NBT-NS enabled at all; DNS-SD service enumeration; DoT/DoQ sessions that bypass your own resolver; DoH-endpoint resolution) while the poisoned <em>answer</em> stays with <strong>SMB&nbsp;Watch</strong>, plus <strong>TSIG/SIG(0)</strong> posture (weak HMAC, excessive fudge). <strong>v9</strong> adds the <strong>SPF / libspf2 parser</strong> tier — SPF TXT-record shapes that reach the libspf2 compile bugs (uppercase macro <code>url_encode</code> <code>CVE-2021-33912</code> / reverse <code>CVE-2021-33913</code>, an oversized <code>exp=</code> explanation literal <code>CVE-2021-20314</code>, and a macro-budget underflow <code>CVE-2023-42118</code>) — and <strong>TCP stream reassembly</strong> that de-truncates large/zone-transfer streams and flags a <strong>segment-overlap mismatch</strong> (two TCP segments giving different bytes for one sequence range — the classic Ptacek-Newsham passive-tap evasion). <strong>Dual-stack</strong> (A + AAAA, byte-identical logic). Pure-Python parser; the rate/baseline-gated detectors (DNSBomb, NXNS burst, NSEC3-encloser) accumulate best over a longer capture. AST-enforced no-transmit.</p>
                             <div class="flex flex-wrap items-center gap-2">
                                 <select id="dnswatch-iface" title="Interface for the capture — a segment carrying DNS, or a SPAN/mirror of one" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
                                     <option value="">Auto (wired first)</option>
@@ -2063,7 +2072,7 @@
                         <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
                             <h3 class="text-lg font-semibold mb-1">NTP Watch <span class="text-xs font-normal text-gray-500">(rogue time source · clock injection)</span></h3>
                             <p class="text-xs text-amber-300/90 mb-2">NTP (<span class="font-mono">UDP/123</span>) is the network's <strong>clock of record</strong>. A rogue NTP server that answers clients — or <strong>broadcasts</strong> — with the <strong>wrong time</strong> silently poisons every downstream timestamp: audit logs, <strong>TLS / Kerberos validity windows</strong>, MFA/TOTP codes, and lab-result / chain-of-custody records. On a precision-critical segment (medical, finance, industrial) a few seconds of skew is a real incident — yet nobody watches 123. <strong>Detection-only</strong> — it never sends an NTP query.</p>
-                            <p class="text-sm text-gray-400 mb-3">Passively captures NTP and flags <strong>time-injection</strong> (a source whose served time disagrees with the segment consensus / local clock), a <strong>rogue server</strong> (answering but not in the baseline), a <strong>Kiss-o'-Death</strong> (stratum-0 sync-DoS), <strong>stratum spoofing</strong> (a forged Stratum-1/GPS claim), a rogue <strong>broadcast</strong> time source, mode 6/7 <strong>monlist recon/amplification</strong>, <strong>on-path forgery</strong> (the same origin nonce echoed by two different servers — only the real one that answered a given client query holds it, so a second source replaying it is a racing spoofer), and anomalies (implausible root dispersion, leap-alarm, refid loop, <strong>Stratum 16 unsynced / reserved &gt;16</strong>, and an <strong>obsolete NTPv1/v2</strong> server reply). It also <strong>detects the Autokey RCE on the wire</strong>: an <strong>Autokey</strong> (RFC&nbsp;5906) extension field is surfaced as a deprecated, high-risk attack surface, and a <strong>malformed</strong> Autokey EF escalates to <strong>critical</strong> — that value/declared-length overflow is the exact on-wire signature of <strong>CVE-2014-9295</strong> and its sibling <strong>CVE-2014-9750</strong> (the ntpd <span class="font-mono">crypto_recv()</span> stack overflow → remote code execution as the ntpd user). Its mere presence also flags the wider deprecated-Autokey CVE family (e.g. <strong>CVE-2016-1547</strong>). Ordinary symmetric-key auth (a 4/20/24-octet MAC) is not Autokey and never trips it. <strong>New in v4:</strong> a <strong>crypto-NAK</strong> (a 4-octet MAC — key ID with an empty digest) on a <strong>symmetric</strong> association is flagged <strong>critical</strong> as the <strong>CVE-2015-7871</strong> (&ldquo;NAK to the Future&rdquo;) authentication bypass that mobilizes an unauthenticated peer able to steer the clock (a NAK in client/server mode is only noted &mdash; benign in isolation); and a <strong>mode-4 server reply with a zero origin timestamp</strong> &mdash; echoing no request the client actually sent &mdash; is flagged as an off-path spoofed response / origin-check bypass (<strong>CVE-2016-7431</strong> / <strong>CVE-2015-8138</strong>), gated to server replies so a legitimate client/broadcast zero origin never false-positives. First scan learns the trusted time source(s) (<span class="font-mono">data/ntp_watch.json</span>); "Trust current" re-learns.</p>
+                            <p class="text-sm text-gray-400 mb-3">Passively captures NTP and flags <strong>time-injection</strong> (a source whose served time disagrees with the segment consensus / local clock), a <strong>rogue server</strong> (answering but not in the baseline), a <strong>Kiss-o'-Death</strong> (stratum-0 sync-DoS), <strong>stratum spoofing</strong> (a forged Stratum-1/GPS claim), a rogue <strong>broadcast</strong> time source, mode 6/7 <strong>monlist recon/amplification</strong>, <strong>on-path forgery</strong> (the same origin nonce echoed by two different servers — only the real one that answered a given client query holds it, so a second source replaying it is a racing spoofer), and anomalies (implausible root dispersion, leap-alarm, refid loop, <strong>Stratum 16 unsynced / reserved &gt;16</strong>, and an <strong>obsolete NTPv1/v2</strong> server reply). It also <strong>detects the Autokey RCE on the wire</strong>: an <strong>Autokey</strong> (RFC&nbsp;5906) extension field is surfaced as a deprecated, high-risk attack surface, and a <strong>malformed</strong> Autokey EF escalates to <strong>critical</strong> — that value/declared-length overflow is the exact on-wire signature of <strong>CVE-2014-9295</strong> and its sibling <strong>CVE-2014-9750</strong> (the ntpd <span class="font-mono">crypto_recv()</span> stack overflow → remote code execution as the ntpd user). Its mere presence also flags the wider deprecated-Autokey CVE family (e.g. <strong>CVE-2016-1547</strong>). Ordinary symmetric-key auth (a 4/20/24-octet MAC) is not Autokey and never trips it. <strong>New in v4:</strong> a <strong>crypto-NAK</strong> (a 4-octet MAC — key ID with an empty digest) on a <strong>symmetric</strong> association is flagged <strong>critical</strong> as the <strong>CVE-2015-7871</strong> (&ldquo;NAK to the Future&rdquo;) authentication bypass that mobilizes an unauthenticated peer able to steer the clock (a NAK in client/server mode is only noted &mdash; benign in isolation); and a <strong>mode-4 server reply with a zero origin timestamp</strong> &mdash; echoing no request the client actually sent &mdash; is flagged as an off-path spoofed response / origin-check bypass (<strong>CVE-2016-7431</strong> / <strong>CVE-2015-8138</strong>), gated to server replies so a legitimate client/broadcast zero origin never false-positives. <strong>New in v11:</strong> an <strong>oversize NTP datagram</strong> (over 1500 bytes — the ntpd remote-crash vector, <strong>CVE-2016-9312</strong>) and a <strong>mode-6 control header whose <span class="font-mono">count</span> overruns</strong> the 468-octet spec maximum or the datagram itself (the ntpsec out-of-bounds read, <strong>CVE-2019-6444</strong> / <strong>CVE-2019-6443</strong>) flag a critical crash/overrun shape; a conformant full-size ntpq response never does, and mode-6/7 data is no longer misread as an Autokey field. It is now <strong>dual-stack</strong>: IPv6 NTP is parsed (including NTP behind an IPv6 extension header) and a spoofed <span class="font-mono">::1</span> source is caught like <span class="font-mono">127.x</span>. First scan learns the trusted time source(s) (<span class="font-mono">data/ntp_watch.json</span>); "Trust current" re-learns.</p>
                             <div class="flex flex-wrap items-center gap-2">
                                 <select id="ntp-iface" title="Interface for the NTP capture — pick the LAN/WiFi NIC for the segment to watch" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
                                     <option value="">Auto (wired first)</option>
@@ -2088,6 +2097,38 @@
                                 <button onclick="snmpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current SNMP agents / community strings as the baseline — use after a legitimate SNMP change">Trust current</button>
                             </div>
                             <div id="snmp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                        </div>
+                        <!-- RADIUS Watch (passive RADIUS/EAP — BlastRADIUS + FreeRADIUS CVEs) -->
+                        <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                            <h3 class="text-lg font-semibold mb-1">RADIUS Watch <span class="text-xs font-normal text-gray-500">(passive AAA · BlastRADIUS + FreeRADIUS CVEs)</span></h3>
+                            <p class="text-xs text-amber-300/90 mb-2">RADIUS carries network <strong>authentication</strong> (802.1X / Wi-Fi / VPN / admin logins) in the clear, protected only by <span class="font-mono">MD5(secret ‖ Request-Authenticator)</span>. The dedicated RADIUS protocol detector — it takes over the <strong>BlastRADIUS</strong> (<span class="font-mono">CVE-2024-3596</span>) engine that lived in Arista Guard and adds RADIUS/EAP auth posture plus the FreeRADIUS CVEs with a deterministic wire shape. <strong>Detection-only</strong> — no socket, no probe. Attribute values (passwords, secrets, State) never enter a finding; only digests, lengths and booleans. Direction is decided by the RADIUS <strong>code</strong>, not the port.</p>
+                            <p class="text-sm text-gray-400 mb-3">Passively captures RADIUS (auth udp/1812+1645, acct udp/1813+1646, CoA udp/3799) and RadSec presence (2083). <strong>Attack:</strong> <strong>forgery</strong> (Proxy-State collision block), <strong>Proxy-State injection</strong> on the NAS-side leg (the forged Access-Accept), a non-UTF-8 <strong>Reply-Message</strong> or opaque <strong>Vendor-Specific</strong> exfil, plus the FreeRADIUS wire shapes — WiMAX VSA overflow (<span class="font-mono">CVE-2017-10979/10984</span>), zero-length concat (<span class="font-mono">CVE-2017-10985</span>), EAP-pwd <strong>Dragonblood</strong> reflected/invalid Commit (<span class="font-mono">CVE-2019-11234/11235</span>), EAP-SIM unknown attribute (<span class="font-mono">CVE-2022-41860</span>), Ascend abinary overflow (<span class="font-mono">CVE-2022-41861</span>) and short Ascend secret (<span class="font-mono">CVE-2017-10978</span>). <strong>Exposure:</strong> cleartext RADIUS, a missing/late <strong>Message-Authenticator</strong>, an unauthenticated response, <strong>PAP</strong>/<strong>CHAP</strong>, a weak <strong>EAP method</strong> (MD5/LEAP), a CoA without M-A, and a RadSec pair that falls back to cleartext. <strong>Dual-stack</strong>, including IPv6 behind extension headers. RadSec's TLS/DTLS itself is <a href="#tls-watch" class="text-cyan-400 underline">TLS Watch</a>'s job.</p>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <select id="radius-iface" title="Interface for the RADIUS capture — pick the NIC facing your NAS / RADIUS servers or a SPAN/mirror" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                    <option value="">Auto (wired first)</option>
+                                </select>
+                                <input id="radius-secs" type="number" min="5" max="50" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <button onclick="runRadiusWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan RADIUS</button>
+                            </div>
+                            <div id="radius-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                        </div>
+                        <!-- Modbus Watch (Modbus/TCP posture: PLC writes / listen-only / UMAS) -->
+                        <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                            <h3 class="text-lg font-semibold mb-1">Modbus Watch <span class="text-xs font-normal text-gray-500">(passive · tcp/502 · PLC / OT segment)</span></h3>
+                            <p class="text-xs text-amber-300/90 mb-2">Modbus/TCP has <strong>no authentication and no encryption</strong>: any host that can reach a PLC on <span class="font-mono">tcp/502</span> can write its coils and registers. So the question is <strong>who is talking to the PLCs and what are they telling them to do</strong>. <strong>Detection-only</strong> — it never sends a Modbus request.</p>
+                            <p class="text-sm text-gray-400 mb-3">Learns which masters talk to each PLC (per slave and unit ID; a one-hour window from the first Modbus seen, kept in <span class="font-mono">data/modbus_watch.json</span>), then flags a <strong>write from an unlearned master</strong> (or any function code from one), <strong>FC8 Force Listen Only</strong> — which silently drops a slave off the bus — and FC8 restart / clear-counters, Schneider <strong>UMAS</strong> (FC90) activity and the <strong>ModiPwn</strong> read-then-reconfigure sequence (<code>CVE-2021-22779</code>), Read-Device-ID <strong>enumeration</strong> bursts and <strong>unit-ID sweeps</strong>. <strong>Malformed MBAP/PDU framing</strong> — the libmodbus over-read / over-reply shape (<code>CVE-2019-14462</code>, <code>CVE-2019-14463</code>, <code>CVE-2024-10918</code>) — is flagged as a <em>trigger</em>: it shows the packet, not that the PLC runs libmodbus. Optional: declare the OT subnet(s) to flag Modbus outside them; a PLC also seen on Modbus Security (<span class="font-mono">802</span>/TLS) is flagged when reached in plaintext. <strong>Dual-stack</strong>, including IPv6 behind extension headers. Modbus RTU/serial is out of scope.</p>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <select id="modbus-iface" title="Interface for the capture — a segment carrying Modbus/TCP, or a SPAN/mirror of one" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                    <option value="">Auto (wired first)</option>
+                                </select>
+                                <input id="modbus-secs" type="number" min="5" max="60" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <input id="modbus-ot" type="text" placeholder="OT subnet(s), e.g. 10.20.0.0/24" oninput="this.dataset.touched='1'" title="Declared OT subnet(s), comma-separated (optional) — Modbus outside them is flagged (MBW-040). Saved with the baseline." class="w-full sm:w-64 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <button onclick="runModbusWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan Modbus</button>
+                                <button onclick="modbusBaseline('arm')" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="End the learning window now: the masters learned so far are trusted, any other master alerts">Arm now</button>
+                                <button onclick="modbusBaseline('reset')" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Forget the learned masters — use after a legitimate SCADA/HMI change">Re-learn</button>
+                            </div>
+                            <p id="modbus-baseline" class="text-xs text-gray-500 mt-2"></p>
+                            <div id="modbus-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                         </div>
                         <h3 class="md:col-span-2 text-xs font-semibold uppercase tracking-wider text-gray-400">Passive · Windows &amp; directory</h3>
                         <!-- SMB Watch (SMBv1 + LLMNR/NBT-NS/mDNS poisoning) -->
@@ -2274,8 +2315,8 @@
                         <!-- Cisco Switch & Router Guard -->
                         <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
                             <h3 class="text-lg font-semibold mb-1">Cisco Switch and Router Guard <span class="text-xs font-normal text-gray-500">(IOS / IOS-XE / NX-OS · switch · router · edge)</span></h3>
-                            <p class="text-xs text-amber-300/90 mb-2">Passive Cisco router/switch CVE guard — <strong>detection-only</strong>, never transmits, probes or authenticates. Reports three classes of evidence about a tracked CVE set: <strong>posture</strong> (a version/platform fingerprint screened against the catalog — a "verify THIS device" note, never a verdict), <strong>exposure</strong> (an enabling condition on the wire — cleartext SNMP, a default community, an HTTP UI or Telnet to infrastructure) and <strong>attack</strong> (an exploitation primitive in transit — the CVE-2025-20352 SNMP overflow shape, an oversized field, a VLAN tag-stack anomaly, or an NX-OS Telnet shell-escape / CVE-2024-20399). New IPv6 / IKEv2 attack shapes: an <strong>IKEv2 message whose declared length overruns its datagram</strong> (CVE-2024-20307/20308), a <strong>malformed DHCPv6 option</strong> (CVE-2024-20259 shape — option overrun / trailing bytes / implausible relay hop-count), and a deprecated <strong>IPv6 Routing Header type&nbsp;0</strong> (RFC 5095 source-routing) on the segment. <strong>VXLAN / NGOAM</strong> (CVE-2021-1587): a VXLAN fabric on the segment (<strong>CG-110</strong>) and, the attack shape, a <strong>TRILL-OAM / 802.1ag CFM frame tunnelled inside VXLAN</strong> — the NGOAM delivery path (<strong>CG-111</strong>/<strong>CG-290</strong>), with a malformed CFM header raising <strong>CG-291</strong>; the capture is gated on the inner ethertype (0x8902) so a whole VXLAN tenant stream never lands on a Pi. <strong>CAPWAP / NBAR</strong> (CVE-2025-20315): CAPWAP on the segment (<strong>CG-112</strong>, WLC control/data UDP 5246/5247) and a <strong>structurally malformed CAPWAP header</strong> — non-zero version, an HLEN below minimum or overrunning the datagram, or reserved bits set — the unauthenticated remote-reload shape NBAR/AVC mishandles on IOS&nbsp;XE (<strong>CG-292</strong>). Firewalls (ASA/Firepower/FTD) are screened out of scope, not misclassified.</p>
-                            <p class="text-sm text-gray-400 mb-3">One short passive capture over the Cisco management + attack surface (SNMP 161/162, Telnet 23, HTTP UIs 80/8080/8443, IKEv2 500/4500, DHCPv6 546/547). SNMP is BER-parsed for the community, OID-arc depth and field sizes; the IKEv2/DHCPv6 headers and the IPv6 extension-header chain are walked from the reconstructed packet bytes; no TCP reassembly, so a segmented HTTP/Telnet attack is best-effort (a hit is high-confidence, a miss inconclusive).</p>
+                            <p class="text-xs text-amber-300/90 mb-2">Passive Cisco router/switch CVE guard — <strong>detection-only</strong>, never transmits, probes or authenticates. Reports three classes of evidence about a tracked CVE set: <strong>posture</strong> (a version/platform fingerprint screened against the catalog — a "verify THIS device" note, never a verdict), <strong>exposure</strong> (an enabling condition on the wire — cleartext SNMP, a default community, an HTTP UI or Telnet to infrastructure) and <strong>attack</strong> (an exploitation primitive in transit — the CVE-2025-20352 SNMP overflow shape, an oversized field, a VLAN tag-stack anomaly, or an NX-OS Telnet shell-escape / CVE-2024-20399). New IPv6 / IKEv2 attack shapes: an <strong>IKEv2 message whose declared length overruns its datagram</strong> (CVE-2024-20307/20308), a <strong>malformed DHCPv6 option</strong> (CVE-2024-20259 shape — option overrun / trailing bytes / implausible relay hop-count), and a deprecated <strong>IPv6 Routing Header type&nbsp;0</strong> (RFC 5095 source-routing) on the segment. <strong>VXLAN / NGOAM</strong> (CVE-2021-1587): a VXLAN fabric on the segment (<strong>CG-110</strong>) and, the attack shape, a <strong>TRILL-OAM / 802.1ag CFM frame tunnelled inside VXLAN</strong> — the NGOAM delivery path (<strong>CG-111</strong>/<strong>CG-290</strong>), with a malformed CFM header raising <strong>CG-291</strong>; the capture is gated on the inner ethertype (0x8902) so a whole VXLAN tenant stream never lands on a Pi. <strong>CAPWAP / NBAR</strong> (CVE-2025-20315): CAPWAP on the segment (<strong>CG-112</strong>, WLC control/data UDP 5246/5247) and a <strong>structurally malformed CAPWAP header</strong> — non-zero version, an HLEN below minimum or overrunning the datagram, or reserved bits set — the unauthenticated remote-reload shape NBAR/AVC mishandles on IOS&nbsp;XE (<strong>CG-292</strong>). <strong>LISP</strong> (CVE-2024-20311): LISP on the segment (<strong>CG-107</strong>) and the attack shapes — a <strong>malformed LISP control header</strong> (<strong>CG-240</strong>) and a <strong>source-EID AFI that overruns the datagram</strong> (<strong>CG-241</strong>). <strong>Cisco Small Business switch web UI</strong> (<strong>CG-113</strong>): the May 2023 cluster — four 9.8 RCEs + four 8.6 DoS + info-disclosure — screened from the SG/CBS switch model in the HTTP banner (the 220 Series is excluded, Cisco says it is not affected). Version posture now names the <strong>August 2026 IOS-XE advisory wave</strong> (incl. the 9.8 CVE-2026-20272) and NX-OS CVE-2025-20111. <strong>TWAMP / IP SLA</strong>: the TWAMP control plane on TCP 862 (<strong>CG-114</strong>, CVE-2025-20154 / CVE-2021-34720), a Server Greeting offering <strong>Unauthenticated mode</strong> (<strong>CG-115</strong>) or a malformed one (<strong>CG-294</strong>), and IP SLA Responder control on UDP 1967 (<strong>CG-116</strong>). <strong>WLC</strong>: a Catalyst 9800 identity → verify the OOB AP-image download <span class="font-mono">CVE-2025-20188</span> (10.0 hardcoded-JWT upload, <strong>CG-105</strong>). <strong>SD-WAN</strong>: a vManage API path → <span class="font-mono">CVE-2026-20133</span> (<strong>CG-106</strong>). Firewalls (ASA/Firepower/FTD) are screened out of scope, not misclassified.</p>
+                            <p class="text-sm text-gray-400 mb-3">One short passive capture over the Cisco management + attack surface (SNMP 161/162, Telnet 23, HTTP UIs 80/8080/8443, IKEv2 500/4500, DHCPv6 546/547, LISP 4341/4342, TWAMP 862, IP SLA 1967). SNMP is BER-parsed for the community, OID-arc depth and field sizes; the IKEv2/DHCPv6 headers and the IPv6 extension-header chain are walked from the reconstructed packet bytes; no TCP reassembly, so a segmented HTTP/Telnet attack is best-effort (a hit is high-confidence, a miss inconclusive).</p>
                             <div class="flex flex-wrap items-center gap-2">
                                 <select id="cisco-guard-iface" title="Interface for the capture — LAN-only: pick the LAN/uplink NIC or a SPAN/mirror port (Wi-Fi is ignored)" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
                                     <option value="">Auto (LAN connections)</option>
@@ -2302,8 +2343,8 @@
                         <!-- Arista Switch & Router Guard -->
                         <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
                             <h3 class="text-lg font-semibold mb-1">Arista Guard <span class="text-xs font-normal text-gray-500">(EOS · switch · router · edge · core)</span></h3>
-                            <p class="text-xs text-amber-300/90 mb-2">Passive Arista EOS CVE guard — <strong>detection-only</strong>, never transmits. Reads the EOS version/platform from <strong>LLDP</strong>, and runs a full <strong>BlastRADIUS</strong> (CVE-2024-3596) engine over <strong>RADIUS</strong>: cleartext exposure, a missing or non-first Message-Authenticator, an unauthenticated response, a <strong>Proxy-State collision block</strong> (bytes summed so splitting it can't evade the bound), <strong>Proxy-State injected on the NAS-side leg</strong> (request↔response correlated by 4-tuple + Identifier — the forged-Access-Accept shape), and collision data smuggled <em>outside</em> Proxy-State in a malformed <strong>Reply-Message</strong> or an opaque <strong>Vendor-Specific</strong> attribute — plus a gNOI <strong>TransferToRemote</strong> credential marker in cleartext accounting (CVE-2025-0936). It also screens <strong>SSH banners</strong> for the <strong>regreSSHion</strong> window (CVE-2024-6387/6409) and flags management listeners (gNMI/gNOI, CVX, VXLAN decap) and VLAN tag-stack CPU-punt anomalies. Attribute values are never retained — Proxy-State is compared by digest. Non-EOS Arista products (CloudVision/VeloCloud/DANZ) are screened out of scope.</p>
-                            <p class="text-sm text-gray-400 mb-3">One short passive capture (RADIUS 1812/1813/1645/1646, SSH 22, gNMI 6030/9339/50051, CVX 9979, VXLAN 4789/8472, LLDP). Thresholds are structural anomaly bounds set well above legitimate traffic, not published vendor constants.</p>
+                            <p class="text-xs text-amber-300/90 mb-2">Passive Arista <strong>EOS switch/router</strong> CVE guard — <strong>detection-only</strong>, never transmits (the vendored engine has no socket, subprocess or injector; scapy loads only on its own live path). Tracks <strong>17 EOS CVEs</strong> across posture / exposure / attack. Reads the EOS version + platform from <strong>LLDP</strong> and screens them against the catalog — non-EOS Arista products (CloudVision / VeloCloud / DANZ / Awake) are screened <em>out of scope</em>. Runs the full <strong>BlastRADIUS</strong> (CVE-2024-3596) engine over RADIUS — cleartext, a missing or non-first Message-Authenticator, a <strong>Proxy-State collision block</strong> (bytes summed so splitting can't evade it), <strong>NAS-side Proxy-State injection</strong> (request↔response correlated by 4-tuple + Identifier — the forged-Access-Accept shape), and collision data smuggled in a malformed <strong>Reply-Message</strong> or opaque <strong>Vendor-Specific</strong> attribute — now <strong>scoped to Arista hardware</strong> learned from LLDP (the vendor-neutral RADIUS posture lives in RADIUS Watch). Also flags gNMI / <strong>gNOI</strong> authorization exposure (CVE-2025-1259/1260) and a gNOI <strong>TransferToRemote</strong> credential marker in cleartext accounting (CVE-2025-0936), <strong>regreSSHion</strong> SSH banners (CVE-2024-6387/6409), the actively-exploited <strong>tunnel-decapsulation</strong> type-confusion (CVE-2026-7473), VLAN tag CPU-punt / cross-VLAN leaks (CVE-2024-5872/9448/11185), an OSPFv3 CPU-exhaustion shape (CVE-2025-8872), a CVX-driven Sysdb crash (CVE-2025-5089) and an IPsec dataplane halt (CVE-2025-8873). Attribute values are never retained — Proxy-State is compared by digest.</p>
+                            <p class="text-sm text-gray-400 mb-3">One short passive capture (LLDP, RADIUS 1812/1813/1645/1646, SSH 22, gNMI 6030/9339/50051, CVX 9979, VXLAN 4789/8472, IPsec/ESP). Findings are <strong>posture</strong> (version/platform screen — "verify this device"), <strong>exposure</strong> (an enabling condition is visibly present) or <strong>attack</strong> (an exploitation primitive observed on the wire). Thresholds are structural anomaly bounds set well above legitimate traffic, not published vendor constants; the one actively-exploited CVE (CVE-2026-7473) is carried below the usual CVSS floor by policy.</p>
                             <div class="flex flex-wrap items-center gap-2">
                                 <select id="arista-guard-iface" title="Interface for the capture — LAN-only: pick the LAN/uplink NIC or a SPAN/mirror port (Wi-Fi is ignored)" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
                                     <option value="">Auto (LAN connections)</option>
@@ -2352,7 +2393,7 @@
                         <!-- MikroTik Switch & Router Guard -->
                         <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
                             <h3 class="text-lg font-semibold mb-1">MikroTik Switch and Router Guard <span class="text-xs font-normal text-gray-500">(RouterOS · CCR / CRS · switch · router)</span></h3>
-                            <p class="text-xs text-amber-300/90 mb-2">Passive MikroTik RouterOS CVE guard — <strong>detection-only</strong>, never transmits. Reads the RouterOS management + attack surface off the wire and names the exploit signatures for a tracked CVE set: the two CISA-KEV bugs — <strong>Winbox path traversal</strong> that reads the credential store (<strong>CVE-2018-14847</strong>, MTK-003) and the pre-auth <strong>SMB/NetBIOS overflow</strong> (<strong>CVE-2018-7445</strong>, MTK-002) — plus <strong>WebFig credentials in the clear</strong> (CVE-2025-61481, MTK-001), the <strong>REST libjson</strong> overflow (CVE-2025-10948, MTK-005), <strong>SCEP</strong> base64/ASN.1 overflows (CVE-2021-41987 / CVE-2026-7668, MTK-013/008), <strong>hotspot</strong> (CVE-2022-45313, MTK-017), <strong>jsproxy</strong> (CVE-2026-67281, MTK-006), <strong>FTP</strong> request overflow (CVE-2020-22845, MTK-014), <strong>autoupgrade .npk origin bypass</strong> (CVE-2019-3977, MTK-020), <strong>DNS unrelated-data cache poisoning</strong> (CVE-2019-3979, MTK-019), the IPv6-only <strong>RDNSS RA overflow</strong> (CVE-2023-32154, MTK-007) and <strong>traceroute-range firewall bypass</strong> (CVE-2023-47310, MTK-010). It also reads the RouterOS version from <strong>MNDP</strong> to flag <strong>Chimay-Red</strong> posture (CVE-2017-20149, MTK-011 — version is dispositive because RouterOS ships one monolithic image), and correlates a gated exploit on a device already seen in cleartext management (<strong>MTK-C01</strong>). <strong>v2</strong> adds the actively exploited <strong>MikroTrick</strong> chain (<code>CVE-2026-67276</code> + <code>CVE-2026-86060</code>, MTK-021 — forge an SSH key from the public modulus, then escalate via a crafted username) as an honest <strong>exposure</strong> finding: a RouterOS version inside the fix train (below 6.49.21 / 7.23.4 / 7.24.2 / 7.25beta3), read from MNDP or the cleartext <span class="font-mono">SSH-2.0-ROSSSH-x.y.z</span> banner, <em>with SSH seen on the wire</em>. The attack itself runs inside encrypted SSH authentication and can never be seen passively — so silence is <strong>not</strong> evidence of safety; the finding says to check the device.</p>
+                            <p class="text-xs text-amber-300/90 mb-2">Passive MikroTik RouterOS CVE guard — <strong>detection-only</strong>, never transmits. Reads the RouterOS management + attack surface off the wire and names the exploit signatures for a tracked CVE set: the two CISA-KEV bugs — <strong>Winbox path traversal</strong> that reads the credential store (<strong>CVE-2018-14847</strong>, MTK-003) and the pre-auth <strong>SMB/NetBIOS overflow</strong> (<strong>CVE-2018-7445</strong>, MTK-002) — plus <strong>WebFig credentials in the clear</strong> (CVE-2025-61481, MTK-001), the <strong>REST libjson</strong> overflow (CVE-2025-10948, MTK-005), <strong>SCEP</strong> base64/ASN.1 overflows (CVE-2021-41987 / CVE-2026-7668, MTK-013/008), <strong>hotspot</strong> (CVE-2022-45313, MTK-017), <strong>jsproxy</strong> (CVE-2026-67281, MTK-006), <strong>FTP</strong> request overflow (CVE-2020-22845, MTK-014), <strong>autoupgrade .npk origin bypass</strong> (CVE-2019-3977, MTK-020), <strong>DNS unrelated-data cache poisoning</strong> (CVE-2019-3979, MTK-019), the IPv6-only <strong>RDNSS RA overflow</strong> (CVE-2023-32154, MTK-007) and <strong>traceroute-range firewall bypass</strong> (CVE-2023-47310, MTK-010). It also reads the RouterOS version from <strong>MNDP</strong> to flag <strong>Chimay-Red</strong> posture (CVE-2017-20149, MTK-011 — version is dispositive because RouterOS ships one monolithic image), and correlates a gated exploit on a device already seen in cleartext management (<strong>MTK-C01</strong>). <strong>v2</strong> adds the actively exploited <strong>MikroTrick</strong> chain (<code>CVE-2026-67276</code> + <code>CVE-2026-86060</code>, MTK-021 — forge an SSH key from the public modulus, then escalate via a crafted username) as an honest <strong>exposure</strong> finding: a RouterOS version inside the fix train (below 6.49.21 / 7.23.4 / 7.24.2 / 7.25beta3), read from MNDP or the cleartext <span class="font-mono">SSH-2.0-ROSSSH-x.y.z</span> banner, <em>with SSH seen on the wire</em>. The attack itself runs inside encrypted SSH authentication and can never be seen passively — so silence is <strong>not</strong> evidence of safety; the finding says to check the device. <strong>v3</strong> (the October 2026 audit) adds two more codes: the pre-auth <strong>SMB1 SessionSetupAndX</strong> crafted <span class="font-mono">uniPwdLen</span> (<code>CVE-2026-56719</code> + <code>CVE-2026-89028</code>, MTK-022 — one code for both, since the tap sees the crafted frame but never which way the daemon's handler then broke), and the unauthenticated <strong>web-management HTTP body-length underflow</strong> (<code>CVE-2026-84411</code>, MTK-023) — a <strong>structural class</strong>, not a CVE-exact signature, because the malformation was withheld by vendor and CISA, so it flags requests that lie about their body length (negative, non-numeric, over-64-bit, conflicting or chunked-plus-length) at medium confidence, and raises a version-screen <strong>posture</strong> from MNDP alone. Two further v3 CVEs are covered where their decoder already lives — the <strong>xt_tls SNI over-read</strong> in <strong>TLS Watch</strong> and the <strong>labelled-VPN NLRI</strong> underflow in <strong>BGP Path Watch</strong> — rather than duplicated here.</p>
                             <p class="text-sm text-gray-400 mb-3">One short passive capture over WebFig/REST/SCEP/hotspot HTTP (80/8080), Winbox (8291), SMB (139/445), FTP (21), DNS (53), MNDP (5678), ICMPv6 RAs and SSH (22 — only SYNs and the cleartext banner, so bulk SSH never floods the capture) — dual-stack (bare <span class="font-mono">port</span> clauses match v4 and v6; a narrow <span class="font-mono">ip6[6]</span> clause admits v6 behind an extension header). Needs a SPAN/mirror to see other hosts. Signature-based on the per-packet capture model: the standalone's flow-behaviour codes (the www/jsproxy <em>crash</em> teardown MTK-011-event/MTK-012, the Winbox→DNS→downgrade chain MTK-018/C02/C03), the VTEP-peer-gated VXLAN code (MTK-009) and the native-L2 bridge2 code (MTK-016) are <strong>not</strong> ported — each needs flow state, operator config, or raw L2 frames the guard's IP-onward capture can't provide.</p>
                             <div class="flex flex-wrap items-center gap-2">
                                 <select id="mikrotik-guard-iface" title="Interface for the capture — LAN-only: pick the LAN/uplink NIC or a SPAN/mirror port (Wi-Fi is ignored)" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
@@ -2380,7 +2421,7 @@
                         <!-- APC Guard (APC / Schneider NMC — Ripple20) -->
                         <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
                             <h3 class="text-lg font-semibold mb-1">APC Guard <span class="text-xs font-normal text-gray-500">(APC / Schneider NMC · rack PDU · ATS · UPS)</span></h3>
-                            <p class="text-xs text-amber-300/90 mb-2">Passive APC Network Management Card guard for <strong>Ripple20</strong> (Treck TCP/IP stack) — <strong>detection-only</strong>, never transmits. Reads the card's <strong>SNMP sysDescr</strong> and gates the <strong>NMC1 / NMC2 / NMC3</strong> AOS version against Schneider's per-application table (<strong>APC-001/002/003</strong>, version in range — never "vulnerable", sysDescr can't prove patch state). Flags the attack shapes against a known card: <strong>fragmented IP-in-IP</strong> and an <strong>inner length shorter than the data</strong> (APC-101/102, CVE-2020-11896), a <strong>protocol-unreachable that quotes bytes not in the packet</strong> — heap disclosure (APC-106, CVE-2020-11898), <strong>IPv6-in-IPv4</strong> to a card (APC-105, CVE-2020-11902), and <strong>malformed DNS answers</strong> — CNAME overrun, looping or overlong names (APC-111/112, CVE-2020-11901). Tunnel and DNS attempts are only analysed against cards it knows: cards seen answering SNMP are <strong>remembered across scans</strong>, and you can <strong>declare cards</strong> below (add a MAC only where the tap sees the card's own frames). IPv4 + IPv6.</p>
+                            <p class="text-xs text-amber-300/90 mb-2">Passive APC Network Management Card guard for <strong>Ripple20</strong> (Treck TCP/IP stack) — <strong>detection-only</strong>, never transmits. Reads the card's <strong>SNMP sysDescr</strong> and gates the <strong>NMC1 / NMC2 / NMC3</strong> AOS version against Schneider's per-application table (<strong>APC-001/002/003</strong>, version in range — never "vulnerable", sysDescr can't prove patch state). Flags the attack shapes against a known card: <strong>fragmented IP-in-IP</strong> and an <strong>inner length shorter than the data</strong> (APC-101/102, CVE-2020-11896), a <strong>protocol-unreachable that quotes bytes not in the packet</strong> — heap disclosure (APC-106, CVE-2020-11898), <strong>IPv6-in-IPv4</strong> to a card (APC-105, CVE-2020-11902), and <strong>malformed DNS answers</strong> — CNAME overrun, looping or overlong names (APC-111/112, CVE-2020-11901). Tunnel and DNS attempts are only analysed against cards it knows: cards seen answering SNMP are <strong>remembered across scans</strong>, and you can <strong>declare cards</strong> below (add a MAC only where the tap sees the card's own frames). IPv4 + IPv6. For Vertiv / Liebert power cards, see <strong>Liebert Guard</strong> (next card).</p>
                             <p class="text-sm text-gray-400 mb-3">One short passive capture on the segment (a SPAN/mirror of the management VLAN sees the SNMP polls and any tunnel traffic).</p>
                             <div class="flex flex-wrap items-center gap-2">
                                 <select id="apc-guard-iface" title="Interface for the capture — LAN-only: pick the LAN/uplink NIC or a SPAN/mirror port (Wi-Fi is ignored)" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
@@ -2394,6 +2435,21 @@
                                 <label class="flex items-center gap-1 text-xs text-gray-400 whitespace-nowrap" title="Clear the cards learned from SNMP replies on the next scan"><input type="checkbox" id="apc-guard-forget"> Forget learned cards</label>
                             </div>
                             <div id="apc-guard-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                        </div>
+                        <!-- Liebert Guard (Vertiv / Liebert power cards — companion to APC Guard) -->
+                        <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                            <h3 class="text-lg font-semibold mb-1">Liebert Guard <span class="text-xs font-normal text-gray-500">(Vertiv / Liebert · rack PDU · cooling · UPS cards · RomPager)</span></h3>
+                            <p class="text-xs text-amber-300/90 mb-2">Passive companion to <strong>APC Guard</strong> for the other big power-gear family — <strong>detection-only</strong>, never transmits. Reads the card's <strong>cleartext HTTP</strong> web UI: a <strong>RomPager</strong> <span class="font-mono">Server:</span> banner below 4.34 is the <strong>Misfortune Cookie</strong> range (<strong>LG-001</strong>, CVE-2014-9222 — Liebert MPH rack PDUs, RPC-1000 cards fixed in 4.D40.1; a banner can't prove the cookie feature is on or that a backport is missing, so it's posture), an unparseable banner is <strong>LG-002</strong>, and a patched one is inventory (<strong>LG-003</strong>). A request whose <strong>HTTP method is longer than 64 bytes</strong> is the shape that overflows the <strong>Liebert RDU101</strong> and <strong>IS-UNITY</strong> cards (<strong>LG-101</strong>, CVE-2025-41426) — an attempt, flagged for any server on the port. It flags RomPager on any host, not only Liebert cards. HTTPS is opaque. IPv4 + IPv6.</p>
+                            <p class="text-sm text-gray-400 mb-3">One short passive capture of the card's web port (a SPAN/mirror of the management VLAN, where APC Guard also listens).</p>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <select id="liebert-guard-iface" title="Interface for the capture — LAN-only: pick the LAN/uplink NIC or a SPAN/mirror port (Wi-Fi is ignored)" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                    <option value="">Auto (LAN connections)</option>
+                                </select>
+                                <input id="liebert-guard-secs" type="number" min="5" max="60" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <label class="flex items-center gap-1 text-xs text-gray-400 whitespace-nowrap" title="TCP port of the card's HTTP web UI">port <input id="liebert-guard-port" type="number" min="1" max="65535" value="80" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300"></label>
+                                <button onclick="runLiebertGuard()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan Liebert</button>
+                            </div>
+                            <div id="liebert-guard-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                         </div>
                         <h3 class="md:col-span-2 text-xs font-semibold uppercase tracking-wider text-gray-400">Active tools</h3>
                         <!-- DNS Doctor -->
@@ -2497,8 +2553,8 @@
                         <!-- Visibility matrix reference (l6) -->
                         <details class="glass rounded-xl p-3 sm:p-4 md:col-span-2" ontoggle="netMatrixLoad(this)">
                             <summary class="cursor-pointer select-none text-sm font-semibold text-gray-300 hover:text-white">Visibility matrix · L6 Presentation <span class="text-xs font-normal text-gray-500">— what a tap must see for each module here</span></summary>
-                            <a href="/web/images/osi/matrix_full.jpg?v=20260930" target="_blank" rel="noopener" title="Open the full matrix">
-                                <img data-src="/web/images/osi/matrix_l6.jpg?v=20260930" alt="Module visibility matrix, L6 Presentation band" class="block w-full h-auto rounded-lg mt-3">
+                            <a href="/web/images/osi/matrix_full.jpg?v=20261018-mikrotik-v3" target="_blank" rel="noopener" title="Open the full matrix">
+                                <img data-src="/web/images/osi/matrix_l6.jpg?v=20261018-mikrotik-v3" alt="Module visibility matrix, L6 Presentation band" class="block w-full h-auto rounded-lg mt-3">
                             </a>
                             <p class="text-xs text-gray-500 mt-2">Card letters are the vantage tier: <strong>A</strong> VLAN-wide · <strong>B</strong> link-local · <strong>C</strong> on-path unicast · <strong>D</strong> configured peer · <strong>E</strong> active / local · <strong>RF</strong> over-the-air. Tap the image for the full matrix (all layers).</p>
                         </details>
@@ -2549,8 +2605,8 @@
                         <!-- Visibility matrix reference (l5) -->
                         <details class="glass rounded-xl p-3 sm:p-4 md:col-span-2" ontoggle="netMatrixLoad(this)">
                             <summary class="cursor-pointer select-none text-sm font-semibold text-gray-300 hover:text-white">Visibility matrix · L5 Session <span class="text-xs font-normal text-gray-500">— what a tap must see for each module here</span></summary>
-                            <a href="/web/images/osi/matrix_full.jpg?v=20260930" target="_blank" rel="noopener" title="Open the full matrix">
-                                <img data-src="/web/images/osi/matrix_l5.jpg?v=20260930" alt="Module visibility matrix, L5 Session band" class="block w-full h-auto rounded-lg mt-3">
+                            <a href="/web/images/osi/matrix_full.jpg?v=20261018-mikrotik-v3" target="_blank" rel="noopener" title="Open the full matrix">
+                                <img data-src="/web/images/osi/matrix_l5.jpg?v=20261018-mikrotik-v3" alt="Module visibility matrix, L5 Session band" class="block w-full h-auto rounded-lg mt-3">
                             </a>
                             <p class="text-xs text-gray-500 mt-2">Card letters are the vantage tier: <strong>A</strong> VLAN-wide · <strong>B</strong> link-local · <strong>C</strong> on-path unicast · <strong>D</strong> configured peer · <strong>E</strong> active / local · <strong>RF</strong> over-the-air. Tap the image for the full matrix (all layers).</p>
                         </details>
@@ -2594,8 +2650,8 @@
                         <!-- Visibility matrix reference (l4) -->
                         <details class="glass rounded-xl p-3 sm:p-4 md:col-span-2" ontoggle="netMatrixLoad(this)">
                             <summary class="cursor-pointer select-none text-sm font-semibold text-gray-300 hover:text-white">Visibility matrix · L4 Transport <span class="text-xs font-normal text-gray-500">— what a tap must see for each module here</span></summary>
-                            <a href="/web/images/osi/matrix_full.jpg?v=20260930" target="_blank" rel="noopener" title="Open the full matrix">
-                                <img data-src="/web/images/osi/matrix_l4.jpg?v=20260930" alt="Module visibility matrix, L4 Transport band" class="block w-full h-auto rounded-lg mt-3">
+                            <a href="/web/images/osi/matrix_full.jpg?v=20261018-mikrotik-v3" target="_blank" rel="noopener" title="Open the full matrix">
+                                <img data-src="/web/images/osi/matrix_l4.jpg?v=20261018-mikrotik-v3" alt="Module visibility matrix, L4 Transport band" class="block w-full h-auto rounded-lg mt-3">
                             </a>
                             <p class="text-xs text-gray-500 mt-2">Card letters are the vantage tier: <strong>A</strong> VLAN-wide · <strong>B</strong> link-local · <strong>C</strong> on-path unicast · <strong>D</strong> configured peer · <strong>E</strong> active / local · <strong>RF</strong> over-the-air. Tap the image for the full matrix (all layers).</p>
                         </details>
@@ -2641,8 +2697,8 @@
                         <!-- Visibility matrix reference (l3) -->
                         <details class="glass rounded-xl p-3 sm:p-4 md:col-span-2" ontoggle="netMatrixLoad(this)">
                             <summary class="cursor-pointer select-none text-sm font-semibold text-gray-300 hover:text-white">Visibility matrix · L3 Network <span class="text-xs font-normal text-gray-500">— what a tap must see for each module here</span></summary>
-                            <a href="/web/images/osi/matrix_full.jpg?v=20260930" target="_blank" rel="noopener" title="Open the full matrix">
-                                <img data-src="/web/images/osi/matrix_l3.jpg?v=20260930" alt="Module visibility matrix, L3 Network band" class="block w-full h-auto rounded-lg mt-3">
+                            <a href="/web/images/osi/matrix_full.jpg?v=20261018-mikrotik-v3" target="_blank" rel="noopener" title="Open the full matrix">
+                                <img data-src="/web/images/osi/matrix_l3.jpg?v=20261018-mikrotik-v3" alt="Module visibility matrix, L3 Network band" class="block w-full h-auto rounded-lg mt-3">
                             </a>
                             <p class="text-xs text-gray-500 mt-2">Card letters are the vantage tier: <strong>A</strong> VLAN-wide · <strong>B</strong> link-local · <strong>C</strong> on-path unicast · <strong>D</strong> configured peer · <strong>E</strong> active / local · <strong>RF</strong> over-the-air. Tap the image for the full matrix (all layers).</p>
                         </details>
@@ -2691,6 +2747,35 @@
                                 <button onclick="eigrpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current routers/prefixes as the trusted baseline — use after a legitimate topology change">Trust current</button>
                             </div>
                             <div id="eigrp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                        </div>
+                        <!-- RIP / RIPng Watch -->
+                        <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                            <h3 class="text-lg font-semibold mb-1">RIP Watch <span class="text-xs font-normal text-gray-500">(RIP / RIPng · IGP · IPv4 + IPv6)</span></h3>
+                            <p class="text-xs text-amber-300/90 mb-2">Passive RIP routing-security scanner — <strong>detection-only</strong>, never transmits. RIP is the oldest distance-vector IGP (the 4th in Ragnar's IGP family with OSPF, IS-IS and EIGRP); it still runs on small/legacy segments and multicasts route updates in the clear (RIPv2 <span class="font-mono">224.0.0.9</span>, RIPng <span class="font-mono">ff02::9</span>) where a <strong>better metric wins</strong>. Flags <strong>injection</strong> (a prefix not in the baseline, a new advertiser, or a <strong>default-route</strong> injection), <strong>hijack</strong> (a metric-undercut from a new source), <strong>rogue-responder</strong> (a new RIP speaker after arm), <strong>storm</strong> (metric-16 mass-poison/withdrawal), <strong>recon</strong> (a full-table request — <span class="font-mono">CVE-2006-2223</span>), an <strong>auth-bypass</strong> RIPv1 Response where authed RIPv2 is the norm (<span class="font-mono">CVE-2006-2224</span>), <strong>malformation</strong> (an RTE count/length that overruns the datagram — <span class="font-mono">CVE-2026-102019 / CVE-2013-3470 / CVE-2012-4091</span>), and <strong>weak-auth</strong> posture (unauthenticated, cleartext simple-password, or dated keyed-MD5).</p>
+                            <p class="text-sm text-gray-400 mb-3">One short passive capture (put the Pi on the RIP segment/VLAN — RIP is link-local multicast, a tap off the routed core won't see it). <strong>Dual-stack by protocol pairing</strong>: the v4 codes cover RIP (UDP/520), the v6 codes cover RIPng (UDP/521); the BPF admits plain and extension-header-bearing RIPng. The first scan <strong>learns</strong> the current RIP sources, advertised prefix→metric map and auth posture as the baseline (<span class="font-mono">data/rip_watch.json</span>) and then <strong>arms</strong>; abuse rules fire only once armed (structural/posture fire in any phase). After a legitimate topology change, click "Trust current".</p>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <select id="rip-iface" title="Interface for the RIP capture — pick the routed/uplink NIC or a SPAN/mirror port on the RIP segment" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                    <option value="">Auto (wired first)</option>
+                                </select>
+                                <input id="rip-secs" type="number" min="5" max="50" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <button onclick="runRipWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan RIP</button>
+                                <button onclick="ripTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current RIP sources/prefixes as the trusted baseline, and arm — use after a legitimate topology change">Trust current</button>
+                            </div>
+                            <div id="rip-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                        </div>
+                        <!-- PIM / MSDP Watch (multicast routing control plane) -->
+                        <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                            <h3 class="text-lg font-semibold mb-1">PIM / MSDP Watch <span class="text-xs font-normal text-gray-500">(multicast routing · PIM-SM/DM/BiDir/SSM · BSR/Auto-RP/MSDP · IPv4 + IPv6)</span></h3>
+                            <p class="text-xs text-amber-300/90 mb-2">PIM is the <strong>multicast routing control plane</strong> — PIM-SM (RFC 7761), PIM-DM, BiDir, SSM — with RP discovery via <strong>BSR</strong> / Cisco <strong>Auto-RP</strong> / Embedded-RP / Anycast-RP, and inter-domain <strong>MSDP</strong> (RFC 3618). It rides <span class="font-mono">IP proto 103</span>, multicast in the clear (<span class="font-mono">224.0.0.13</span> / <span class="font-mono">ff02::d</span>) with no auth beyond optional IPsec AH. An on-segment attacker can spoof a <strong>Hello</strong> to win the DR election, forge a <strong>Candidate-RP / BSR</strong> to become everyone's RP (multicast MITM / blackhole), inject a PIM <strong>Register</strong> or an <strong>MSDP SA</strong> to pull or poison (S,G) state, or flood Joins/Prunes/Asserts. <strong>Detection-only</strong> — never transmits.</p>
+                            <p class="text-sm text-gray-400 mb-3">One short passive capture (put the Pi on the multicast-routed VLAN or a SPAN/mirror). Flags <strong>attack</strong> (rogue RP / BSR spoofing, DR hijack, Register &amp; SA injection, Assert &amp; flood abuse) and <strong>posture</strong> (IPsec-AH protection loss, SSM-range violations, Embedded-RP / Auto-RP anomalies, malformed / bad-checksum messages) — <strong>88 codes</strong> across the PIM and MSDP planes. <strong>Dual-stack</strong>: PIM is v4+v6 (extension-header chains walked); Auto-RP and MSDP are IPv4-only (no IPv6 form — their v6 equivalents are Embedded-RP and Anycast-RP, both on the PIM side). RadSec-style secure transport is not part of PIM; RPF is a router-internal RIB decision and is covered by three observable heuristics, not guessed at. A short on-demand scan learns the neighbours/RP set early in the window and arms partway through; the standalone daemon uses the full learn window.</p>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <select id="pim-iface" title="Interface for the PIM/MSDP capture — pick the multicast-routed/uplink NIC or a SPAN/mirror port" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                    <option value="">Auto (wired first)</option>
+                                </select>
+                                <input id="pim-secs" type="number" min="5" max="50" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <button onclick="runPimWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan PIM / MSDP</button>
+                            </div>
+                            <div id="pim-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                         </div>
                         <!-- FHRP Watch (HSRP/VRRP/GLBP/CARP) -->
                         <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
@@ -2851,13 +2936,13 @@
                 </div>
 
                 <!-- ===== L2 Data Link ===== -->
-                <div id="net-layer-l2" class="net-layer hidden" data-desc="ARP / MAC, the switch control protocols (STP, DTP, CDP, VTP, LACP, IS-IS) and PTP.">
+                <div id="net-layer-l2" class="net-layer hidden" data-desc="ARP / MAC, the switch control protocols (STP, DTP, CDP, LLDP, VTP, MRP, LACP, IS-IS), carrier Ethernet OAM (Link OAM, CFM / Y.1731), PTP and the Bluetooth LE link layer (BLE Watch).">
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
                         <!-- Visibility matrix reference (l2) -->
                         <details class="glass rounded-xl p-3 sm:p-4 md:col-span-2" ontoggle="netMatrixLoad(this)">
                             <summary class="cursor-pointer select-none text-sm font-semibold text-gray-300 hover:text-white">Visibility matrix · L2 Data Link <span class="text-xs font-normal text-gray-500">— what a tap must see for each module here</span></summary>
-                            <a href="/web/images/osi/matrix_full.jpg?v=20260930" target="_blank" rel="noopener" title="Open the full matrix">
-                                <img data-src="/web/images/osi/matrix_l2.jpg?v=20260930" alt="Module visibility matrix, L2 Data Link band" class="block w-full h-auto rounded-lg mt-3">
+                            <a href="/web/images/osi/matrix_full.jpg?v=20261018-mikrotik-v3" target="_blank" rel="noopener" title="Open the full matrix">
+                                <img data-src="/web/images/osi/matrix_l2.jpg?v=20261018-mikrotik-v3" alt="Module visibility matrix, L2 Data Link band" class="block w-full h-auto rounded-lg mt-3">
                             </a>
                             <p class="text-xs text-gray-500 mt-2">Card letters are the vantage tier: <strong>A</strong> VLAN-wide · <strong>B</strong> link-local · <strong>C</strong> on-path unicast · <strong>D</strong> configured peer · <strong>E</strong> active / local · <strong>RF</strong> over-the-air. Tap the image for the full matrix (all layers).</p>
                         </details>
@@ -2871,10 +2956,14 @@
                                     <p class="text-sm text-gray-400 mb-3">Also inventories privacy-randomized MACs on the segment, and <strong>tracks</strong> a device that rotates through several randomized addresses — following it across the MACs it hides behind. Adds <strong>HSRP/VRRP/GLBP virtual-MAC awareness</strong>: it recognizes first-hop-redundancy virtual MACs so a shared gateway MAC that legitimately moves between routers on failover never reads as a spoof/clone — and flags the inverse, an FHRP redundancy VIP suddenly answered by a <em>non-virtual</em> MAC, as a gateway hijack (the arp_guard / FHRP-Watch cross-pivot). Reads the neighbour table (+ optional arp-scan sweep); history persists so past events survive restarts. Cross-MAC tracking here is IP-anchored (capture-free); true fingerprint tracking needs monitor mode. <strong>IPv6 / NDP:</strong> it also collects MAC↔IPv6 bindings from the NDP neighbour cache and runs the v6-native identity check — <strong>eui64_mismatch</strong>, where a SLAAC EUI-64 address embeds its owner's MAC but the cache binds it to a <em>different</em> MAC (a MAC-identity contradiction; proxy-NDP can also explain it). The v6 side is kept separate from the v4 clone logic on purpose — a healthy IPv6 host holds a link-local plus several SLAAC/temporary globals on one MAC, so "many IPs per MAC" is normal for v6 and never reads as a clone.</p>
                                 </div>
                             </div>
+                            <p class="text-sm text-gray-400 mb-3"><strong>L2 security (opt-in passive sniff):</strong> tick <em>L2 security</em> to add a short, harmless capture of the link-security control plane the neighbour table never sees — <strong>MACsec (802.1AE)</strong>, <strong>802.1X / EAPOL</strong> and <strong>MKA</strong>. It flags a MACsec packet-number that rolls backwards inside a secure association (replay), a secure-channel SCI whose system-identifier contradicts the frame's own source MAC (spoofed channel), a confidentiality downgrade (a once-encrypted association now integrity-only), and an EAPOL-Logoff burst that force-deauthenticates an 802.1X port (port-access DoS) — and inventories the MACsec / 802.1X / MKA that is legitimately in use.</p>
                             <div class="flex flex-wrap items-center gap-2">
                                 <select id="macwatch-iface" title="Interface for the arp-scan sweep — pick your WiFi or LAN NIC to scan that subnet" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
                                     <option value="">Auto (default route)</option>
                                 </select>
+                                <label class="inline-flex items-center gap-2 text-sm text-gray-300 bg-slate-800 border border-slate-700 rounded px-3 py-2 whitespace-nowrap" title="Opt-in: add a short passive MACsec / 802.1X-EAPOL / MKA sniff to this scan (no frames are sent)">
+                                    <input type="checkbox" id="macwatch-l2sec" class="accent-Ragnar-600"> L2 security
+                                </label>
                                 <button onclick="runMacWatch(true)" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan (arp-scan sweep)</button>
                                 <button onclick="runMacWatch(false)" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Read the kernel neighbour table only — no traffic generated">Quick (neighbour table)</button>
                                 <button onclick="macWatchReset()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Clear the MAC-watch history (first/last-seen, per-IP history, change events)">Reset history</button>
@@ -2909,7 +2998,7 @@
                         <!-- STP/BPDU Watch (spanning tree) -->
                         <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
                             <h3 class="text-lg font-semibold mb-1">STP/BPDU Watch <span class="text-xs font-normal text-gray-500">(spanning tree · root hijack)</span></h3>
-                            <p class="text-xs text-amber-300/90 mb-2">Passive spanning-tree security scanner — <strong>detection-only</strong>, never sends a BPDU. STP/RSTP/MSTP (and Cisco PVST+) elect a <strong>root bridge</strong> by lowest Bridge ID; BPDUs carry the election, multicast in the clear with no auth. An attacker who sends a BPDU claiming a <strong>superior root</strong> (priority 0 — Yersinia "claim root role") wins and the tree reconverges to pull traffic through them (<strong>L2 MITM</strong>). Flags <strong>root-hijack</strong> (a root superior to the baseline), <strong>rogue-bridge</strong> (a new bridge in spanning tree), <strong>bpdu-flood</strong> (reconvergence-storm DoS) and <strong>topology-change</strong> (TCN/TC churn that flushes MAC tables). Defenses are BPDU Guard on edge ports and Root Guard downstream.</p>
+                            <p class="text-xs text-amber-300/90 mb-2">Passive spanning-tree <strong>security</strong> scanner (v2) — <strong>detection-only</strong>, never sends a BPDU. A byte-level decoder for 802.1D / RSTP / MSTP (including <strong>every per-MSTI record</strong>) and Cisco PVST+/RPVST+, running <strong>31 checks</strong> across six families. STP elects a <strong>root bridge</strong> by lowest Bridge ID; BPDUs carry the election, multicast in the clear with no auth. An attacker who sends a BPDU claiming a <strong>superior root</strong> (priority 0 — Yersinia "claim root role") wins and the tree reconverges to pull traffic through them (<strong>L2 MITM</strong>). Flags <strong>root-hijack</strong> (superior BPDU, incl. a regional-root takeover inside one MST instance), <strong>rogue-bridge</strong> (new bridge / BPDU on an edge port / two roots at once), <strong>bpdu-flood</strong> (reconvergence-storm DoS), <strong>topology-change</strong> (TCN/TC churn) and <strong>anomaly</strong> (field-sanity / MST digest-region / per-MSTI violations). No CVEs — BPDUs are unauthenticated by design, so every check is behavioural. Defenses are BPDU Guard on edge ports and Root Guard downstream.</p>
                             <p class="text-sm text-gray-400 mb-3">One short passive capture on the BPDU group MACs (IEEE <span class="font-mono">01:80:c2:00:00:00</span> + Cisco PVST+ <span class="font-mono">01:00:0c:cc:cc:cd</span>). The first scan learns the current root(s) — per VLAN for PVST+ — and legitimate bridges as the baseline (<span class="font-mono">data/stp_watch.json</span>); after a legitimate topology change, click "Trust current".</p>
                             <div class="flex flex-wrap items-center gap-2">
                                 <select id="stp-iface" title="Interface for the BPDU capture — pick the switch-facing NIC you want to audit" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
@@ -2920,6 +3009,21 @@
                                 <button onclick="stpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current root(s) and bridges as the trusted baseline — use after a legitimate topology change">Trust current</button>
                             </div>
                             <div id="stp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                        </div>
+                        <!-- MRP Watch (MVRP / MMRP / GVRP / GMRP registration) -->
+                        <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                            <h3 class="text-lg font-semibold mb-1">MRP Watch <span class="text-xs font-normal text-gray-500">(MVRP / MMRP / GVRP / GMRP registration)</span></h3>
+                            <p class="text-xs text-amber-300/90 mb-2">Passive monitor for the standards-based <strong>dynamic registration</strong> protocols — the siblings of Cisco's VTP: 802.1ak <strong>MVRP</strong> (EtherType <span class="font-mono">0x88F5</span>) and <strong>MMRP</strong> (<span class="font-mono">0x88F6</span>), plus legacy 802.1D <strong>GVRP/GMRP</strong> (LLC-framed). <strong>Detection-only</strong>, never transmits. <em>Not</em> IEC 62439-2 ring-redundancy MRP — this is the VLAN/multicast registration plane. MVRP and MMRP use <strong>different EtherTypes</strong>, so the capture admits both plus the whole GARP application block (a filter on 0x88F5 alone would silently miss all MMRP). Flags a <strong>LeaveAll flood</strong> (<span class="font-mono">MRP-101/103/105/107</span>, HIGH — forces network-wide re-registration, the standards sibling of the VTP bomb), a <strong>registration burst for never-before-seen VLANs/groups</strong> (<span class="font-mono">MRP-102/104/106/108</span> — a VLAN-hopping setup signal), and structural/malformed PDUs (<span class="font-mono">MRP-120..125</span>). No CVEs — none exist for these four protocols.</p>
+                            <p class="text-sm text-gray-400 mb-3">Optionally supply your <strong>known VLANs</strong> (comma-separated) as an operator baseline — it escalates a registration burst for out-of-baseline VLANs from MEDIUM to HIGH, but <strong>never gates detection</strong>. On a predominantly Cisco segment (VTP/DTP preferred) this card may legitimately see no traffic — that's an environment fact, not a fault.</p>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <select id="mrp-iface" title="Interface for the capture — pick the switch-facing NIC you want to audit" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                    <option value="">Auto (wired first)</option>
+                                </select>
+                                <input id="mrp-secs" type="number" min="5" max="50" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <input id="mrp-known-vlans" type="text" placeholder="known VLANs (e.g. 1,10,100)" title="Operator VLAN baseline — scoping only, never gates detection" class="w-full sm:w-56 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <button onclick="runMrpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan MRP</button>
+                            </div>
+                            <div id="mrp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                         </div>
                         <!-- DTP Watch (VLAN hopping) -->
                         <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
@@ -2939,7 +3043,7 @@
                         <!-- CDP Watch (flood / spoof / info-leak) -->
                         <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
                             <h3 class="text-lg font-semibold mb-1">CDP Watch <span class="text-xs font-normal text-gray-500">(Cisco Discovery · flood / spoof / info-leak · CDPwn)</span></h3>
-                            <p class="text-xs text-amber-300/90 mb-2">Passive Cisco Discovery Protocol scanner — <strong>detection-only</strong>, never sends a CDP frame. CDP is on by default on every Cisco device and, <strong>unauthenticated</strong>, advertises to anyone on the wire the device hostname, full <strong>IOS version</strong> (→ known CVEs), hardware model, <strong>management IP</strong>, <strong>native VLAN</strong>, VTP domain and voice VLAN — a reconnaissance goldmine. Flags <strong>flood</strong> (Yersinia CDP flood — CAM/CPU exhaustion DoS), <strong>spoof</strong> (a new/rogue CDP speaker, incl. a fake IP phone advertising a Voice VLAN = VoIP-VLAN-hop), and <strong>cdp-enabled</strong> (surfaces exactly what CDP leaks here). Now also screens for <strong>CDPwn</strong> — a byte-level parser catches the exploit shapes behind the five Armis CVEs (<span class="font-mono">CVE-2020-3110/3111/3118/3119/3120</span>): oversized DeviceID/PortID, format-string TLVs, malformed Power-Request, absurd Addresses count and TLV over/underrun (verdict <strong>cdpwn</strong>), plus platform/version CVE-screening hints (IOS/IOS-XE excluded per Cisco's advisory).</p>
+                            <p class="text-xs text-amber-300/90 mb-2">Passive Cisco Discovery Protocol scanner — <strong>detection-only</strong>, never sends a CDP frame. CDP is on by default on every Cisco device and, <strong>unauthenticated</strong>, advertises to anyone on the wire the device hostname, full <strong>IOS version</strong> (→ known CVEs), hardware model, <strong>management IP</strong>, <strong>native VLAN</strong>, VTP domain and voice VLAN — a reconnaissance goldmine. Flags <strong>flood</strong> (Yersinia CDP flood — CAM/CPU exhaustion DoS), <strong>spoof</strong> (a new/rogue CDP speaker, incl. a fake IP phone advertising a Voice VLAN = VoIP-VLAN-hop), and <strong>cdp-enabled</strong> (surfaces exactly what CDP leaks here). Now also screens for <strong>CDPwn</strong> and its <strong>LCDPwn</strong> successor — a byte-level parser catches the exploit shapes: oversized DeviceID/PortID, format-string TLVs, malformed Power-Request, absurd Addresses count, per-address-record protocol_type/length and allocation/copy mismatches (the <span class="font-mono">CVE-2023-41910</span> lldpd out-of-bounds-read class) and TLV over/underrun (verdict <strong>cdpwn</strong>), plus platform/version CVE-screening across nine families — Cisco IP Phone / Camera / IOS-XR / NX-OS / FXOS, <strong>FortiSwitch</strong>, <strong>lldpd</strong>, <strong>Cisco ATA</strong> and <strong>Unified CM</strong> — covering 27 CDP-plane CVEs (plain IOS/IOS-XE excluded per Cisco's advisory). It also watches <strong>UDLD</strong> on the same group MAC: UDLD is off by default and both UDLD CVEs require it enabled, so a UDLD frame is itself the signal — attributed via the CDP identity of the same MAC to <span class="font-mono">CVE-2021-1368</span> (8.8 port-channel RCE, NX-OS/FXOS/UCS) and <span class="font-mono">CVE-2021-34714</span> (7.4 reload DoS, incl. IOS/IOS-XE), plus malformed-UDLD-TLV shapes.</p>
                             <p class="text-sm text-gray-400 mb-3">One short passive capture on the switch group MAC (<span class="font-mono">01:00:0c:cc:cc:cc</span>, CDP PID 0x2000). CDP hellos are ~60s apart, so give it a longer window. The first scan learns the current CDP speakers (real switches/phones) as the baseline (<span class="font-mono">data/cdp_watch.json</span>); "Trust current" re-learns. Mitigate by disabling CDP on access ports (<span class="font-mono">no cdp enable</span>) and preferring LLDP with minimal TLVs.</p>
                             <div class="flex flex-wrap items-center gap-2">
                                 <select id="cdp-iface" title="Interface for the CDP capture — pick the access-port NIC you want to audit" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
@@ -2950,6 +3054,22 @@
                                 <button onclick="cdpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current CDP speakers as the trusted baseline — use after a legitimate switch/phone change">Trust current</button>
                             </div>
                             <div id="cdp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                        </div>
+                        <!-- LLDP Watch (802.1AB malformed-TLV CVE shapes / screening / flood) -->
+                        <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                            <h3 class="text-lg font-semibold mb-1">LLDP Watch <span class="text-xs font-normal text-gray-500">(IEEE 802.1AB · malformed TLV / CVE screening / flood · passive)</span></h3>
+                            <p class="text-xs text-amber-300/90 mb-2">Passive LLDP security monitor — <strong>detection-only</strong>, never sends an LLDP frame. LLDP is the multi-vendor cousin of CDP, and its parsers have a long CVE record: one crafted, unauthenticated frame from a host on the same port crashes or reloads the neighbour — <strong>lldpd</strong> (<code>CVE-2015-8011</code> oversized Management Address overflow, <code>CVE-2015-8012</code>, <code>CVE-2020-27827</code>; Ruckus inherits them), <strong>Cisco</strong> NX-OS / FXOS / IOS-XE (<code>CVE-2018-0395</code>, <code>CVE-2021-34703</code>, <code>CVE-2023-20089</code>, <code>CVE-2024-20294</code>, <code>CVE-2026-20010</code>), <strong>Juniper l2cpd</strong> (<code>CVE-2018-0007</code>, <code>CVE-2020-1641</code>, <code>CVE-2021-0277</code>, <code>CVE-2023-36849</code>, <code>CVE-2024-21618</code> — l2cpd also runs STP and LACP, so a crash flaps both), <strong>Open vSwitch</strong> (<code>CVE-2022-4337</code>, <code>CVE-2022-4338</code>), <strong>Aruba</strong> (<code>CVE-2020-7121</code>, <code>CVE-2021-34618</code>), <strong>FortiSwitch</strong> (<code>CVE-2021-26111</code>), <strong>PAN-OS</strong> (<code>CVE-2025-0116</code>) and <strong>SonicWall SWS</strong> (<code>CVE-2021-20024</code>).</p>
+                            <p class="text-sm text-gray-400 mb-3">Catches the <strong>malformed frame</strong>, whatever vendor it targets: a TLV length past the end of the frame, an oversized or family-mismatched Management Address (IPv4 <em>and</em> IPv6), a Chassis/Port ID whose subtype disagrees with its length, a wrong-size org-specific TLV, reserved TLV types, missing/out-of-order mandatory TLVs, and non-zero data after End-of-LLDPDU (Ethernet padding and FCS stay silent). Neighbours advertising a vulnerable family are listed as a <em>screening note</em> — a version string can't show patch state. Also flags an <strong>LLDP flood</strong> (the only signal for the memory-leak CVEs) and, once you click “Trust current” (kept in <span class="font-mono">data/lldp_watch.json</span>), a <strong>forged neighbour</strong>. Only the directly attached link is visible; 802.1Q/QinQ-tagged LLDP is captured too.</p>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <select id="lldpw-iface" title="Interface for the LLDP capture — the switch-facing NIC" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                    <option value="">Auto (wired first)</option>
+                                </select>
+                                <input id="lldpw-secs" type="number" min="5" max="65" value="30" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <button onclick="runLldpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan LLDP</button>
+                                <button onclick="lldpwBaseline('trust')" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Trust the LLDP neighbours seen in the last scan and turn on the forged-neighbour check">Trust current</button>
+                                <button onclick="lldpwBaseline('reset')" class="w-full sm:w-auto bg-slate-800 hover:bg-slate-700 text-gray-400 px-4 py-2 rounded text-sm whitespace-nowrap" title="Forget the trusted neighbours (forged-neighbour check off)">Reset</button>
+                            </div>
+                            <div id="lldpw-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                         </div>
                         <!-- VTP Watch (bomb / rogue-server) -->
                         <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
@@ -2984,13 +3104,20 @@
                         <!-- PTP Watch (IEEE-1588 / PTPv2 / gPTP timing-plane manipulation) -->
                         <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
                             <h3 class="text-lg font-semibold mb-1">PTP Watch <span class="text-xs font-normal text-gray-500">(IEEE-1588 · PTPv2 · gPTP · grandmaster takeover / time injection)</span></h3>
-                            <p class="text-xs text-amber-300/90 mb-2">Passive IEEE-1588 / PTPv2 timing-plane monitor — <strong>detection-only</strong>, it has no transmit primitives (the engine's own conformance greps its source to prove it). The precision-time plane runs the phase reference for 5G radios, power-grid PMUs, broadcast, finance and industrial control, and it is almost never authenticated: a forged Announce or an injected <span class="font-mono">correctionField</span> doesn't crash anything, it quietly drags the time base and everything slaved to it. Parses all three transports unconditionally — <strong>Annex F</strong> (raw Ethernet <span class="font-mono">0x88F7</span>), <strong>Annex D</strong> (UDP/IPv4 <span class="font-mono">319/320</span>) and <strong>Annex E</strong> (UDP/IPv6, extension-header + <span class="font-mono">AH</span> aware). Every rule is packet-vs-packet or packet-vs-its-own-in-band-claim — <strong>no rule consults the sensor's wall clock</strong> (a timing sensor under attack may itself be slewed). 42 finding codes: flags <strong>time-manipulation</strong> (critical — the one that should page you: a grandmaster <em>takeover</em> / two sources claiming one GM identity, a <span class="font-mono">correctionField</span> or origin-timestamp <em>injection</em>, a mid-session <span class="font-mono">currentUtcOffset</span> flip, a management <em>SET/WRITE</em>, or a unicast-cancel forgery), <strong>exposure</strong> (announce/sync flooding faster than a source's own advertised rate, sequence regression, EUI-64/MAC mismatch), and <strong>posture</strong> (no integrity protection on the timing plane, multiple domains, PTPv1/version downgrade).</p>
-                            <p class="text-sm text-gray-400 mb-3"><strong>gPTP / IEEE 802.1AS</strong> (<span class="font-mono">majorSdoId==1</span>) gets eight peer-delay-specific codes on top: the headline is <strong>multiple peer-delay responders on one link</strong> — because 802.1AS mandates point-to-point, a single injected <span class="font-mono">Pdelay_Resp</span> sets <span class="font-mono">asCapable=FALSE</span> and stops timing on that port, a complete denial-of-timing that forges no timestamp at all — plus path-trace TLV checks (missing, length-vs-<span class="font-mono">stepsRemoved</span> contradiction, repeated clockIdentity loop). One short passive capture; the Ethernet/IPv4/IPv6/UDP decode, the PTP parser and the pcap reader are all hand-rolled (no scapy). The capture walks the IPv6 extension-header chain itself so an Annex E frame hidden behind a Hop-by-Hop or Authentication Header — the case a plain <span class="font-mono">udp port 319</span> filter is blind to — is still seen.</p>
+                            <p class="text-xs text-amber-300/90 mb-2">Passive IEEE-1588 / PTPv2 timing-plane monitor — <strong>detection-only</strong>, it has no transmit primitives (the engine's own conformance greps its source to prove it). The precision-time plane runs the phase reference for 5G radios, power-grid PMUs, broadcast, finance and industrial control, and it is almost never authenticated: a forged Announce or an injected <span class="font-mono">correctionField</span> doesn't crash anything, it quietly drags the time base and everything slaved to it. Parses all three transports unconditionally — <strong>Annex F</strong> (raw Ethernet <span class="font-mono">0x88F7</span>), <strong>Annex D</strong> (UDP/IPv4 <span class="font-mono">319/320</span>) and <strong>Annex E</strong> (UDP/IPv6, extension-header + <span class="font-mono">AH</span> aware). Every rule is packet-vs-packet or packet-vs-its-own-in-band-claim — <strong>no rule consults the sensor's wall clock</strong> (a timing sensor under attack may itself be slewed). 66 finding codes: flags <strong>time-manipulation</strong> (critical — the one that should page you: a grandmaster <em>takeover</em> / two sources claiming one GM identity, a <span class="font-mono">correctionField</span> or origin-timestamp <em>injection</em>, a mid-session <span class="font-mono">currentUtcOffset</span> flip, a management <em>SET/WRITE</em>, or a unicast-cancel forgery), <strong>exposure</strong> (announce/sync flooding faster than a source's own advertised rate, sequence regression, EUI-64/MAC mismatch), and <strong>posture</strong> (no integrity protection on the timing plane, multiple domains, PTPv1/version downgrade). <strong>New in v4 — SyncE / ESMC:</strong> SyncE carries <em>frequency</em> at the physical layer, but its control channel, <strong>ESMC</strong> (ITU-T G.8264, slow protocol <span class="font-mono">0x8809</span>), is on the wire — so it now flags a malformed ESMC PDU, a quality level that changes without the event flag, an event flag with no change, a PDU rate over the G.8264 ceiling, more than two ESMC speakers on a link, a VLAN-tagged ESMC frame, an extended-QL TLV that contradicts the legacy one, and QL flapping (<strong>PTP-S01…S08</strong>; no ESMC CVEs exist, so these are protocol-violation and posture findings). LACP shares the EtherType and is ignored.</p>
+                            <p class="text-sm text-gray-400 mb-3"><strong>gPTP / IEEE 802.1AS</strong> (<span class="font-mono">majorSdoId 1</span>, and since v6 also <span class="font-mono">majorSdoId 2</span> — the 802.1AS-2020 <strong>Common Mean Link Delay Service</strong>, a peer-delay service shared across gPTP domains) gets eight peer-delay-specific codes on top: the headline is <strong>multiple peer-delay responders on one link</strong> — because 802.1AS mandates point-to-point, a single injected <span class="font-mono">Pdelay_Resp</span> sets <span class="font-mono">asCapable=FALSE</span> and stops timing on that port, a complete denial-of-timing that forges no timestamp at all — plus path-trace TLV checks (missing, length-vs-<span class="font-mono">stepsRemoved</span> contradiction, repeated clockIdentity loop). One short passive capture; the Ethernet/IPv4/IPv6/UDP decode, the PTP parser and the pcap reader are all hand-rolled (no scapy). The capture walks the IPv6 extension-header chain itself so an Annex E frame hidden behind a Hop-by-Hop or Authentication Header — the case a plain <span class="font-mono">udp port 319</span> filter is blind to — is still seen. <strong>New in v6 — telecom profiles:</strong> pick the ITU-T profile your timing domain follows (<strong>G.8275.1</strong>, <strong>G.8275.2</strong>, <strong>G.8265.1</strong>) and it checks the traffic against it: domain out of range, a foreign transport, multicast where the profile is unicast (or negotiation where it is multicast-only), peer-delay in a telecom profile, priority1 not pinned, a primary-reference clockClass with no traceability asserted, a destination outside the G.8275.1 pair, and non-zero correctionField / stepsRemoved under G.8265.1 (<strong>PTP-P01…P11</strong>). Nothing on the wire says which profile a domain is meant to follow, so these stay off until you choose one.</p>
                             <div class="flex flex-wrap items-center gap-2">
                                 <select id="ptpwatch-iface" title="Interface for the PTP capture — a timing-plane segment or a SPAN/mirror of one (mirror a VLAN or ACL the mirror; do not mirror a busy trunk wholesale)" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
                                     <option value="">Auto (wired first)</option>
                                 </select>
                                 <input id="ptpwatch-secs" type="number" min="8" max="60" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <select id="ptpwatch-profile" title="Telecom profile this PTP domain is meant to follow. Nothing on the wire says which one, so the profile-conformance checks (PTP-P01…P11) stay off until you pick one." class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                    <option value="auto">Profile: none declared</option>
+                                    <option value="g8275.1">G.8275.1 (full timing support)</option>
+                                    <option value="g8275.2">G.8275.2 (partial timing support)</option>
+                                    <option value="g8265.1">G.8265.1 (frequency)</option>
+                                    <option value="8021as">IEEE 802.1AS (gPTP)</option>
+                                </select>
                                 <button onclick="runPtpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan PTP</button>
                             </div>
                             <div id="ptpwatch-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
@@ -3020,6 +3147,53 @@
                             </div>
                             <div id="lacp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                         </div>
+                        <!-- OAM Watch (IEEE 802.3ah Link OAM: loopback blackhole / flag forgery) -->
+                        <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                            <h3 class="text-lg font-semibold mb-1">OAM Watch <span class="text-xs font-normal text-gray-500">(IEEE 802.3ah Link OAM · loopback blackhole / flag forgery · passive)</span></h3>
+                            <p class="text-xs text-amber-300/90 mb-2">Passive Link OAM (EFM OAM) monitor — <strong>detection-only</strong>, never sends an OAMPDU. Link OAM is the per-link operations channel on the slow-protocols EtherType (<span class="font-mono">0x8809</span>, subtype 3 — LACP's sibling). It is cleartext and <strong>unauthenticated</strong>: <strong>one forged Loopback Control frame</strong> puts the peer into remote loopback and discards its traffic — an instant <strong>link blackhole</strong>. Also flags forged or <strong>flapping Dying Gasp / Critical Event / Link Fault</strong> flags (they drive protection switches), discovery restart and <strong>peer substitution</strong>, capability escalation, cleartext <strong>Clause 30 MIB reads</strong>, event-sequence replay, a <strong>second OAM speaker</strong> on a point-to-point link, floods past the 10 PDU/s cap, and malformed OAMPDUs.</p>
+                            <p class="text-sm text-gray-400 mb-3">No CVEs exist for Link OAM — every finding is protocol abuse seen on the wire. Link OAM is <strong>point-to-point and config-gated</strong>: you will only see it on an OAM-enabled link (typically a metro / ISP access handoff); everywhere else this stays silent. Session state (peer identity, flags, event sequence) is kept across scans so slow flapping and a peer swapped between scans are still caught; "Reset" forgets it after a legitimate change. A single Dying Gasp is often a real power loss — repeated assert-and-clear is the forgery signal.</p>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <select id="oam-iface" title="Interface for the Link OAM capture — the handoff / uplink NIC" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                    <option value="">Auto (wired first)</option>
+                                </select>
+                                <input id="oam-secs" type="number" min="5" max="65" value="30" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <button onclick="runOamWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan Link OAM</button>
+                                <button onclick="oamReset()" class="w-full sm:w-auto bg-slate-800 hover:bg-slate-700 text-gray-400 px-4 py-2 rounded text-sm whitespace-nowrap" title="Forget the learned Link OAM session state">Reset</button>
+                            </div>
+                            <div id="oam-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                        </div>
+                        <!-- CFM Watch (IEEE 802.1ag CFM / ITU-T Y.1731 service OAM) -->
+                        <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                            <h3 class="text-lg font-semibold mb-1">CFM Watch <span class="text-xs font-normal text-gray-500">(IEEE 802.1ag CFM · ITU-T Y.1731 · service OAM · passive)</span></h3>
+                            <p class="text-xs text-amber-300/90 mb-2">Passive carrier-Ethernet service-OAM monitor — <strong>detection-only</strong>, never sends an LBM, LTM or CCM. CFM (EtherType <span class="font-mono">0x8902</span>, inside the service VLAN; 802.1Q and QinQ parsed) runs maintenance domains at levels 0–7, continuity checks between MEPs and the Y.1731 overlay — and all of it is cleartext and <strong>unauthenticated</strong>. A forged <strong>APS</strong> frame moves production traffic onto the protection path or <strong>locks protection out</strong>; a forged <strong>AIS</strong> hides a real fault; a forged <strong>CCM</strong> raises a cross-connect or unexpected-MEP defect that takes a service down; a <strong>linktrace sweep</strong> maps the provider's MIP chain. Also flags MD-level hierarchy violations, duplicate / moved MEPs, LBM floods and malformed CFM — the <span class="font-mono">CVE-2020-1639</span> shape (Junos cfmd core) — plus the <span class="font-mono">CVE-2025-52961</span> load pattern (low confidence: the trigger is valid traffic). On <strong>ERPS / G.8032</strong> rings (R-APS, opcode 40) it flags a forged <strong>RPL owner</strong>, two ring blocks, a ring left open, off-VLAN R-APS, flush storms and revision downgrades — <strong>90 finding codes</strong> across ten classes.</p>
+                            <p class="text-sm text-gray-400 mb-3">CFM normally only appears on a <strong>carrier / metro Ethernet service handoff</strong>; elsewhere this stays silent. MEP, association and protection-group state is kept across scans, so a MEP moving to a new MAC between scans is still caught; "Reset" forgets it after a legitimate change. Set the <strong>MD ceiling</strong> to the highest maintenance level that is legitimate at this tap to catch cross-domain injection. To police <strong>ERPS ring topology</strong>, <strong>declare the ring</strong> below (VLAN + RPL owner + node set); with none declared, R-APS is still reported as present (CFM-200) but topology can't be judged from one tap.</p>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <select id="cfm-iface" title="Interface for the CFM capture — the handoff / EVC trunk NIC" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                    <option value="">Auto (wired first)</option>
+                                </select>
+                                <input id="cfm-secs" type="number" min="5" max="65" value="30" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <select id="cfm-ceiling" title="Highest legitimate MD level at this tap (arms CFM-021)" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                    <option value="">MD ceiling: off</option>
+                                    <option value="0">MD ceiling 0</option><option value="1">MD ceiling 1</option><option value="2">MD ceiling 2</option><option value="3">MD ceiling 3</option>
+                                    <option value="4">MD ceiling 4</option><option value="5">MD ceiling 5</option><option value="6">MD ceiling 6</option><option value="7">MD ceiling 7</option>
+                                </select>
+                                <button onclick="runCfmWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan CFM</button>
+                                <button onclick="cfmReset()" class="w-full sm:w-auto bg-slate-800 hover:bg-slate-700 text-gray-400 px-4 py-2 rounded text-sm whitespace-nowrap" title="Forget the learned CFM state">Reset</button>
+                            </div>
+                            <div class="flex flex-wrap items-center gap-2 mt-2">
+                                <input id="cfm-ring-spec" type="text" placeholder="ERPS ring e.g. 100,rpl=aa:bb:cc:00:00:01,nodes=…/…,name=ring-a" title="Declare a G.8032 ring to arm the ring-topology rules (Class R). VLAN[,rpl=MAC][,nodes=MAC/MAC][,role=major|sub][,name=LABEL]" class="flex-1 min-w-0 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm font-mono">
+                                <button onclick="cfmDeclareRing()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Declare this ERPS ring (persists across scans)">Declare ring</button>
+                                <button onclick="cfmClearRings()" class="w-full sm:w-auto bg-slate-800 hover:bg-slate-700 text-gray-400 px-4 py-2 rounded text-sm whitespace-nowrap" title="Forget all declared ERPS rings">Clear rings</button>
+                            </div>
+                            <div id="cfm-rings" class="hidden mt-2 text-xs"></div>
+                            <div class="flex flex-wrap items-center gap-2 mt-2">
+                                <input id="cfm-evc-spec" type="text" placeholder="E-LMI EVC e.g. 7,vlan=500,name=cust-A" title="Declare an E-LMI EVC (MEF 16) to arm the CE-VLAN/EVC cross-plane rules (Class L). REFERENCE,vlan=VLAN[,name=LABEL]" class="flex-1 min-w-0 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm font-mono">
+                                <button onclick="cfmDeclareEvc()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Declare this E-LMI EVC (persists across scans)">Declare EVC</button>
+                                <button onclick="cfmClearEvcs()" class="w-full sm:w-auto bg-slate-800 hover:bg-slate-700 text-gray-400 px-4 py-2 rounded text-sm whitespace-nowrap" title="Forget all declared E-LMI EVCs">Clear EVCs</button>
+                            </div>
+                            <div id="cfm-evcs" class="hidden mt-2 text-xs"></div>
+                            <div id="cfm-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                        </div>
                         <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
                             <div class="mb-3">
                                 <h3 class="text-lg font-semibold">L2 Link Health</h3>
@@ -3033,6 +3207,21 @@
                                 <button onclick="runL2Health()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan L2</button>
                             </div>
                             <div id="l2-results" class="hidden mt-3 text-sm"></div>
+                        </div>
+                        <h3 class="md:col-span-2 text-xs font-semibold uppercase tracking-wider text-gray-400">Passive · Bluetooth LE</h3>
+                        <!-- BLE Watch (Bluetooth Low Energy attack monitor) -->
+                        <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                            <h3 class="text-lg font-semibold mb-1">BLE Watch <span class="text-xs font-normal text-gray-500">(passive · Bluetooth Low Energy · external sniffer)</span></h3>
+                            <p class="text-xs text-amber-300/90 mb-2">Passive Bluetooth Low Energy attack monitor — <strong>detection-only</strong>, it never transmits a BLE packet. The RX is done by an <strong>external nRF / Adafruit Bluefruit LE sniffer</strong> over USB; Ragnar only parses the captured link layer, so this card is <strong>device-gated</strong> — with no sniffer attached it says so rather than pretending to listen. Flags advertising-layer <strong>impersonation</strong> (device &amp; iBeacon/Eddystone clones, two radios sharing one address, public-address reuse across names), <strong>beacon spoofing</strong> and <strong>GATT service masquerade</strong>, <strong>advertising floods</strong> and <strong>BLE-spam tooling</strong> (Flipper / "Sour Apple" / Fast-Pair / Swift-Pair signatures, RPA rotation storms), and the <strong>connection-layer</strong> abuse the sniffer can see when it follows a link: <strong>CONNECT_IND races</strong> (connection MITM), <strong>LL_VERSION_IND swaps</strong>, <strong>Just-Works pairing downgrade</strong> and <strong>forced re-pair storms</strong>.</p>
+                            <p class="text-sm text-gray-400 mb-3">Captures with the Nordic nRF Sniffer extcap helper and feeds the BLE Link-Layer PDUs through a hand-rolled raw-byte parser (no dissector). <strong>Both sniffer generations are supported</strong> — <strong>nRF51</strong> (Adafruit Bluefruit LE Sniffer) and <strong>nRF52</strong> (nRF52840 Dongle/DK) — same parser and findings for each; blewatch autodetects either over USB. <strong>Caveat:</strong> the nRF51 follows <em>one</em> connection at a time and drops packets on busy advertising channels, so on it the advertising-layer findings are solid while the connection-layer findings are best-effort; an nRF52 is the better radio for the connection-layer checks. Only <strong>HIGH/CRITICAL</strong> findings reach Watchtower. Example baseline (beacon UUIDs, protected services) in <span class="font-mono">python/blewatch.example.json</span>. Use <strong>Trust current</strong> after a scan to add the advertisers on the air now to the trusted list (<span class="font-mono">data/ble_watch.json</span>) so they stop being flagged as clones/masquerades, and <strong>Clear list</strong> to empty it.</p>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <input id="blewatch-device" type="text" placeholder="Sniffer device (auto)" title="nRF/Bluefruit LE sniffer serial device — leave blank to autodetect" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                <input id="blewatch-secs" type="number" min="5" max="120" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <button onclick="runBleWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan BLE</button>
+                                <button onclick="bleTrustCurrent()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Add the devices seen in the last scan to the trusted list (data/ble_watch.json) so they stop being flagged as clones/masquerades">Trust current</button>
+                                <button onclick="bleClearList()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Empty the BLE trusted-device list and clear the results below">Clear list</button>
+                            </div>
+                            <div id="blewatch-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                         </div>
                         <h3 class="md:col-span-2 text-xs font-semibold uppercase tracking-wider text-gray-400">Active tools</h3>
                         <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
@@ -3058,8 +3247,8 @@
                         <!-- Visibility matrix reference (l1) -->
                         <details class="glass rounded-xl p-3 sm:p-4 md:col-span-2" ontoggle="netMatrixLoad(this)">
                             <summary class="cursor-pointer select-none text-sm font-semibold text-gray-300 hover:text-white">Visibility matrix · L1 Physical <span class="text-xs font-normal text-gray-500">— what a tap must see for each module here</span></summary>
-                            <a href="/web/images/osi/matrix_full.jpg?v=20260930" target="_blank" rel="noopener" title="Open the full matrix">
-                                <img data-src="/web/images/osi/matrix_l1.jpg?v=20260930" alt="Module visibility matrix, L1 Physical band" class="block w-full h-auto rounded-lg mt-3">
+                            <a href="/web/images/osi/matrix_full.jpg?v=20261018-mikrotik-v3" target="_blank" rel="noopener" title="Open the full matrix">
+                                <img data-src="/web/images/osi/matrix_l1.jpg?v=20261018-mikrotik-v3" alt="Module visibility matrix, L1 Physical band" class="block w-full h-auto rounded-lg mt-3">
                             </a>
                             <p class="text-xs text-gray-500 mt-2">Card letters are the vantage tier: <strong>A</strong> VLAN-wide · <strong>B</strong> link-local · <strong>C</strong> on-path unicast · <strong>D</strong> configured peer · <strong>E</strong> active / local · <strong>RF</strong> over-the-air. Tap the image for the full matrix (all layers).</p>
                         </details>
@@ -3206,10 +3395,10 @@
                         <span id="wifi-zb-status" class="text-xs text-amber-500/70"></span>
                         <span id="wifi-scan-status" class="text-xs text-gray-500"></span>
                     </div>
-                    <!-- Other RF tools: each opens its own page (all link back to Signal Intelligence). Each appears as its radio is detected, or with the RF Waterfall demo toggle on. -->
+                    <!-- Other RF tools: each opens its own page (all link back to Signal Intelligence). RF Waterfall is always shown (its page collapses absent radios); the rest appear as their radio is detected, or with the RF Waterfall demo toggle on. -->
                     <div class="flex flex-wrap items-center gap-4 mt-4 pt-3 border-t border-slate-700">
                         <span class="text-xs uppercase tracking-wider text-gray-500 mr-1 self-center">🧰 RF tools</span>
-                        <a href="/rf-waterfall" id="wifi-rfwf-btn" title="Open the full-screen RF Waterfall page — true-RF sub-GHz (RTL-SDR) + Wi-Fi bands (HackRF), stacked" class="hidden items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-2 rounded text-sm font-semibold">
+                        <a href="/rf-waterfall" id="wifi-rfwf-btn" title="Open the full-screen RF Waterfall page — RTL-SDR, HackRF and ESP-SDR panels, stacked" class="inline-flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-2 rounded text-sm font-semibold">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg>
                             RF Waterfall page
                         </a>
@@ -3238,7 +3427,7 @@
                             APRS
                         </a>
                         <button type="button" onclick="wifiSdrCheck()" id="wifi-sdr-check" title="Diagnose why an SDR (HackRF / RTL-SDR) isn't detected — checks the USB bus, drivers, tools and power, and tells you the fix" class="flex items-center gap-1.5 bg-slate-700 hover:bg-slate-600 text-gray-100 px-3 py-2 rounded text-sm font-semibold border border-slate-600">🩺 SDR check</button>
-                        <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none" title="Keep the RF Waterfall page reachable even with no SDR connected — it shows a synthetic feed, and each panel flips to true RF automatically when its radio (HackRF / RTL-SDR) is plugged in"><input type="checkbox" id="wifi-rfwf-demo" class="accent-indigo-500"> <span class="text-indigo-300">🌊 RF Waterfall demo</span></label>
+                        <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none" title="Show a synthetic feed on the RF Waterfall panels (and the ADS-B / Pager / VOR tools) when no SDR is connected — each panel flips to true RF automatically when its radio (HackRF / RTL-SDR / ESP-SDR) is plugged in"><input type="checkbox" id="wifi-rfwf-demo" class="accent-indigo-500"> <span class="text-indigo-300">🌊 RF Waterfall demo</span></label>
                     </div>
                     <div id="wifi-sdr-diag" class="hidden mt-3 rounded-lg border border-slate-700 bg-slate-900/60 p-3 text-sm"></div>
                 </div>
@@ -4145,6 +4334,33 @@
                         Poll now
                     </button>
                 </div>
+                <!-- Filter / sort toolbar. Client-side over the already-polled
+                     roster, so it never costs a round-trip; hidden until there
+                     is more than one peer to sift. -->
+                <div id="mesh-filter-bar" class="flex flex-wrap items-center gap-2 mb-3 hidden">
+                    <input id="mesh-filter-search" type="search" oninput="meshOnFilterChange()"
+                           placeholder="Search name, unit #, IP, site…" style="min-width:10rem"
+                           class="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-sm">
+                    <select id="mesh-filter-status" onchange="meshOnFilterChange()"
+                            class="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-sm">
+                        <option value="all">All status</option>
+                        <option value="online">Online</option>
+                        <option value="attention">Needs attention</option>
+                        <option value="unreachable">Unreachable</option>
+                        <option value="notpolled">Not polled</option>
+                    </select>
+                    <select id="mesh-filter-sort" onchange="meshOnFilterChange()"
+                            class="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-sm">
+                        <option value="name">Sort: Name</option>
+                        <option value="unit">Sort: Unit #</option>
+                        <option value="severity">Sort: Severity</option>
+                        <option value="alerts">Sort: Alerts</option>
+                        <option value="cpu">Sort: CPU</option>
+                    </select>
+                    <button onclick="meshResetFilters()"
+                            class="text-xs text-gray-400 hover:text-white px-2 py-1.5">Reset</button>
+                    <span id="mesh-filter-count" class="text-[11px] text-gray-500 ml-auto"></span>
+                </div>
                 <div id="mesh-peer-cards" class="space-y-2"></div>
                 <p id="mesh-last-poll" class="text-xs text-gray-500 mt-3"></p>
                 <!-- Mesh-secret nudge (only when a separate mesh has none) lives
@@ -4548,6 +4764,51 @@
 
         <!-- Pentest Tab -->
         <div id="pentest-tab" class="tab-content hidden">
+            <div id="ulf-arsenal" class="glass rounded-xl p-4 mb-6 hidden" style="border:1px solid rgba(220,38,38,0.35)">
+                <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
+                    <h3 class="font-bold flex items-center gap-2"><span class="text-red-400">⚔️</span> Ulfberht Arsenal</h3>
+                    <span class="text-xs text-gray-400"><span id="ulf-arsenal-count">0</span> tools detected · click tools to build a playbook · <a onclick="showTab('engagements')" class="underline cursor-pointer">Engagements →</a></span>
+                </div>
+                <div id="ulf-arsenal-tools" class="flex flex-wrap gap-2"></div>
+                <div class="mt-3 pt-3 text-xs" style="border-top:1px solid rgba(255,255,255,0.08)">
+                    <div class="text-gray-400 mb-2">Select tools above (<span id="ulf-arsenal-sel-count">0</span> selected), name it, and <b>Build playbook</b> for a starter tailored to those tools — the generated steps open in an editor below; tweak the args and <b>Save</b>, and it appears in the Engagements tab. Or let <b>your own AI</b> write it.</div>
+                    <div class="flex items-center gap-2 flex-wrap">
+                        <input id="ulf-arsenal-name" placeholder="Playbook name" class="bg-slate-800 rounded px-2 py-1 text-xs" style="min-width:180px">
+                        <button onclick="ulfArsenalBuild()" class="text-white px-3 py-1 rounded" style="background:#dc2626">Build playbook</button>
+                        <button onclick="ulfArsenalClearSel()" class="bg-slate-700 hover:bg-slate-600 px-2 py-1 rounded">Clear</button>
+                        <span id="ulf-arsenal-build-msg"></span>
+                    </div>
+
+                    <!-- Generate with AI: Ragnar calls the AI configured in Settings -> AI,
+                         gets a playbook back, validates it, and shows it ready to Save. -->
+                    <div class="mt-3 pt-3" style="border-top:1px solid rgba(255,255,255,0.08)">
+                        <div class="text-gray-400 mb-1">⚡ <b>Generate with AI</b> — describe the engagement and Ragnar uses the AI you set in <a onclick="showTab('settings')" class="underline cursor-pointer">Settings → AI</a> (OpenAI or a self-hosted/Ollama endpoint) to write the playbook, then just <b>Save</b> it.</div>
+                        <textarea id="ulf-arsenal-ai-instr" rows="2" placeholder="e.g. Thorough but non-destructive web app test; focus on auth bypass and SQLi, then a TLS check." class="w-full bg-slate-800 rounded px-2 py-1 text-xs" style="resize:vertical"></textarea>
+                        <div class="flex items-center gap-2 flex-wrap mt-2">
+                            <button onclick="ulfArsenalAiGenerate()" id="ulf-arsenal-ai-gen-btn" class="text-white px-3 py-1 rounded" style="background:#7c3aed">Generate with AI</button>
+                            <button onclick="ulfArsenalAiPrompt()" class="text-xs text-gray-400 underline">or copy a prompt for an external AI</button>
+                            <span id="ulf-arsenal-ai-msg"></span>
+                        </div>
+                        <div id="ulf-arsenal-ai-wrap" class="mt-2 hidden">
+                            <div class="flex items-center justify-between gap-2 mb-1">
+                                <span class="text-gray-400">Copy this into your own AI, then paste its JSON reply into the editor below and Save:</span>
+                                <button onclick="ulfArsenalAiCopy()" class="bg-slate-700 hover:bg-slate-600 px-2 py-1 rounded shrink-0">Copy prompt</button>
+                            </div>
+                            <textarea id="ulf-arsenal-ai-prompt" readonly spellcheck="false" class="w-full bg-slate-900 rounded p-2 font-mono text-xs" style="min-height:180px;white-space:pre;color:#c4b5fd"></textarea>
+                        </div>
+                    </div>
+
+                    <div id="ulf-arsenal-editor-wrap" class="mt-3 hidden">
+                        <div id="ulf-arsenal-editor-label" class="text-gray-400 mb-1">Review &amp; edit the generated playbook JSON, then Save:</div>
+                        <textarea id="ulf-arsenal-editor" spellcheck="false" placeholder="Paste your AI's JSON playbook here (or edit the generated one), then Save." class="w-full bg-slate-900 rounded p-2 font-mono text-xs" style="min-height:260px;white-space:pre;color:#e2e8f0"></textarea>
+                        <div class="flex items-center gap-2 mt-2 flex-wrap">
+                            <button onclick="ulfArsenalSaveEdited()" class="text-white px-3 py-1 rounded" style="background:#16a34a">Save to Engagements</button>
+                            <button onclick="ulfArsenalCancelEdit()" class="bg-slate-700 hover:bg-slate-600 px-2 py-1 rounded">Cancel</button>
+                            <span id="ulf-arsenal-save-msg"></span>
+                        </div>
+                    </div>
+                </div>
+            </div>
             <div class="glass rounded-xl p-6 mb-6 border border-red-800 bg-red-950/30">
                 <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
                     <div>
@@ -5538,6 +5799,107 @@
         </div><!-- /#discovered-tab -->
 
         <!-- Threat Intelligence Tab -->
+        <div id="engagements-tab" class="tab-content hidden">
+            <div class="glass rounded-xl p-4 sm:p-6">
+                <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
+                    <h2 class="text-xl sm:text-2xl font-bold flex items-center gap-2"><span class="text-red-400">⚔️</span> Engagements</h2>
+                    <span class="text-xs text-gray-400">Ulfberht · coordinated workflows</span>
+                </div>
+                <p class="text-sm text-gray-400 mb-4">Run a methodology-aligned engagement (NIST SP 800-115): <b>discovery → diagnostics → assessment → reporting</b>, over one scope, into one report. For authorized testing only.</p>
+
+                <div class="glass-card p-4 mb-4">
+                    <div class="grid sm:grid-cols-2 gap-3">
+                        <div>
+                            <label class="block text-xs text-gray-400 mb-1">Playbook</label>
+                            <select id="ulf-playbook" onchange="ulfPlaybookDesc()" class="w-full bg-slate-800 rounded px-2 py-2 text-sm"></select>
+                        </div>
+                        <div id="ulf-scope-wrap">
+                            <label class="block text-xs text-gray-400 mb-1">Scope (IP / CIDR / host)</label>
+                            <input id="ulf-scope" placeholder="192.168.1.0/24" class="w-full bg-slate-800 rounded px-2 py-2 text-sm">
+                            <div class="flex items-center gap-2 mt-1 text-xs text-gray-400">
+                                <label class="underline cursor-pointer">… or load a targets file
+                                    <input type="file" id="ulf-scope-file" accept=".txt,.lst,.list,text/plain" class="hidden" onchange="ulfLoadTargetsFile(this)">
+                                </label>
+                                <span id="ulf-scope-file-status"></span>
+                            </div>
+                        </div>
+                        <!-- Wireless engagements: no IP scope — a monitor interface + optional BSSID/channel. -->
+                        <div id="ulf-wireless-wrap" class="hidden">
+                            <label class="block text-xs text-gray-400 mb-1">📡 Monitor interface</label>
+                            <input id="ulf-iface" placeholder="wlan1mon" class="w-full bg-slate-800 rounded px-2 py-2 text-sm">
+                            <div class="grid grid-cols-2 gap-2 mt-2">
+                                <input id="ulf-bssid" placeholder="BSSID (optional) AA:BB:CC:DD:EE:FF" class="bg-slate-800 rounded px-2 py-2 text-xs">
+                                <input id="ulf-channel" placeholder="Channel (optional)" class="bg-slate-800 rounded px-2 py-2 text-xs">
+                            </div>
+                            <div class="text-xs text-gray-500 mt-1">Needs an adapter in monitor mode (<code>airmon-ng start wlan1</code> → <code>wlan1mon</code>).</div>
+                        </div>
+                    </div>
+                    <p id="ulf-playbook-desc" class="text-xs text-gray-500 mt-2"></p>
+                    <label class="flex items-center gap-2 mt-3 text-sm"><input type="checkbox" id="ulf-active" checked> <span>Enable active assessment phase <span class="text-xs text-gray-500">(authorized targets only — the Ulfberht edition is your authorization; not tied to auto-attacks)</span></span></label>
+                    <button onclick="ulfStartRun()" class="mt-3 text-white px-4 py-2 rounded-lg text-sm" style="background:#dc2626">Run engagement</button>
+                    <div id="ulf-run-msg" class="text-xs mt-2"></div>
+                </div>
+
+                <!-- Playbook library + upload (mirrors Device Console / Rubber Ducky script folders) -->
+                <div class="glass-card p-4 mb-4">
+                    <div class="flex items-center justify-between flex-wrap gap-2 mb-1">
+                        <button onclick="ulfToggleLibrary()" class="flex items-center gap-2 font-semibold text-sm text-left">
+                            <span id="ulf-lib-chevron" class="inline-block text-gray-400 transition-transform">▸</span>
+                            Playbook library <span id="ulf-lib-count" class="text-xs text-gray-500"></span>
+                        </button>
+                        <div class="flex items-center gap-2">
+                            <label class="text-white px-3 py-1.5 rounded text-xs cursor-pointer" style="background:#dc2626">Upload .json
+                                <input type="file" id="ulf-upload" accept=".json,application/json" class="hidden" onchange="ulfUploadPlaybook(this)">
+                            </label>
+                            <button onclick="ulfShowHelp()" class="bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded text-xs">Format help</button>
+                        </div>
+                    </div>
+                    <div id="ulf-library-body" class="hidden">
+                        <p class="text-xs text-gray-500 mb-3 mt-1">Built-in playbooks ship with the image. Upload your own <code>.json</code> playbooks — they sync to the <code>engagement_playbooks</code> folder in the <a onclick="showTab('files')" class="underline cursor-pointer">Files tab</a> (same as Device Console scripts &amp; Rubber Ducky payloads), where you can also edit or delete them.</p>
+                        <div id="ulf-library" class="grid sm:grid-cols-2 gap-2"></div>
+                    </div>
+                    <div id="ulf-upload-msg" class="text-xs mt-2"></div>
+                    <pre id="ulf-help" class="hidden mt-3 p-3 bg-slate-900 rounded text-xs overflow-x-auto whitespace-pre-wrap" style="max-height:50vh"></pre>
+                </div>
+
+                <div id="ulf-run-panel" class="glass-card p-4 mb-4 hidden">
+                    <div class="flex items-center justify-between flex-wrap gap-2">
+                        <div class="font-semibold text-sm">Run <span id="ulf-run-id" class="text-gray-400"></span></div>
+                        <div id="ulf-run-status" class="text-xs"></div>
+                    </div>
+                    <div id="ulf-phases" class="flex flex-wrap gap-2 mt-3 text-xs"></div>
+                    <!-- Live run log — plain text, no box; follows the run as it progresses. -->
+                    <div id="ulf-run-log" class="mt-3 text-xs font-mono text-gray-500 whitespace-pre-wrap hidden" style="max-height:220px;overflow:auto;line-height:1.4"></div>
+                    <div class="mt-3">
+                        <div class="text-xs text-gray-400 mb-1">Findings (<span id="ulf-finding-count">0</span>)</div>
+                        <div id="ulf-findings" class="space-y-1"></div>
+                    </div>
+                    <div class="mt-3 flex gap-2 flex-wrap">
+                        <a id="ulf-report-html" href="#" target="_blank" rel="noopener" class="text-white px-3 py-1.5 rounded text-xs hidden" style="background:#dc2626">Open report (print / PDF)</a>
+                        <button onclick="ulfLoadReport()" id="ulf-report-btn" class="bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded text-xs hidden">View markdown</button>
+                        <a id="ulf-report-dl-html" href="#" class="bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded text-xs hidden">Download .html</a>
+                        <a id="ulf-report-dl" href="#" class="bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded text-xs hidden">Download .md</a>
+                    </div>
+                    <pre id="ulf-report" class="mt-3 p-3 bg-slate-900 rounded text-xs overflow-x-auto whitespace-pre-wrap hidden" style="max-height:60vh"></pre>
+                </div>
+
+                <!-- Recent engagements — persisted history (survives a restart); click to reopen -->
+                <div class="glass-card p-4 mb-4">
+                    <div class="flex items-center justify-between flex-wrap gap-2 mb-1">
+                        <button onclick="ulfToggleHistory()" class="flex items-center gap-2 font-semibold text-sm text-left">
+                            <span id="ulf-hist-chevron" class="inline-block text-gray-400 transition-transform">▸</span>
+                            Recent engagements <span id="ulf-hist-count" class="text-xs text-gray-500"></span>
+                        </button>
+                        <button onclick="ulfLoadPlaybooks()" class="bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded text-xs">Refresh</button>
+                    </div>
+                    <div id="ulf-history-body" class="hidden">
+                        <p class="text-xs text-gray-500 mb-3 mt-1">Completed engagements are saved on the device and survive a restart. Click one to reopen its findings and report.</p>
+                        <div id="ulf-history" class="space-y-1"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <div id="threat-intel-tab" class="tab-content hidden">
             <div class="flex flex-wrap items-center gap-1 mb-5 border-b border-slate-800 pb-2">
                 <button id="ti-subtab-vulns" onclick="showThreatIntelSubtab('vulns')" class="ti-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors bg-Ragnar-600 text-white">Vulnerabilities by Host</button>
@@ -6084,6 +6446,23 @@
                         </svg>
                         Refresh
                     </button>
+                </div>
+
+                <!-- Ulfberht edition: only revealed by JS on the security-distro base; hidden on standard Raspberry Pi OS builds -->
+                <div id="edition-card" class="glass-card p-4 sm:p-5 mb-4 sm:mb-6 hidden" style="border:1px solid rgba(220,38,38,0.35)">
+                    <div class="flex items-center justify-between flex-wrap gap-2">
+                        <div class="flex items-center gap-2">
+                            <span class="text-lg sm:text-xl">⚔️</span>
+                            <h3 id="edition-name" class="text-lg font-bold">Ragnar OS Ulfberht</h3>
+                            <span class="text-xs px-2 py-0.5 rounded-full" style="background:rgba(220,38,38,0.18);color:#f87171">EDITION</span>
+                        </div>
+                        <div id="edition-base" class="text-xs text-gray-400"></div>
+                    </div>
+                    <div id="edition-nexmon" class="text-sm mt-2 text-gray-300">&nbsp;</div>
+                    <div class="mt-3">
+                        <div class="text-xs text-gray-400 mb-1">Installed offensive tools (<span id="edition-tool-count">0</span>)</div>
+                        <div id="edition-tools" class="flex flex-wrap gap-2"></div>
+                    </div>
                 </div>
 
                 <!-- Overview: one compact stat per card -->
@@ -7649,6 +8028,12 @@
                         <div id="wd-zigbee-count" class="text-2xl font-bold text-teal-400">0</div>
                         <div class="text-xs text-gray-500 mt-1">802.15.4</div>
                     </div>
+                    <!-- Aircraft (ADS-B) -->
+                    <div class="bg-slate-800/50 rounded-lg p-3">
+                        <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">Aircraft</div>
+                        <div id="wd-adsb-live-count" class="text-2xl font-bold text-sky-400">0</div>
+                        <div id="wd-adsb-live-sub" class="text-xs text-gray-500 mt-1">ADS-B</div>
+                    </div>
                     <!-- Cameras + Bands -->
                     <div class="bg-slate-800/50 rounded-lg p-3">
                         <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">More</div>
@@ -8305,6 +8690,13 @@
                             </div>
                             <div id="wd-import-result" class="text-xs mt-2 hidden"></div>
                             <div class="border-t border-slate-700 mt-3 pt-3">
+                                <div class="text-xs text-gray-400 mb-2">Solo drives on a Piglet <span class="text-gray-500">— plug it in over USB and pull its SD-card logs; each drive becomes a session (needs Piglet firmware v2.60+). Also runs automatically whenever a Piglet connects while wardriving.</span></div>
+                                <div class="flex flex-wrap gap-2 items-center">
+                                    <button type="button" onclick="syncPiglet()" class="bg-pink-700 hover:bg-pink-600 text-white px-3 py-1.5 rounded text-xs transition-colors">Import from Piglet (USB)</button>
+                                    <span id="wd-piglet-sync-status" class="text-xs text-gray-500 break-words"></span>
+                                </div>
+                            </div>
+                            <div class="border-t border-slate-700 mt-3 pt-3">
                                 <div class="text-xs text-gray-400 mb-2">WiGLE upload API <span class="text-gray-500">— optional, lets the <span class="text-cyan-400">↑ WiGLE</span> button on a session push it to <a href="https://wigle.net" target="_blank" rel="noopener" class="text-cyan-400 hover:text-cyan-300">wigle.net</a></span></div>
                                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-2">
                                     <input type="text" id="wd-wigle-name" placeholder="WiGLE API name" class="bg-slate-700 text-white text-xs rounded px-2 py-1.5 border border-slate-600">
@@ -8442,6 +8834,38 @@
                                 <div id="wd-wdm-msg" class="text-xs mt-1"></div>
                                 </div>
                             </div>
+                        </div>
+
+                        <!-- Upload Aircraft (ADS-B) Card -->
+                        <div class="glass rounded-lg p-4">
+                            <div class="flex items-center justify-between mb-3 gap-2 flex-wrap">
+                                <h4 class="font-medium">🛩 Aircraft (ADS-B) → Wardrift</h4>
+                                <span id="wd-adsb-badge" class="text-xs px-2 py-0.5 rounded-full bg-gray-700 text-gray-400">—</span>
+                            </div>
+                            <div class="text-sm text-gray-400 mb-3">
+                                Upload the unique aircraft the <a href="/adsb-radar" class="text-amber-400 hover:text-amber-300">ADS-B radar</a> hears each UTC day to Wardrift's <span class="text-amber-400">Aircraft Watch</span> (10 different aircraft in a day). Uses your Wardrift sign-in above; needs an RTL-SDR running the radar.
+                            </div>
+                            <div class="flex gap-2 items-center flex-wrap">
+                                <button id="wd-adsb-upload-btn" onclick="uploadAdsbWardrift()" class="bg-amber-600 hover:bg-amber-700 text-white px-3 py-1.5 rounded text-xs transition-colors whitespace-nowrap">&#8593; Upload today</button>
+                                <span id="wd-adsb-today" class="text-xs text-gray-400"></span>
+                            </div>
+                            <label class="flex items-center gap-2 text-xs text-gray-400 mt-3 flex-wrap cursor-pointer">
+                                <input type="checkbox" id="wd-adsb-autostart" onchange="saveAdsbWardrift()" class="accent-amber-500">
+                                <span>Start the ADS-B radar when a wardrive begins</span>
+                            </label>
+                            <label class="flex items-center gap-2 text-xs text-gray-400 mt-2 flex-wrap cursor-pointer">
+                                <input type="checkbox" id="wd-adsb-auto" onchange="saveAdsbWardrift()" class="accent-amber-500">
+                                <span>Auto-upload while receiving, every</span>
+                                <select id="wd-adsb-interval" onchange="saveAdsbWardrift()" class="bg-slate-700 text-white text-xs rounded px-1.5 py-0.5 border border-slate-600">
+                                    <option value="15">15 min</option>
+                                    <option value="30">30 min</option>
+                                    <option value="60">60 min</option>
+                                    <option value="120">120 min</option>
+                                </select>
+                                <span id="wd-adsb-pushnote" class="text-gray-500"></span>
+                            </label>
+                            <div id="wd-adsb-last" class="text-xs text-gray-500 mt-2"></div>
+                            <div id="wd-adsb-msg" class="text-xs mt-1 hidden"></div>
                         </div>
 
                         <!-- Serial ESP32 Listener Card -->
@@ -9494,7 +9918,7 @@
     <!-- JavaScript -->
     <script src="/web/scripts/skyview.js?v=20260822-mobile-opacity"></script>
     <script src="/web/scripts/skyview_vr.js?v=20260822-rich-info-panel"></script>
-    <script src="/web/scripts/ragnar_modern.js?v=20261003-tier3-ask-sched"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20261023-upstream-sync"></script>
 
 
 

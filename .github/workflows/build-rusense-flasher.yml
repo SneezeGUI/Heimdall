@@ -3,7 +3,8 @@ name: Deploy RuSense CSI Node Flasher (ESP32-S3 / C6)
 # The CSI-node firmware binaries are vendored under rusense_flasher/firmware/
 # (copied bit-identically from the upstream RuView repo at the commit pinned in
 # rusense_flasher/rusense-csi-node.version) — those need no build step.
-#
+
+
 # The hidden "Skál" easter egg on the same page forges the Ragnar Piglet
 # Coordinator (ESP32-C5 headless / ESP32-S3-Touch-LCD-4B). That firmware IS
 # built here from source with arduino-cli, then merged into single .bin images
@@ -18,6 +19,7 @@ on:
       - 'espnow_bridge_firmware/espnow_bridge_s3_lcd/**'
       - 'roomscan_firmware/**'
       - 'cyd_firmware/flasher/**'
+      - 'web/os/**'
       - '.github/workflows/build-rusense-flasher.yml'
   workflow_dispatch:
 
@@ -198,6 +200,15 @@ jobs:
 
           echo "=== Firmware binaries ==="
           ls -lhR site/firmware
+
+      # Ragnar OS download page, served as a subpage at /os/ alongside the
+      # flasher. Self-contained HTML; its download buttons point at the images
+      # hosted on https://ragnar.life/images/, so nothing large lands on Pages.
+      - name: Stage the Ragnar OS download subpage (/os)
+        run: |
+          mkdir -p site/os
+          cp web/os/index.html site/os/index.html
+          echo "staged site/os:"; ls -l site/os
 
       - uses: actions/configure-pages@v5
 
