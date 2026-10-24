@@ -1,8 +1,21 @@
 diff --git a/actions/nmap_vuln_scanner.py b/actions/nmap_vuln_scanner.py
-index dfe122bc..b5adf631 100755
+index d6d3ec68..448109d6 100755
 --- a/actions/nmap_vuln_scanner.py
 +++ b/actions/nmap_vuln_scanner.py
-@@ -321,6 +321,32 @@ class NmapVulnScanner:
+@@ -37,10 +37,11 @@ if parent_dir not in sys.path:
+ import re
+ import json
+ import subprocess
++import threading
++import time
+ import logging
+ from datetime import datetime, timedelta
+ from typing import Dict, List, Optional, Set, Tuple
+-from concurrent.futures import ThreadPoolExecutor, as_completed
+ from rich.console import Console
+ from rich.progress import Progress, BarColumn, TextColumn
+ 
+@@ -320,6 +321,54 @@ class NmapVulnScanner:
          except Exception as e:
              logger.error(f"Error updating database with vulnerabilities: {e}")
  
@@ -13,7 +26,6 @@ index dfe122bc..b5adf631 100755
 +    DEFAULT_NSE_SCRIPTS = (
 +        "vulners.nse",
 +        "smb-vuln-ms17-010.nse",
-+        "smb-vuln-cve-2009-3103.nse",
 +        "smb-vuln-cve2009-3103.nse",
 +        "smb-vuln-regsvc-dos.nse",
 +        "ssl-heartbleed.nse",
@@ -21,21 +33,44 @@ index dfe122bc..b5adf631 100755
 +        "ssl-ccs-injection.nse",
 +        "ssl-dh-params.nse",
 +        "http-vuln-cve2017-5638.nse",
-+        "http-vuln-cve2014-0160.nse",
 +    )
 +
 +    def _nse_script_spec(self) -> str:
-+        """Return the comma-joined NSE script list (config-overridable)."""
++        """Return the comma-joined NSE script list (config-overridable).
++
++        Names are validated against the installed script directory. nmap
++        aborts the whole scan with "match a category, filename, or directory"
++        when a name is wrong, and it logs a multi-line Lua traceback every
++        time - two bad names in the default list were producing ~700 log
++        lines a minute and silently failing every vuln scan.
++        """
 +        raw = self.shared_data.config.get("nmap_vuln_scripts")
 +        if isinstance(raw, str) and raw.strip():
-+            return raw.strip()
-+        if isinstance(raw, (list, tuple)) and raw:
-+            return ",".join(str(x).strip() for x in raw if str(x).strip())
-+        return ",".join(self.DEFAULT_NSE_SCRIPTS)
++            names = [x.strip() for x in raw.split(",") if x.strip()]
++        elif isinstance(raw, (list, tuple)) and raw:
++            names = [str(x).strip() for x in raw if str(x).strip()]
++        else:
++            names = list(self.DEFAULT_NSE_SCRIPTS)
++
++        script_dir = "/usr/share/nmap/scripts"
++        valid, dropped = [], []
++        for n in names:
++            bare = n[:-4] if n.endswith(".nse") else n
++            if os.path.isdir(script_dir):
++                if os.path.exists(os.path.join(script_dir, bare + ".nse")):
++                    valid.append(bare + ".nse")
++                else:
++                    dropped.append(n)
++            else:
++                valid.append(n)
++        if dropped:
++            logger.warning("nmap: skipping unknown NSE script(s): %s",
++                           ", ".join(dropped))
++        return ",".join(valid) if valid else "vulners.nse"
  
      def scan_vulnerabilities(self, ip, hostname, mac, ports):
          combined_result = ""
-@@ -359,8 +385,10 @@ class NmapVulnScanner:
+@@ -358,8 +407,10 @@ class NmapVulnScanner:
                      "-Pn",
                      "-sT",  # TCP connect scan (works on Wi-Fi)
                      "-sV",  # Service version detection
@@ -47,7 +82,7 @@ index dfe122bc..b5adf631 100755
                      "--top-ports",
                      "50",
                      ip,
-@@ -375,8 +403,10 @@ class NmapVulnScanner:
+@@ -374,8 +425,10 @@ class NmapVulnScanner:
                      "-Pn",  # Treat host as up (skip ping)
                      "-sT",  # TCP connect scan (works on Wi-Fi)
                      "-sV",  # Service version detection
@@ -59,7 +94,7 @@ index dfe122bc..b5adf631 100755
                      "-p",
                      ",".join(ports_to_scan),
                      ip,
-@@ -540,9 +570,15 @@ class NmapVulnScanner:
+@@ -545,9 +598,15 @@ class NmapVulnScanner:
                          continue
                      port_key = port_candidate
                      current_port = port_key
@@ -76,3 +111,61 @@ index dfe122bc..b5adf631 100755
                      elif len(parts) >= 2:
                          current_service = parts[1]
                      else:
+@@ -1013,24 +1072,42 @@ if __name__ == "__main__":
+             console=Console()
+         ) as progress:
+             task = progress.add_task("Scanning vulnerabilities...", total=len(alive_hosts))
+-            futures = []
+-            with ThreadPoolExecutor(max_workers=2) as executor:  # Adjust the number of workers for RPi Zero
+-                for host in alive_hosts:
+-                    # Convert database format to legacy row format
+-                    row = {
+-                        "IPs": host.get("ip", ""),
+-                        "Hostnames": host.get("hostname", ""),
+-                        "MAC Address": host.get("mac", ""),
+-                        "Ports": host.get("ports", ""),
+-                        "Alive": "1"
+-                    }
+-                    ip = row["IPs"]
+-                    if ip:
+-                        futures.append(executor.submit(nmap_vuln_scanner.execute, ip, row, b_status))
++            # Direct threads, not ThreadPoolExecutor. concurrent.futures sets a
++            # global "no more work" flag when the interpreter begins shutting down,
++            # after which every submit() raises "cannot schedule new futures after
++            # interpreter shutdown" - a background scan then silently produces
++            # nothing. Plain threads have no such gate.
++            # Two workers, tuned for a Pi Zero-class board.
++            _jobs = []
++            for host in alive_hosts:
++                # Convert database format to legacy row format
++                row = {
++                    "IPs": host.get("ip", ""),
++                    "Hostnames": host.get("hostname", ""),
++                    "MAC Address": host.get("mac", ""),
++                    "Ports": host.get("ports", ""),
++                    "Alive": "1"
++                }
++                ip = row["IPs"]
++                if ip:
++                    _jobs.append((ip, row))
+ 
+-                for future in as_completed(futures):
++            def _one(ip, row):
++                try:
++                    nmap_vuln_scanner.execute(ip, row, b_status)
++                finally:
+                     progress.update(task, advance=1)
+ 
++            threads = []
++            for ip, row in _jobs:
++                while sum(1 for t in threads if t.is_alive()) >= 2:
++                    time.sleep(0.05)
++                t = threading.Thread(target=_one, args=(ip, row), daemon=True)
++                t.start()
++                threads.append(t)
++            for t in threads:
++                t.join()
++
+         # Log summary (data is in SQLite database)
+         nmap_vuln_scanner.save_summary()
+         logger.info(f"Total scans performed: {len(nmap_vuln_scanner.scan_results)}")

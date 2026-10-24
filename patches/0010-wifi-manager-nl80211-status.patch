@@ -1,5 +1,5 @@
 diff --git a/wifi_manager.py b/wifi_manager.py
-index 68443db0..dc027533 100755
+index 40890f31..c440b907 100755
 --- a/wifi_manager.py
 +++ b/wifi_manager.py
 @@ -24,6 +24,67 @@ from db_manager import get_db
